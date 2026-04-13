@@ -16,7 +16,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ---
 
-## MCP Tools (26)
+## MCP Tools (27)
 
 ### Palace (read)
 - mempalace_status -- Palace status and stats
@@ -26,6 +26,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 - mempalace_search -- Search memories by query
 - mempalace_check_duplicate -- Check if a memory already exists
 - mempalace_get_aaak_spec -- Get the AAAK specification
+- mempalace_eval -- Evaluate retrieval quality (hit rates, avg similarity, wing precision)
 
 ### Palace (write)
 - mempalace_add_drawer -- Add a new memory (drawer)
@@ -54,6 +55,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 - **mempalace_hybrid_search** — combines semantic (ChromaDB) + keyword (BM25) + KG in one call
 - **mempalace_kg_supersede** — atomically replace a fact (invalidate old, add new)
 - **mempalace_kg_history** — audit trail for any fact (all versions over time)
+- **mempalace_eval** — evaluate retrieval quality: hit rates, avg similarity, wing precision
 - **mempalace_remember_code** — store code with description for better semantic search
 - **mempalace_consolidate** — find and optionally merge duplicate memories by topic
 - **mempalace_export_claude_md** — export memories to CLAUDE.md format

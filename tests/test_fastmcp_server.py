@@ -122,7 +122,7 @@ async def seeded_palace_client(tmp_path):
 async def test_list_tools_count(client):
     """Verify server exposes exactly 26 tools."""
     tools = await client.list_tools()
-    assert len(tools) == 26
+    assert len(tools) == 27
 
 
 async def test_list_tools_contains_expected(client):
@@ -156,6 +156,7 @@ async def test_list_tools_contains_expected(client):
         "mempalace_remember_code",
         "mempalace_consolidate",
         "mempalace_export_claude_md",
+        "mempalace_eval",
     }
     assert expected.issubset(tool_names), f"Missing tools: {expected - tool_names}"
 

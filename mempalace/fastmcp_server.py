@@ -290,6 +290,63 @@ def _register_tools(server, backend, config, settings):
         """[MEMPALACE] Get the AAAK dialect specification — the compressed memory format MemPalace uses."""
         return {"aaak_spec": AAAK_SPEC}
 
+    @server.tool(timeout=settings.timeout_read)
+    async def mempalace_eval(
+        ctx: Context,
+        queries: list[str],
+        expected_wing: str | None = None,
+        n_results: int = 5,
+    ) -> dict:
+        """[MEMPALACE] Evaluate retrieval quality: run queries and report hit rates, avg similarity.
+        Use to diagnose whether palace is finding relevant memories.
+        queries: list of test queries (e.g. ["project deadline", "API design decision"])
+        expected_wing: if set, measures what % of top results are in the right wing
+        """
+        from .searcher import search_memories_async
+
+        results_summary = []
+        total_similarity = 0.0
+        wing_hit_count = 0
+        total_results = 0
+
+        for query in queries[:10]:  # max 10 queries per eval call
+            result = await search_memories_async(
+                query=query, palace_path=settings.db_path, n_results=n_results
+            )
+            hits = result.get("results", [])
+            avg_sim = sum(h.get("similarity", 0) for h in hits) / max(len(hits), 1)
+
+            wing_hits = 0
+            if expected_wing and hits:
+                wing_hits = sum(1 for h in hits if h.get("wing") == expected_wing)
+                wing_hit_count += wing_hits
+
+            total_similarity += avg_sim
+            total_results += len(hits)
+
+            results_summary.append({
+                "query": query,
+                "hit_count": len(hits),
+                "avg_similarity": round(avg_sim, 3),
+                "wing_precision": round(wing_hits / max(len(hits), 1), 2) if expected_wing else None,
+                "top_result": hits[0]["text"][:100] if hits else None,
+            })
+
+        n_queries = len(queries[:10])
+        return {
+            "eval_summary": {
+                "queries_tested": n_queries,
+                "avg_similarity_across_queries": round(total_similarity / max(n_queries, 1), 3),
+                "avg_results_per_query": round(total_results / max(n_queries, 1), 1),
+                "wing_precision": round(wing_hit_count / max(total_results, 1), 2) if expected_wing else None,
+            },
+            "per_query": results_summary,
+            "diagnosis": (
+                "Good retrieval" if total_similarity / max(n_queries, 1) > 0.7
+                else "Low similarity — consider reranking (rerank=True) or refining queries"
+            ),
+        }
+
     @server.tool(timeout=settings.timeout_embed)
     async def mempalace_search(
         ctx: Context,
