@@ -1,5 +1,12 @@
 #!/bin/bash
-# MemPalace Stop Hook — thin wrapper calling Python CLI
-# All logic lives in mempalace.hooks_cli for cross-harness extensibility
+# MemPalace Stop Hook — thin wrapper with HTTP server fast-path
 INPUT=$(cat)
-echo "$INPUT" | python3 -m mempalace hook run --hook stop --harness claude-code
+MCP_HOST="http://127.0.0.1:8765"
+
+if curl -sf --max-time 1 "$MCP_HOST/health" > /dev/null 2>&1; then
+    printf '%s' "$INPUT" | python3 -m mempalace hook run \
+        --hook stop --harness claude-code --transport http
+else
+    printf '%s' "$INPUT" | python3 -m mempalace hook run \
+        --hook stop --harness claude-code
+fi

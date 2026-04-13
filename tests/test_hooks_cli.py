@@ -6,8 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
+# Default values matching MempalaceConfig defaults for hook_save_interval
+DEFAULT_SAVE_INTERVAL = 15
+DEFAULT_SAVE_INTERVAL_MIN = 3
+
 from mempalace.hooks_cli import (
-    SAVE_INTERVAL,
     STOP_BLOCK_REASON,
     PRECOMPACT_BLOCK_REASON,
     _count_human_messages,
@@ -108,7 +111,7 @@ def test_count_malformed_json_lines(tmp_path):
 # --- hook_stop ---
 
 
-def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
+def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None, transport="cli"):
     """Run a hook and capture its JSON stdout output."""
     import io
 
@@ -119,7 +122,7 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
-        hook_fn(data, harness)
+        hook_fn(data, harness, transport)
     return json.loads(buf.getvalue())
 
 
@@ -147,7 +150,7 @@ def test_stop_hook_passthrough_below_interval(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL - 1)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(DEFAULT_SAVE_INTERVAL - 1)],
     )
     result = _capture_hook_output(
         hook_stop,
@@ -161,7 +164,7 @@ def test_stop_hook_blocks_at_interval(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(DEFAULT_SAVE_INTERVAL)],
     )
     result = _capture_hook_output(
         hook_stop,
@@ -176,7 +179,7 @@ def test_stop_hook_tracks_save_point(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(DEFAULT_SAVE_INTERVAL)],
     )
     data = {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)}
 
@@ -291,7 +294,7 @@ def test_stop_hook_oserror_on_last_save_read(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(DEFAULT_SAVE_INTERVAL)],
     )
     # Write invalid content to last save file
     (tmp_path / "test_last_save").write_text("not_a_number")
@@ -308,7 +311,7 @@ def test_stop_hook_oserror_on_write(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(DEFAULT_SAVE_INTERVAL)],
     )
 
     def bad_write_text(*args, **kwargs):

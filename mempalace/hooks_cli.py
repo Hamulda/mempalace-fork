@@ -14,7 +14,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 
 STOP_BLOCK_REASON = (
@@ -118,12 +117,28 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     }
 
 
-def hook_stop(data: dict, harness: str):
+def hook_stop(data: dict, harness: str, transport: str = "cli"):
     """Stop hook: block every N messages for auto-save."""
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
+
+    # HTTP fast-path: call MCP server synchronously instead of spawning subprocess
+    if transport == "http":
+        try:
+            import requests
+            resp = requests.post(
+                "http://127.0.0.1:8765/mcp",
+                json={"method": "hooks/stop", "params": data},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                _output(result.get("result", {}))
+                return
+        except Exception as e:
+            _log(f"HTTP stop fallback: {e}")
 
     # If already in a save cycle, let through (infinite-loop prevention)
     if str(stop_hook_active).lower() in ("true", "1", "yes"):
@@ -147,7 +162,12 @@ def hook_stop(data: dict, harness: str):
 
     _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
 
-    if since_last >= SAVE_INTERVAL and exchange_count > 0:
+    from mempalace.config import MempalaceConfig
+    cfg = MempalaceConfig()
+    save_interval = cfg.hook_save_interval
+    save_interval_min = cfg.hook_save_interval_min
+
+    if since_last >= save_interval and exchange_count >= save_interval_min:
         # Update last save point
         try:
             last_save_file.write_text(str(exchange_count), encoding="utf-8")
@@ -164,7 +184,7 @@ def hook_stop(data: dict, harness: str):
         _output({})
 
 
-def hook_session_start(data: dict, harness: str):
+def hook_session_start(data: dict, harness: str, transport: str = "cli"):
     """Session start hook: inject relevant memories as session context."""
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
@@ -208,7 +228,7 @@ def hook_session_start(data: dict, harness: str):
         return  # silent failure — no output
 
 
-def hook_precompact(data: dict, harness: str):
+def hook_precompact(data: dict, harness: str, transport: str = "cli"):
     """Precompact hook: always block with comprehensive save instruction."""
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
@@ -234,7 +254,7 @@ def hook_precompact(data: dict, harness: str):
     _output({"decision": "block", "reason": PRECOMPACT_BLOCK_REASON})
 
 
-def run_hook(hook_name: str, harness: str):
+def run_hook(hook_name: str, harness: str, transport: str = "cli"):
     """Main entry point: read stdin JSON, dispatch to hook handler."""
     try:
         data = json.load(sys.stdin)
@@ -253,4 +273,4 @@ def run_hook(hook_name: str, harness: str):
         print(f"Unknown hook: {hook_name}", file=sys.stderr)
         sys.exit(1)
 
-    handler(data, harness)
+    handler(data, harness, transport)

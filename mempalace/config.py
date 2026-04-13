@@ -190,6 +190,22 @@ class MempalaceConfig:
         """How many memories to inject on session start (default: 5)."""
         return self._file_config.get("hooks", {}).get("session_start_top_k", 5)
 
+    @property
+    def hook_save_interval(self) -> int:
+        """Number of human messages between auto-saves. Default: 15. Env: MEMPALACE_SAVE_INTERVAL."""
+        env_val = os.environ.get("MEMPALACE_SAVE_INTERVAL")
+        if env_val:
+            try:
+                return max(1, min(int(env_val), 100))  # clamp 1–100
+            except ValueError:
+                pass
+        return self._file_config.get("hooks", {}).get("save_interval", 15)
+
+    @property
+    def hook_save_interval_min(self) -> int:
+        """Minimum exchanges before any save triggers (guards against ultra-short sessions)."""
+        return self._file_config.get("hooks", {}).get("save_interval_min", 3)
+
     def init(self):
         """Create config directory and write default config.json if it doesn't exist."""
         self._config_dir.mkdir(parents=True, exist_ok=True)

@@ -275,7 +275,7 @@ def cmd_hook(args):
     """Run hook logic: reads JSON from stdin, outputs JSON to stdout."""
     from .hooks_cli import run_hook
 
-    run_hook(hook_name=args.hook, harness=args.harness)
+    run_hook(hook_name=args.hook, harness=args.harness, transport=args.transport)
 
 
 def cmd_instructions(args):
@@ -896,6 +896,13 @@ def main():
         required=True,
         choices=["claude-code", "codex"],
         help="Harness type (determines stdin JSON format)",
+    )
+    p_hook_run.add_argument(
+        "--transport",
+        required=False,
+        choices=["cli", "http"],
+        default="cli",
+        help="Transport method: cli (subprocess) or http (MCP server). Default: cli",
     )
 
     # instructions

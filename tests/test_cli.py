@@ -86,10 +86,10 @@ def test_cmd_instructions_calls_run_instructions():
 
 
 def test_cmd_hook_calls_run_hook():
-    args = argparse.Namespace(hook="session-start", harness="claude-code")
+    args = argparse.Namespace(hook="session-start", harness="claude-code", transport="cli")
     with patch("mempalace.hooks_cli.run_hook") as mock_run:
         cmd_hook(args)
-        mock_run.assert_called_once_with(hook_name="session-start", harness="claude-code")
+        mock_run.assert_called_once_with(hook_name="session-start", harness="claude-code", transport="cli")
 
 
 # ── cmd_init ───────────────────────────────────────────────────────────
