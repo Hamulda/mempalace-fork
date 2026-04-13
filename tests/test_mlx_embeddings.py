@@ -7,10 +7,16 @@ Run: pytest tests/test_mlx_embeddings.py -v -s
 import platform
 import pytest
 
-pytest.importorskip("lancedb", reason="LanceDB not installed")
+try:
+    import mlx  # noqa: F401
+    import mlx_embeddings  # noqa: F401
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
 
 
 class TestMLXEmbeddings:
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx_embeddings not installed")
     def test_mlx_model_or_fallback_loads(self):
         """_create_embedding_model() uspěje na libovolné platformě."""
         from mempalace.embed_daemon import _create_embedding_model
@@ -20,8 +26,8 @@ class TestMLXEmbeddings:
         assert len(embeddings[0]) == 256, f"Expected 256 dims (ModernBERT Matryoshka), got {len(embeddings[0])}"
 
     @pytest.mark.skipif(
-        platform.machine() != "arm64",
-        reason="MLX pouze na Apple Silicon"
+        not HAS_MLX or platform.machine() != "arm64",
+        reason="MLX requires Apple Silicon + mlx_embeddings installed"
     )
     def test_mlx_preferred_on_apple_silicon(self):
         """Na Apple Silicon je preferován MLX backend."""
@@ -31,6 +37,7 @@ class TestMLXEmbeddings:
         assert len(result) == 1
         assert len(result[0]) == 256, f"Expected 256 dims, got {len(result[0])}"
 
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx_embeddings not installed")
     def test_mlx_wrapper_batch(self):
         """MLX wrapper correctly batch-encodes multiple texts."""
         from mempalace.embed_daemon import _create_mlx_model

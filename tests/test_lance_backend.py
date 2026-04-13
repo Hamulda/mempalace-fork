@@ -31,7 +31,10 @@ def tmp_palace(tmp_path):
 
 @pytest.fixture
 def lance_collection(tmp_palace):
-    """Fresh LanceDB collection."""
+    """Fresh LanceDB collection with dedup disabled for predictable test results."""
+    import os
+    os.environ["MEMPALACE_DEDUP_HIGH"] = "1.0"
+    os.environ["MEMPALACE_DEDUP_LOW"] = "0.99"
     backend = LanceBackend()
     col = backend.get_collection(tmp_palace, "test_drawers", create=True)
     return col

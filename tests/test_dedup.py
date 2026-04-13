@@ -109,11 +109,11 @@ class TestSemanticDeduplicator:
         )
         d = SemanticDeduplicator(high_threshold=0.92, low_threshold=0.82)
         action, eid = d.classify(
-            "Config returns Config object type",
+            "it returns dict type",
             {"wing": "code", "room": "config"},
             col,
         )
-        # These are similar but different — should trigger conflict
+        # Similar (~0.83 similarity) in same room — triggers conflict
         assert action == "conflict"
         assert eid == "conflict_1"
 

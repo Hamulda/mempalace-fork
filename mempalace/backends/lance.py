@@ -273,8 +273,9 @@ class SemanticDeduplicator:
             return "unique", None
 
         try:
-            results = collection.query(
-                query_texts=[new_doc],
+            query_emb = _embed_texts([new_doc])[0]
+            results = collection.query_by_vector(
+                vector=query_emb,
                 n_results=n_candidates,
             )
         except Exception:
@@ -287,9 +288,8 @@ class SemanticDeduplicator:
         best_id = results["ids"][0][0]
         best_meta = (results["metadatas"][0][0] or {}) if results["metadatas"] else {}
 
-        # LanceDB distance is Euclidean; convert to similarity approximation
-        # For normalized vectors: similarity ≈ 1 - distance (RRF/distance already applied)
-        # We use a practical threshold based on cosine similarity scale
+        # LanceDB distance is Euclidean; convert to similarity
+        # For normalized vectors: similarity ≈ 1 - distance
         best_similarity = max(0.0, 1.0 - best_dist)
 
         if best_similarity >= self.high_threshold:
