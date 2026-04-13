@@ -1,40 +1,56 @@
 ---
 name: mempalace
-description: MemPalace — mine projects and conversations into a searchable memory palace. Use when asked about mempalace, memory palace, mining memories, searching memories, or palace setup.
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep
+description: MemPalace persistent memory — mine, search, and recall context across sessions.
+allowed-tools: Read
 ---
 
 # MemPalace
 
-A searchable memory palace for AI — mine projects and conversations, then search them semantically.
+Searchable memory palace for AI sessions. Mine projects, store decisions, recall context.
 
-## Prerequisites
+## Auto-trigger rules
 
-Ensure `mempalace` is installed:
+**Call `mempalace_search` without being asked when:**
+- User asks about past decisions: "what did we decide", "jak jsme to implementovali"
+- User mentions a project or technology they may have worked on before
+- User says "I don't remember", "zapomněl jsem", "kde jsme přestali"
 
+**Call `mempalace_add_drawer` without being asked when:**
+- User says "remember this", "ulož to", "poznamenej si"
+- Key architectural decision just made
+- Session exceeds 20 exchanges with code or design content
+
+## Tool reference
+
+| Tool | When to use | Key params |
+|------|-------------|------------|
+| `mempalace_search` | Semantic search across all memories | `query`, `limit=5`, `wing`, `room` |
+| `mempalace_add_drawer` | Store a single memory manually | `content`, `wing`, `room` |
+| `mempalace_check_duplicate` | Check if content already exists before storing | `content`, `threshold=0.9` |
+| `mempalace_status` | Palace overview: counts, wings, size | — |
+| `mempalace_list_wings` | List all wings | — |
+| `mempalace_list_rooms` | List rooms, optionally filtered by wing | `wing=None` |
+| `mempalace_kg_query` | Query knowledge graph entities | `query` |
+| `mempalace_kg_stats` | Knowledge graph statistics | — |
+| `mempalace_diary_write` | Write to agent diary | `content`, `agent_name` |
+| `mempalace_diary_read` | Read agent diary | `agent_name`, `last_n=10` |
+| `mempalace_export_claude_md` | Export palace as Claude.md | `project_path`, `output_dir` |
+
+## Organization patterns
+
+| Content | Wing | Room |
+|---------|------|------|
+| Architectural decisions | technical | decisions |
+| Code and implementations | technical | code |
+| Debates and conclusions | technical | discussions |
+| User personal preferences | identity | preferences |
+| Memory/session notes | memory | sessions |
+
+## Server not running?
+
+If MemPalace MCP tools return an error, start the server:
+<!-- Bash permitted only for server startup -->
 ```bash
-mempalace --version
-```
-
-If not installed:
-
-```bash
-# Lokální install (development)
-pip install -e /path/to/mempalace
-# nebo: uv pip install -e /path/to/mempalace
-
-# Spuštění HTTP serveru (nutné před použitím)
 python3 -m mempalace.fastmcp_server
 ```
-
-## Usage
-
-MemPalace provides dynamic instructions via the CLI. To get instructions for any operation:
-
-```bash
-mempalace instructions <command>
-```
-
-Where `<command>` is one of: `help`, `init`, `mine`, `search`, `status`.
-
-Run the appropriate instructions command, then follow the returned instructions step by step.
+Server URL: `http://127.0.0.1:8765/mcp`
