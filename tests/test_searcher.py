@@ -5,10 +5,12 @@ Uses the real ChromaDB fixtures from conftest.py for integration tests,
 plus mock-based tests for error paths.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mempalace.backends import get_backend
 from mempalace.searcher import SearchError, _build_where_filter, search, search_memories
 
 
@@ -242,3 +244,85 @@ def test_rerank_graceful_no_sentence_transformers(palace_path, seeded_collection
     result = search_memories("JWT authentication pattern", palace_path, n_results=3, rerank=True)
     assert "error" not in result
     assert "results" in result
+
+
+class TestHybridSearch:
+    def test_hybrid_search_returns_results(self, palace_path, seeded_collection):
+        """hybrid_search returns ChromaDB results + KG hits."""
+        from mempalace.searcher import hybrid_search
+        from mempalace.knowledge_graph import KnowledgeGraph
+        import sqlite3
+
+        # Add ChromaDB drawer with a known token
+        backend = get_backend("chromadb")
+        col = backend.get_collection(palace_path, "mempalace_drawers")
+        col.add(
+            ids=["hw_1"],
+            documents=["Alice works at Acme Corp"],
+            metadatas=[{"wing": "notes", "room": "people", "is_latest": True}],
+        )
+
+        # Add KG triple with same token
+        kg_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
+        kg = KnowledgeGraph(db_path=kg_path)
+        kg.add_triple("Alice", "works_at", "Acme Corp", valid_from="2020-01-01")
+
+        result = hybrid_search("Alice works at", palace_path, n_results=10, use_kg=True)
+
+        assert "results" in result
+        assert "sources" in result
+        assert result["sources"]["chroma"] >= 1
+        assert result["sources"]["kg"] >= 1
+
+    def test_hybrid_search_kg_failure_graceful(self, palace_path, seeded_collection):
+        """hybrid_search returns ChromaDB results even if KG is unavailable."""
+        from mempalace.searcher import hybrid_search
+
+        result = hybrid_search("JWT", palace_path, n_results=5, use_kg=True)
+
+        assert "results" in result
+        assert isinstance(result["results"], list)
+
+    def test_hybrid_search_deduplication(self, palace_path, seeded_collection):
+        """Identical text from ChromaDB and KG appears only once."""
+        from mempalace.searcher import hybrid_search
+        from mempalace.knowledge_graph import KnowledgeGraph
+
+        # Add ChromaDB drawer
+        backend = get_backend("chromadb")
+        col = backend.get_collection(palace_path, "mempalace_drawers")
+        col.add(
+            ids=["dedup_1"],
+            documents=["Bob knows Alice"],
+            metadatas=[{"wing": "notes", "room": "people", "is_latest": True}],
+        )
+
+        # Add identical KG triple
+        kg_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
+        kg = KnowledgeGraph(db_path=kg_path)
+        kg.add_triple("Bob", "knows", "Alice", valid_from="2020-01-01")
+
+        result = hybrid_search("Bob knows Alice", palace_path, n_results=10, use_kg=True)
+        texts = [r["text"] for r in result["results"]]
+        assert len(texts) == len(set(texts))
+
+    def test_hybrid_search_sources_count(self, palace_path, seeded_collection):
+        """Result contains sources dict with chroma and kg keys."""
+        from mempalace.searcher import hybrid_search
+
+        result = hybrid_search("JWT", palace_path, n_results=5, use_kg=True)
+
+        assert "sources" in result
+        assert "chroma" in result["sources"]
+        assert "kg" in result["sources"]
+        assert isinstance(result["sources"]["chroma"], int)
+        assert isinstance(result["sources"]["kg"], int)
+
+    def test_hybrid_search_sources_count_kg_disabled(self, palace_path, seeded_collection):
+        """use_kg=False returns kg=0."""
+        from mempalace.searcher import hybrid_search
+
+        result = hybrid_search("JWT", palace_path, n_results=5, use_kg=False)
+
+        assert result["sources"]["kg"] == 0
+        assert result["sources"]["chroma"] >= 0

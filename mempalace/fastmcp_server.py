@@ -29,7 +29,7 @@ from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .middleware import build_middleware_stack
 from .settings import settings, MemPalaceSettings
 from .version import __version__
-from .searcher import search_memories, search_memories_async
+from .searcher import search_memories, search_memories_async, hybrid_search_async
 from .palace_graph import traverse, find_tunnels, graph_stats
 from .knowledge_graph import KnowledgeGraph
 from .backends import get_backend
@@ -301,6 +301,25 @@ def _register_tools(server, backend, config, settings):
             agent_id=agent_id,
             n_results=limit,
             rerank=rerank,
+        )
+
+    @server.tool(timeout=settings.timeout_embed)
+    async def mempalace_hybrid_search(
+        ctx: Context,
+        query: str,
+        limit: int = 10,
+        wing: str | None = None,
+        room: str | None = None,
+        use_kg: bool = True,
+        rerank: bool = False,
+        agent_id: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Hybrid search: semantic (ChromaDB) + knowledge graph (SQLite) combined.
+        use_kg=True adds entity relationship facts alongside vector matches.
+        rerank: bool — if True, apply cross-encoder reranking (slower, better precision)."""
+        return await hybrid_search_async(
+            query=query, palace_path=settings.db_path, wing=wing, room=room,
+            n_results=limit, use_kg=use_kg, rerank=rerank, agent_id=agent_id,
         )
 
     @server.tool(timeout=settings.timeout_embed)

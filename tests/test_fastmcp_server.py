@@ -119,9 +119,9 @@ async def seeded_palace_client(tmp_path):
 
 
 async def test_list_tools_count(client):
-    """Verify server exposes exactly 25 tools."""
+    """Verify server exposes exactly 26 tools."""
     tools = await client.list_tools()
-    assert len(tools) == 25
+    assert len(tools) == 26
 
 
 async def test_list_tools_contains_expected(client):
@@ -135,6 +135,7 @@ async def test_list_tools_contains_expected(client):
         "mempalace_get_taxonomy",
         "mempalace_get_aaak_spec",
         "mempalace_search",
+        "mempalace_hybrid_search",
         "mempalace_check_duplicate",
         "mempalace_traverse_graph",
         "mempalace_find_tunnels",
@@ -536,6 +537,14 @@ async def test_export_claude_md(seeded_palace_client):
 
 
 # ── Tool Timeouts ─────────────────────────────────────────────────────
+
+
+async def test_hybrid_search_tool_exists(client):
+    """Verify mempalace_hybrid_search tool is registered."""
+    tools = await client.list_tools()
+    tool_map = {t.name: t for t in tools}
+    hybrid_tool = tool_map.get("mempalace_hybrid_search")
+    assert hybrid_tool is not None, "mempalace_hybrid_search not found in tool registry"
 
 
 async def test_search_tool_has_timeout(client):
