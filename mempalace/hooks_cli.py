@@ -207,7 +207,8 @@ def hook_session_start(data: dict, harness: str, transport: str = "cli"):
             lines = []
 
         if not lines:
-            return  # empty results → silent, no output
+            _output({})
+            return  # empty results → output empty dict
 
         context = "## Relevant memories\n" + "\n".join(f"- {l}" for l in lines)
         _output({"context": context})

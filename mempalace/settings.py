@@ -29,6 +29,7 @@ class MemPalaceSettings(BaseSettings):
     # Cache TTL (zachovat hodnoty z middleware.py)
     cache_ttl_status: int = 5  # sekund
     cache_ttl_metadata: int = 30  # sekund pro wings/rooms/taxonomy
+    query_cache_ttl: int = 300  # sekund (env: MEMPALACE_QUERY_CACHE_TTL)
 
     # Circuit breaker
     cb_failure_threshold: int = 5

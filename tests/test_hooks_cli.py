@@ -438,3 +438,19 @@ def test_hook_session_start_no_subprocess():
     from mempalace.hooks_cli import hook_session_start
     src = inspect.getsource(hook_session_start)
     assert "mempalace search" not in src, "hook_session_start must not use subprocess for search"
+
+
+def test_hook_session_start_empty_outputs_dict(tmp_path):
+    """hook_session_start with empty results must output {}, not None."""
+    import json
+    from unittest.mock import patch
+    from mempalace.hooks_cli import hook_session_start
+
+    # No palace, so search returns empty
+    with patch("mempalace.hooks_cli._output") as mock_output:
+        hook_session_start(
+            data={"cwd": str(tmp_path)},
+            harness="claude-code",
+        )
+    # Must call _output with {} even when no results
+    mock_output.assert_called_once_with({})

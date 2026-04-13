@@ -22,6 +22,34 @@ _search_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp_sear
 _reranker = None
 _reranker_lock = threading.Lock()
 
+# Query cache singleton (lazy, thread-safe)
+_query_cache = None
+_query_cache_lock = threading.Lock()
+
+
+def _get_query_cache():
+    global _query_cache
+    if _query_cache is None:
+        with _query_cache_lock:
+            if _query_cache is None:
+                from .query_cache import QueryCache
+                _query_cache = QueryCache()
+    return _query_cache
+
+# Query cache singleton (lazy, thread-safe)
+_query_cache = None
+_query_cache_lock = threading.Lock()
+
+
+def _get_query_cache():
+    global _query_cache
+    if _query_cache is None:
+        with _query_cache_lock:
+            if _query_cache is None:
+                from .query_cache import QueryCache
+                _query_cache = QueryCache()
+    return _query_cache
+
 
 def _get_reranker():
     global _reranker
@@ -167,6 +195,20 @@ def search_memories(
     if not query:
         return {"query": "", "filters": {}, "results": [], "error": "Query was empty after sanitization"}
 
+    # Cache lookup before backend call
+    try:
+        import time
+        cache = _get_query_cache()
+        cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}"
+        if cache_key in cache._cache:
+            cached_result, cached_ts = cache._cache[cache_key]
+            if time.monotonic() - cached_ts < cache._ttl:
+                return cached_result
+            else:
+                del cache._cache[cache_key]
+    except Exception:
+        pass
+
     try:
         cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
@@ -239,7 +281,7 @@ def search_memories(
             except Exception as e:
                 logger.warning("Reranking failed, cosine order preserved: %s", e)
 
-    return {
+    result_dict = {
         "query": query,
         "filters": {
             "wing": wing, "room": room,
@@ -248,6 +290,21 @@ def search_memories(
         },
         "results": hits,
     }
+
+    # Cache result (skip errors)
+    if "error" not in result_dict:
+        try:
+            import time
+            cache = _get_query_cache()
+            cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}"
+            cache._cache[cache_key] = (result_dict, time.monotonic())
+            # Evict if over maxsize
+            while len(cache._cache) > cache._maxsize:
+                cache._cache.popitem(last=False)
+        except Exception:
+            pass
+
+    return result_dict
 
 
 async def search_memories_async(

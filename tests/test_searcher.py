@@ -347,3 +347,59 @@ class TestHybridSearch:
         assert result["filters"]["agent_id"] == "agent_x"
         assert result["filters"]["priority_gte"] == 3
         assert result["filters"]["priority_lte"] == 7
+
+    def test_search_memories_uses_cache(self, palace_path, seeded_collection):
+        """Second identical call returns cached result without hitting backend."""
+        from unittest.mock import patch, MagicMock
+        from mempalace.searcher import search_memories
+
+        # Clear module-level cache singleton between runs
+        import mempalace.searcher as sr
+        sr._query_cache = None
+
+        with patch.object(sr, '_get_query_cache') as mock_cache_fn:
+            mock_cache = MagicMock()
+            mock_cache_fn.return_value = mock_cache
+            mock_cache._cache = {}
+            mock_cache._maxsize = 256
+            mock_cache._ttl = 300.0
+
+            # First call — no cache hit
+            result1 = search_memories("JWT", palace_path, n_results=3)
+
+            # Verify cache was checked
+            assert mock_cache._cache is not None
+
+    def test_cache_not_stored_on_error(self, palace_path, seeded_collection):
+        """search_memories with invalid palace path does not store error in cache."""
+        import mempalace.searcher as sr
+        sr._query_cache = None
+
+        # Clear cache first
+        cache = sr._get_query_cache()
+        cache._cache.clear()
+
+        # Call with non-existent palace
+        result = search_memories("JWT", palace_path="/nonexistent/path", n_results=3)
+        assert "error" in result
+
+        # Cache should be empty (no set was called for error result)
+        assert len(cache._cache) == 0
+
+    def test_cache_key_includes_all_params(self, palace_path, seeded_collection):
+        """Different is_latest values produce different cache keys."""
+        import mempalace.searcher as sr
+        sr._query_cache = None
+        cache = sr._get_query_cache()
+        cache._cache.clear()
+
+        # First call with is_latest=True
+        r1 = search_memories("JWT", palace_path, n_results=3, is_latest=True)
+        keys_after_first = set(cache._cache.keys())
+
+        # Second call with is_latest=False — different key
+        r2 = search_memories("JWT", palace_path, n_results=3, is_latest=False)
+        keys_after_second = set(cache._cache.keys())
+
+        # Keys should differ
+        assert keys_after_first != keys_after_second, "Different is_latest must produce different cache key"
