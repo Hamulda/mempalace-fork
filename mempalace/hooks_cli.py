@@ -124,22 +124,6 @@ def hook_stop(data: dict, harness: str, transport: str = "cli"):
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
 
-    # HTTP fast-path: call MCP server synchronously instead of spawning subprocess
-    if transport == "http":
-        try:
-            import requests
-            resp = requests.post(
-                "http://127.0.0.1:8765/mcp",
-                json={"method": "hooks/stop", "params": data},
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                result = resp.json()
-                _output(result.get("result", {}))
-                return
-        except Exception as e:
-            _log(f"HTTP stop fallback: {e}")
-
     # If already in a save cycle, let through (infinite-loop prevention)
     if str(stop_hook_active).lower() in ("true", "1", "yes"):
         _output({})

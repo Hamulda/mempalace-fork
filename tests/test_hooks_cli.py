@@ -421,3 +421,12 @@ def test_run_hook_invalid_json(tmp_path):
             with patch("mempalace.hooks_cli._output") as mock_output:
                 run_hook("session-start", "claude-code")
     mock_output.assert_called_once_with({})
+
+
+def test_hook_stop_no_http_block():
+    """hook_stop must not contain HTTP fast-path calling hooks/stop endpoint."""
+    import inspect
+    from mempalace.hooks_cli import hook_stop
+    src = inspect.getsource(hook_stop)
+    assert "hooks/stop" not in src, "hook_stop must not call HTTP /mcp endpoint"
+    assert "requests.post" not in src, "hook_stop must not use HTTP POST"

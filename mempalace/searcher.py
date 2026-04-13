@@ -241,7 +241,11 @@ def search_memories(
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room},
+        "filters": {
+            "wing": wing, "room": room,
+            "is_latest": is_latest, "agent_id": agent_id,
+            "priority_gte": priority_gte, "priority_lte": priority_lte,
+        },
         "results": hits,
     }
 
@@ -342,84 +346,6 @@ def hybrid_search(
         "results": merged[:n_results],
         "sources": {"chroma": len(hits), "kg": len(kg_hits)},
     }
-
-
-async def hybrid_search_async(
-    query: str, palace_path: str, wing: str = None, room: str = None,
-    n_results: int = 10, use_kg: bool = True, rerank: bool = False, agent_id: str = None,
-) -> dict:
-    import asyncio, functools
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        _search_executor,
-        functools.partial(hybrid_search, query=query, palace_path=palace_path,
-            wing=wing, room=room, n_results=n_results, use_kg=use_kg,
-            rerank=rerank, agent_id=agent_id)
-    )
-
-def hybrid_search(
-    query: str,
-    palace_path: str,
-    wing: str = None,
-    room: str = None,
-    n_results: int = 10,
-    use_kg: bool = True,
-    rerank: bool = False,
-    agent_id: str = None,
-) -> dict:
-    from datetime import date
-
-    # Vrstva 1: ChromaDB semantic search
-    chroma = search_memories(
-        query=query, palace_path=palace_path, wing=wing, room=room,
-        n_results=n_results, is_latest=True, agent_id=agent_id, rerank=rerank
-    )
-    hits = chroma.get("results", [])
-
-    # Vrstva 2: KG entity search
-    kg_hits = []
-    if use_kg:
-        try:
-            from .knowledge_graph import KnowledgeGraph
-            from pathlib import Path
-            kg_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
-            kg = KnowledgeGraph(db_path=kg_path)
-            today = date.today().isoformat()
-            tokens = [t.lower() for t in query.split() if len(t) > 3]
-            seen = set()
-            for token in tokens[:5]:
-                for triple in kg.query_entity(token, as_of=today)[:3]:
-                    key = f"{triple['subject']}_{triple['predicate']}_{triple['object']}"
-                    if key not in seen:
-                        seen.add(key)
-                        kg_hits.append({
-                            "text": f"{triple['subject']} {triple['predicate']} {triple['object']}",
-                            "wing": "knowledge_graph",
-                            "room": triple["predicate"],
-                            "source_file": "knowledge_graph.sqlite3",
-                            "similarity": triple.get("confidence", 0.8),
-                            "source": "kg",
-                        })
-            kg.close()
-        except Exception as e:
-            logger.warning("KG layer failed in hybrid_search, ChromaDB only: %s", e)
-
-    # Sloučit + deduplikovat (ChromaDB první)
-    seen_texts = set()
-    merged = []
-    for h in hits + kg_hits:
-        key = h["text"][:80]
-        if key not in seen_texts:
-            seen_texts.add(key)
-            merged.append(h)
-
-    return {
-        "query": query,
-        "filters": {"wing": wing, "room": room, "agent_id": agent_id},
-        "results": merged[:n_results],
-        "sources": {"chroma": len(hits), "kg": len(kg_hits)},
-    }
-
 
 async def hybrid_search_async(
     query: str, palace_path: str, wing: str = None, room: str = None,

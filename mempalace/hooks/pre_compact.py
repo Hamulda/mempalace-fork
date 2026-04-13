@@ -37,7 +37,7 @@ def main():
         },
     }
 
-    mcp_url = os.environ.get("MEMPALACE_URL", "http://127.0.0.1:8766")
+    mcp_url = os.environ.get("MEMPALACE_URL", "http://127.0.0.1:8765")
 
     try:
         req_data = json.dumps(

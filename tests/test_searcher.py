@@ -326,3 +326,24 @@ class TestHybridSearch:
 
         assert result["sources"]["kg"] == 0
         assert result["sources"]["chroma"] >= 0
+
+    def test_hybrid_search_defined_once(self):
+        """hybrid_search and hybrid_search_async exist exactly once each."""
+        import inspect
+        from mempalace.searcher import hybrid_search, hybrid_search_async
+        src = inspect.getsource(hybrid_search)
+        assert src.count("def hybrid_search(") == 1
+        src_async = inspect.getsource(hybrid_search_async)
+        assert src_async.count("async def hybrid_search_async(") == 1
+
+    def test_search_memories_returns_all_filters(self, palace_path, seeded_collection):
+        """search_memories returns is_latest, agent_id, priority_gte, priority_lte in filters."""
+        result = search_memories(
+            "JWT", palace_path, n_results=5,
+            is_latest=True, agent_id="agent_x",
+            priority_gte=3, priority_lte=7,
+        )
+        assert result["filters"]["is_latest"] is True
+        assert result["filters"]["agent_id"] == "agent_x"
+        assert result["filters"]["priority_gte"] == 3
+        assert result["filters"]["priority_lte"] == 7
