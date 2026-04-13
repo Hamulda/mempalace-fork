@@ -958,6 +958,11 @@ if __name__ == "__main__":
     mcp = create_server()
 
     if settings.transport == "http":
-        serve_http(host=settings.host, port=settings.port)
+        # Native FastMCP streamable-http transport
+        mcp.run(
+            transport="streamable-http",
+            host=settings.host,
+            port=settings.port,
+        )
     else:
         mcp.run()
