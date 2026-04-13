@@ -1,7 +1,7 @@
 {
   "name": "mempalace",
-  "version": "3.0.14",
-  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 19 MCP tools, auto-save hooks, and guided setup.",
+  "version": "3.1.0",
+  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 19 MCP tools, auto-save hooks, and guided setup. Run 'python3 -m mempalace.fastmcp_server' before use.",
   "author": {
     "name": "milla-jovovich"
   },
@@ -9,11 +9,8 @@
   "commands": [],
   "mcpServers": {
     "mempalace": {
-      "command": "/Users/vojtechhamada/.pyenv/versions/3.12.12/bin/python3",
-      "args": [
-        "-m",
-        "mempalace.fastmcp_server"
-      ]
+      "transport": "http",
+      "url": "http://127.0.0.1:8765/mcp"
     }
   },
   "keywords": [

@@ -1,9 +1,6 @@
 {
   "mempalace": {
-    "command": "/Users/vojtechhamada/.pyenv/versions/3.12.12/bin/python3",
-    "args": [
-      "-m",
-      "mempalace.fastmcp_server"
-    ]
+    "transport": "http",
+    "url": "http://127.0.0.1:8765/mcp"
   }
 }

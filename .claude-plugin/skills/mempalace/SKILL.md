@@ -19,7 +19,12 @@ mempalace --version
 If not installed:
 
 ```bash
-pip install mempalace
+# Lokální install (development)
+pip install -e /path/to/mempalace
+# nebo: uv pip install -e /path/to/mempalace
+
+# Spuštění HTTP serveru (nutné před použitím)
+python3 -m mempalace.fastmcp_server
 ```
 
 ## Usage
