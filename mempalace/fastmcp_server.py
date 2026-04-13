@@ -176,7 +176,7 @@ def create_server(settings: MemPalaceSettings | None = None) -> FastMCP:
 
 
 def _register_tools(server, backend, config, settings):
-    """Register all 23 @mcp.tool() as closures over backend/config/kg."""
+    """Register all 27 @mcp.tool() as closures over backend/config/kg."""
 
     def _get_collection(create=False):
         """Return the palace collection using the configured backend."""
@@ -788,28 +788,30 @@ def _register_tools(server, backend, config, settings):
             return _no_palace()
 
         try:
-            results = col.query(
+            all_results = col.query(
                 query_texts=[project_path],
-                n_results=limit,
-                where={"project": project_path},
+                n_results=limit * 3,
                 include=["documents", "metadatas", "distances"],
             )
-
             memories = []
-            if results["ids"] and results["ids"][0]:
-                for i, drawer_id in enumerate(results["ids"][0]):
-                    doc = results["documents"][0][i]
-                    meta = results["metadatas"][0][i]
-                    dist = results["distances"][0][i]
-                    similarity = round(1 - dist, 3)
-                    memories.append({
-                        "id": drawer_id,
-                        "wing": meta.get("wing", "?"),
-                        "room": meta.get("room", "?"),
-                        "similarity": similarity,
-                        "content": doc,
-                    })
-
+            if all_results["ids"] and all_results["ids"][0]:
+                for i, drawer_id in enumerate(all_results["ids"][0]):
+                    meta = all_results["metadatas"][0][i]
+                    doc = all_results["documents"][0][i]
+                    dist = all_results["distances"][0][i]
+                    # Filter by source_file containing project_path or wing containing project slug
+                    project_slug = Path(project_path).name.lower().replace("-", "_")
+                    source_match = project_path in meta.get("source_file", "")
+                    wing_match = project_slug in meta.get("wing", "").lower()
+                    if source_match or wing_match:
+                        memories.append({
+                            "id": drawer_id,
+                            "wing": meta.get("wing", "?"),
+                            "room": meta.get("room", "?"),
+                            "similarity": round(1 - dist, 3),
+                            "content": doc,
+                        })
+            memories = memories[:limit]
             return {
                 "project_path": project_path,
                 "memories": memories,
@@ -930,6 +932,17 @@ def _register_tools(server, backend, config, settings):
 
             merged_count = 0
             if merge and len(duplicates) > 1:
+                # Sort by filed_at descending — newest as keeper
+                duplicates_with_ts = []
+                for dup in duplicates:
+                    try:
+                        raw = col.get(ids=[dup["id"]], include=["metadatas"])
+                        ts = raw["metadatas"][0].get("filed_at", "") if raw["metadatas"] else ""
+                    except Exception:
+                        ts = ""
+                    duplicates_with_ts.append({**dup, "_filed_at": ts})
+                duplicates_with_ts.sort(key=lambda x: x["_filed_at"], reverse=True)
+                duplicates = duplicates_with_ts
                 keeper = duplicates[0]
                 to_remove = duplicates[1:]
 
@@ -1039,7 +1052,7 @@ def _register_tools(server, backend, config, settings):
 # HTTP TRANSPORT
 # ═══════════════════════════════════════════════════════════════════
 
-def serve_http(host: str = "127.0.0.1", port: int = 8766, server: FastMCP | None = None) -> None:
+def serve_http(host: str = "127.0.0.1", port: int = 8765, server: FastMCP | None = None) -> None:
     """Run MemPalace FastMCP server over HTTP using Starlette + Uvicorn."""
     try:
         from starlette.applications import Starlette
