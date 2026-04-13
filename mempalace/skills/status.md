@@ -47,3 +47,10 @@ Based on the current state, suggest one relevant action:
 - Use short labels and numbers, not prose paragraphs.
 - If any step fails or a tool is unavailable, note it briefly and continue
   with what is available.
+
+## Provenance Metadata
+
+The response now includes provenance metadata per drawer: `agent_id`, `timestamp`,
+`origin_type`, `is_latest`. After calling mempalace_status, if you need to find
+facts specifically saved by a particular agent, use mempalace_hybrid_search
+with `agent_id` filter.

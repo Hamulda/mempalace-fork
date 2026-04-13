@@ -16,7 +16,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ---
 
-## MCP Tools (19)
+## MCP Tools (26)
 
 ### Palace (read)
 - mempalace_status -- Palace status and stats
@@ -48,6 +48,15 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 - mempalace_diary_read -- Read diary entries
 
 ---
+
+## New in this fork
+
+- **mempalace_hybrid_search** — combines semantic (ChromaDB) + keyword (BM25) + KG in one call
+- **mempalace_kg_supersede** — atomically replace a fact (invalidate old, add new)
+- **mempalace_kg_history** — audit trail for any fact (all versions over time)
+- **mempalace_remember_code** — store code with description for better semantic search
+- **mempalace_consolidate** — find and optionally merge duplicate memories by topic
+- **mempalace_export_claude_md** — export memories to CLAUDE.md format
 
 ## CLI Commands
 

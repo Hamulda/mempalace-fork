@@ -56,6 +56,17 @@ completion, summarize the results including:
 - Categories or classifications applied
 - Any warnings or skipped files
 
+## 5b. Provenance Metadata
+
+When mining, drawers are automatically tagged with:
+- **origin_type**: "observation" for mined content, "diary_entry" for diary writes
+- **is_latest**: True (set False by mempalace_cleanup or supersede)
+- **agent_id**: set to the "added_by" value you provide
+- **timestamp**: UTC timestamp of when the drawer was filed
+
+Use `agent_id` filter in mempalace_hybrid_search to find content from a
+specific source or session.
+
 ## 6. Suggest next steps
 
 After mining completes, suggest the user try:
