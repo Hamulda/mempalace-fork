@@ -89,6 +89,55 @@ class TestInvalidation:
         assert chess[0]["valid_to"] == "2026-01-01"
         assert chess[0]["current"] is False
 
+    def test_supersede_triple_invalidates_old(self, kg):
+        """Supersede marks old triple as expired and adds new triple."""
+        kg.add_triple("Bob", "status", "active", valid_from="2025-01-01")
+        result = kg.supersede_triple("Bob", "status", "active", "inactive")
+        assert result["old_value"] == "active"
+        assert result["new_value"] == "inactive"
+        assert result["old_id"] is not None
+        assert result["new_id"] is not None
+        # query_entity returns all triples (current + expired)
+        all_status = kg.query_entity("Bob", direction="outgoing")
+        status_triples = [r for r in all_status if r["predicate"] == "status"]
+        assert len(status_triples) == 2
+        # One should be expired (active), one current (inactive)
+        expired = [r for r in status_triples if r["object"] == "active"]
+        current = [r for r in status_triples if r["object"] == "inactive"]
+        assert len(expired) == 1
+        assert expired[0]["current"] is False
+        assert expired[0]["valid_to"] is not None
+        assert len(current) == 1
+        assert current[0]["current"] is True
+
+    def test_get_triple_history_two_versions(self, kg):
+        """Supersede creates 2 entries in history, one current=True."""
+        kg.add_triple("Carol", "status", "online", valid_from="2025-01-01", rel_type="initial")
+        kg.supersede_triple("Carol", "status", "online", "offline")
+        history = kg.get_triple_history("Carol", "status")
+        assert len(history) == 2
+        assert sum(1 for h in history if h["current"]) == 1
+        assert sum(1 for h in history if not h["current"]) == 1
+
+    def test_rel_type_stored_and_retrieved(self, kg):
+        """add_triple with rel_type='correction' is stored and retrieved."""
+        kg.add_triple("Dan", "answer", "42", rel_type="correction")
+        history = kg.get_triple_history("Dan", "answer")
+        assert len(history) == 1
+        assert history[0]["rel_type"] == "correction"
+
+    def test_active_only_filter(self, kg):
+        """query_entity(active_only=True) excludes expired triples."""
+        kg.add_triple("Eve", "mood", "happy", valid_from="2025-01-01")
+        kg.add_triple("Eve", "mood", "sad", valid_from="2025-06-01")
+        kg.invalidate("Eve", "mood", "sad", ended="2025-12-01")
+        all_facts = kg.query_entity("Eve", direction="outgoing")
+        active_facts = kg.query_entity("Eve", direction="outgoing", active_only=True)
+        assert len(all_facts) == 2
+        assert len(active_facts) == 1
+        assert active_facts[0]["object"] == "happy"
+        assert active_facts[0]["current"] is True
+
 
 class TestTimeline:
     def test_timeline_all(self, seeded_kg):

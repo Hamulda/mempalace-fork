@@ -119,9 +119,9 @@ async def seeded_palace_client(tmp_path):
 
 
 async def test_list_tools_count(client):
-    """Verify server exposes exactly 23 tools."""
+    """Verify server exposes exactly 25 tools."""
     tools = await client.list_tools()
-    assert len(tools) == 23
+    assert len(tools) == 25
 
 
 async def test_list_tools_contains_expected(client):
@@ -142,6 +142,8 @@ async def test_list_tools_contains_expected(client):
         "mempalace_kg_query",
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
+        "mempalace_kg_history",
         "mempalace_kg_timeline",
         "mempalace_kg_stats",
         "mempalace_add_drawer",
@@ -283,6 +285,30 @@ async def test_add_drawer_duplicate_detection(empty_palace_client):
     assert data2["reason"] == "already_exists"
 
 
+async def test_add_drawer_has_is_latest(empty_palace_client):
+    """Add drawer metadata includes is_latest=True and timestamp in ChromaDB."""
+    client, palace_path = empty_palace_client
+    result = await client.call_tool("mempalace_add_drawer", {
+        "wing": "test_wing",
+        "room": "test_room",
+        "content": "Memory with provenance fields.",
+    })
+    data = _get_result_data(result)
+    assert data["success"] is True
+    drawer_id = data["drawer_id"]
+
+    # Verify metadata stored in ChromaDB
+    from mempalace.backends import get_backend
+    backend = get_backend("chromadb")
+    col = backend.get_collection(palace_path, "mempalace_drawers")
+    stored = col.get(ids=[drawer_id])
+    meta = stored["metadatas"][0]
+    assert meta.get("is_latest") is True
+    assert "timestamp" in meta
+    assert meta.get("origin_type") == "observation"
+    assert meta.get("agent_id") == "mcp"
+
+
 async def test_check_duplicate(seeded_palace_client):
     """Check duplicate detects similar content."""
     client, palace_path = seeded_palace_client
@@ -355,6 +381,52 @@ async def test_kg_invalidate(empty_palace_client):
     assert data["success"] is True
 
 
+async def test_kg_supersede_tool(empty_palace_client):
+    """KG supersede atomically replaces old fact with new one."""
+    client, palace_path = empty_palace_client
+    await client.call_tool("mempalace_kg_add", {
+        "subject": "Bob",
+        "predicate": "status",
+        "object": "active",
+    })
+    result = await client.call_tool("mempalace_kg_supersede", {
+        "subject": "Bob",
+        "predicate": "status",
+        "old_value": "active",
+        "new_value": "inactive",
+    })
+    data = _get_result_data(result)
+    assert data["success"] is True
+    assert "old_id" in data
+    assert "new_id" in data
+    assert data["old_value"] == "active"
+    assert data["new_value"] == "inactive"
+
+
+async def test_kg_history_tool(empty_palace_client):
+    """mempalace_kg_history returns all versions after supersede."""
+    client, palace_path = empty_palace_client
+    await client.call_tool("mempalace_kg_add", {
+        "subject": "Frank",
+        "predicate": "role",
+        "object": "developer",
+    })
+    await client.call_tool("mempalace_kg_supersede", {
+        "subject": "Frank",
+        "predicate": "role",
+        "old_value": "developer",
+        "new_value": "senior_developer",
+    })
+    result = await client.call_tool("mempalace_kg_history", {
+        "subject": "Frank",
+        "predicate": "role",
+    })
+    data = _get_result_data(result)
+    assert data["versions"] == 2
+    assert len(data["history"]) == 2
+    assert data["current"] is not None
+
+
 async def test_kg_stats(empty_palace_client):
     """KG stats returns overview."""
     client, palace_path = empty_palace_client
@@ -383,6 +455,28 @@ async def test_diary_write_and_read(empty_palace_client):
     assert read_data["total"] == 1
     assert read_data["entries"][0]["topic"] == "architecture"
     assert "authentication" in read_data["entries"][0]["content"]
+
+
+async def test_diary_write_idempotent(empty_palace_client):
+    """Calling diary_write twice with same data does not raise."""
+    client, palace_path = empty_palace_client
+    entry = "Consistent diary entry about project status."
+    result1 = await client.call_tool("mempalace_diary_write", {
+        "agent_name": "IdempotentAgent",
+        "entry": entry,
+        "topic": "status",
+    })
+    data1 = _get_result_data(result1)
+    assert data1["success"] is True
+
+    # Second write with same data should not raise
+    result2 = await client.call_tool("mempalace_diary_write", {
+        "agent_name": "IdempotentAgent",
+        "entry": entry,
+        "topic": "status",
+    })
+    data2 = _get_result_data(result2)
+    assert data2["success"] is True
 
 
 async def test_diary_read_empty(empty_palace_client):

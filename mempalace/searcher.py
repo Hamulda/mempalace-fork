@@ -6,16 +6,70 @@ Semantic search against the palace.
 Returns verbatim text — the actual words, never summaries.
 """
 
+import functools
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .backends import get_backend
+from .query_sanitizer import sanitize_query
 
 logger = logging.getLogger("mempalace_mcp")
+
+_search_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp_search")
+
+_reranker = None
+_reranker_lock = threading.Lock()
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        with _reranker_lock:
+            if _reranker is None:
+                try:
+                    from sentence_transformers import CrossEncoder
+
+                    _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+                    logger.info("Cross-encoder reranker loaded")
+                except ImportError:
+                    _reranker = False
+                    logger.info("sentence-transformers not installed, reranking disabled")
+    return _reranker if _reranker is not False else None
 
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
+
+
+def _build_where_filter(
+    wing: str = None,
+    room: str = None,
+    is_latest: bool = None,
+    agent_id: str = None,
+    priority_gte: int = None,
+    priority_lte: int = None,
+) -> dict:
+    conditions = []
+    if wing:
+        conditions.append({"wing": {"$eq": wing}})
+    if room:
+        conditions.append({"room": {"$eq": room}})
+    if is_latest is not None:
+        conditions.append({"is_latest": {"$eq": is_latest}})
+    if agent_id:
+        conditions.append({"agent_id": {"$eq": agent_id}})
+    if priority_gte is not None:
+        conditions.append({"priority": {"$gte": priority_gte}})
+    if priority_lte is not None:
+        conditions.append({"priority": {"$lte": priority_lte}})
+
+    if len(conditions) == 0:
+        return {}
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
 
 
 def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
@@ -24,6 +78,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Optionally filter by wing (project) or room (aspect).
     """
     from .config import MempalaceConfig
+
+    query = sanitize_query(query)
+    if not query:
+        print("\n  Query empty after sanitization (possible injection detected).")
+        return
 
     try:
         cfg = MempalaceConfig()
@@ -34,14 +93,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"  Run: mempalace init <dir> then mempalace mine <dir>")
         raise SearchError(f"No palace found at {palace_path}")
 
-    # Build where filter
-    where = {}
-    if wing and room:
-        where = {"$and": [{"wing": wing}, {"room": room}]}
-    elif wing:
-        where = {"wing": wing}
-    elif room:
-        where = {"room": room}
+    where = _build_where_filter(wing=wing, room=room)
 
     try:
         kwargs = {
@@ -94,13 +146,26 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
 
 def search_memories(
-    query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    is_latest: bool = None,
+    agent_id: str = None,
+    priority_gte: int = None,
+    priority_lte: int = None,
+    n_results: int = 5,
+    rerank: bool = False,
 ) -> dict:
     """
     Programmatic search — returns a dict instead of printing.
     Used by the MCP server and other callers that need data.
     """
     from .config import MempalaceConfig
+
+    query = sanitize_query(query)
+    if not query:
+        return {"query": "", "filters": {}, "results": [], "error": "Query was empty after sanitization"}
 
     try:
         cfg = MempalaceConfig()
@@ -113,14 +178,22 @@ def search_memories(
             "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
         }
 
-    # Build where filter
-    where = {}
-    if wing and room:
-        where = {"$and": [{"wing": wing}, {"room": room}]}
-    elif wing:
-        where = {"wing": wing}
-    elif room:
-        where = {"room": room}
+    where = _build_where_filter(
+        wing=wing,
+        room=room,
+        is_latest=is_latest,
+        agent_id=agent_id,
+        priority_gte=priority_gte,
+        priority_lte=priority_lte,
+    )
+
+    # Adaptive top_k — prevent ChromaDB exception when n_results > doc count
+    try:
+        actual_count = col.count()
+        if actual_count < n_results:
+            n_results = max(1, actual_count)
+    except Exception:
+        pass
 
     try:
         kwargs = {
@@ -151,8 +224,57 @@ def search_memories(
             }
         )
 
+    # Rerank: re-order using cross-encoder if query has >3 words
+    if rerank and len(hits) > 1 and len(query.split()) > 3:
+        reranker = _get_reranker()
+        if reranker is not None:
+            try:
+                pairs = [[query, h["text"]] for h in hits]
+                scores = reranker.predict(pairs)
+                hits_scored = sorted(zip(scores, hits), key=lambda x: x[0], reverse=True)
+                hits = []
+                for score, h in hits_scored:
+                    h["rerank_score"] = round(float(score), 4)
+                    hits.append(h)
+            except Exception as e:
+                logger.warning("Reranking failed, cosine order preserved: %s", e)
+
     return {
         "query": query,
         "filters": {"wing": wing, "room": room},
         "results": hits,
     }
+
+
+async def search_memories_async(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    is_latest: bool = None,
+    agent_id: str = None,
+    priority_gte: int = None,
+    priority_lte: int = None,
+    n_results: int = 5,
+    rerank: bool = False,
+) -> dict:
+    """Non-blocking wrapper — používej v async kontextu (fastmcp_server.py)."""
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _search_executor,
+        functools.partial(
+            search_memories,
+            query=query,
+            palace_path=palace_path,
+            wing=wing,
+            room=room,
+            is_latest=is_latest,
+            agent_id=agent_id,
+            priority_gte=priority_gte,
+            priority_lte=priority_lte,
+            n_results=n_results,
+            rerank=rerank,
+        ),
+    )

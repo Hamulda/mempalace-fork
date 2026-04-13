@@ -88,6 +88,13 @@ class KnowledgeGraph:
         """)
         conn.commit()
 
+        # Migrace: přidej rel_type sloupec pokud neexistuje (starší DB)
+        try:
+            conn.execute("ALTER TABLE triples ADD COLUMN rel_type TEXT DEFAULT 'observation'")
+            conn.commit()
+        except Exception:
+            pass  # Sloupec již existuje
+
     def _conn(self):
         if self._connection is None:
             self._connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
@@ -128,6 +135,7 @@ class KnowledgeGraph:
         confidence: float = 1.0,
         source_closet: str = None,
         source_file: str = None,
+        rel_type: str = "observation",
     ):
         """
         Add a relationship triple: subject → predicate → object.
@@ -161,8 +169,8 @@ class KnowledgeGraph:
             triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.sha256(f'{valid_from}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]}"
 
             conn.execute(
-                """INSERT INTO triples (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, source_file)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO triples (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, source_file, rel_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     triple_id,
                     sub_id,
@@ -173,6 +181,7 @@ class KnowledgeGraph:
                     confidence,
                     source_closet,
                     source_file,
+                    rel_type,
                 ),
             )
         return triple_id
@@ -191,9 +200,55 @@ class KnowledgeGraph:
                 (ended, sub_id, pred, obj_id),
             )
 
+    def supersede_triple(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        new_value: str,
+        agent_id: str = "unknown",
+        source_closet: str = None,
+    ) -> dict:
+        """
+        Atomically supersede an existing triple with a new value.
+        The old triple gets valid_to = today. The new triple is added.
+        Returns {"old_id": ..., "new_id": ..., "subject": ..., "predicate": ...,
+                "old_value": ..., "new_value": ...}
+        """
+        from datetime import date
+        today = date.today().isoformat()
+        sub_id = self._entity_id(subject)
+        pred = predicate.lower().replace(" ", "_")
+        obj_id = self._entity_id(obj)
+
+        conn = self._conn()
+        old = conn.execute(
+            "SELECT id FROM triples WHERE subject=? AND predicate=? AND valid_to IS NULL",
+            (sub_id, pred),
+        ).fetchone()
+        old_id = old["id"] if old else None
+
+        if old_id:
+            self.invalidate(subject, predicate, obj, ended=today)
+
+        new_id = self.add_triple(
+            subject, predicate, new_value,
+            valid_from=today,
+            source_closet=source_closet,
+        )
+        return {
+            "old_id": old_id,
+            "new_id": new_id,
+            "subject": subject,
+            "predicate": predicate,
+            "old_value": obj,
+            "new_value": new_value,
+            "agent_id": agent_id,
+        }
+
     # ── Query operations ──────────────────────────────────────────────────
 
-    def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
+    def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing", active_only: bool = False):
         """
         Get all relationships for an entity.
 
@@ -211,6 +266,8 @@ class KnowledgeGraph:
             if as_of:
                 query += " AND (t.valid_from IS NULL OR t.valid_from <= ?) AND (t.valid_to IS NULL OR t.valid_to >= ?)"
                 params.extend([as_of, as_of])
+            if active_only:
+                query += " AND t.valid_to IS NULL"
             for row in conn.execute(query, params).fetchall():
                 results.append(
                     {
@@ -232,6 +289,8 @@ class KnowledgeGraph:
             if as_of:
                 query += " AND (t.valid_from IS NULL OR t.valid_from <= ?) AND (t.valid_to IS NULL OR t.valid_to >= ?)"
                 params.extend([as_of, as_of])
+            if active_only:
+                query += " AND t.valid_to IS NULL"
             for row in conn.execute(query, params).fetchall():
                 results.append(
                     {
@@ -248,6 +307,35 @@ class KnowledgeGraph:
                 )
 
         return results
+
+    def get_triple_history(self, subject: str, predicate: str) -> list:
+        """Audit trail — všechny verze faktu (včetně expired), seřazené chronologicky."""
+        sub_id = self._entity_id(subject)
+        pred = predicate.lower().replace(" ", "_")
+        conn = self._conn()
+        rows = conn.execute(
+            """SELECT t.*, s.name as sub_name, o.name as obj_name
+               FROM triples t
+               JOIN entities s ON t.subject = s.id
+               JOIN entities o ON t.object = o.id
+               WHERE t.subject = ? AND t.predicate = ?
+               ORDER BY t.extracted_at ASC""",
+            (sub_id, pred),
+        ).fetchall()
+        return [
+            {
+                "triple_id": r["id"],
+                "subject": r["sub_name"],
+                "predicate": r["predicate"],
+                "object": r["obj_name"],
+                "valid_from": r["valid_from"],
+                "valid_to": r["valid_to"],
+                "rel_type": r["rel_type"] if "rel_type" in r.keys() else "observation",
+                "current": r["valid_to"] is None,
+                "extracted_at": r["extracted_at"],
+            }
+            for r in rows
+        ]
 
     def query_relationship(self, predicate: str, as_of: str = None):
         """Get all triples with a given relationship type."""

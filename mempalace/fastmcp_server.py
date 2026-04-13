@@ -29,7 +29,7 @@ from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .middleware import build_middleware_stack
 from .settings import settings, MemPalaceSettings
 from .version import __version__
-from .searcher import search_memories
+from .searcher import search_memories, search_memories_async
 from .palace_graph import traverse, find_tunnels, graph_stats
 from .knowledge_graph import KnowledgeGraph
 from .backends import get_backend
@@ -281,20 +281,26 @@ def _register_tools(server, backend, config, settings):
         return {"aaak_spec": AAAK_SPEC}
 
     @server.tool(timeout=settings.timeout_embed)
-    def mempalace_search(
+    async def mempalace_search(
         ctx: Context,
         query: str,
         limit: int = 5,
         wing: str | None = None,
         room: str | None = None,
+        is_latest: bool | None = None,
+        agent_id: str | None = None,
+        rerank: bool = False,
     ) -> dict:
         """[MEMPALACE] Semantic search. Returns verbatim drawer content with similarity scores."""
-        return search_memories(
+        return await search_memories_async(
             query,
             palace_path=settings.db_path,
             wing=wing,
             room=room,
+            is_latest=is_latest,
+            agent_id=agent_id,
             n_results=limit,
+            rerank=rerank,
         )
 
     @server.tool(timeout=settings.timeout_embed)
@@ -373,9 +379,10 @@ def _register_tools(server, backend, config, settings):
         entity: str,
         as_of: str | None = None,
         direction: str = "both",
+        active_only: bool = False,
     ) -> dict:
         """[MEMPALACE] Query the knowledge graph for an entity's relationships."""
-        results = kg.query_entity(entity, as_of=as_of, direction=direction)
+        results = kg.query_entity(entity, as_of=as_of, direction=direction, active_only=active_only)
         return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
     @server.tool(timeout=settings.timeout_write)
@@ -432,6 +439,30 @@ def _register_tools(server, backend, config, settings):
             "ended": ended or "today",
         }
 
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_kg_supersede(
+        ctx: Context,
+        subject: str,
+        predicate: str,
+        old_value: str,
+        new_value: str,
+        agent_id: str = "unknown",
+        source_closet: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Atomically supersede a fact: invalidate old, add new. Use when facts change."""
+        try:
+            subject = sanitize_name(subject, "subject")
+            predicate = sanitize_name(predicate, "predicate")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        _wal_log(
+            "kg_supersede",
+            {"subject": subject, "predicate": predicate, "old_value": old_value, "new_value": new_value, "agent_id": agent_id},
+            wal_file=_get_wal_path(settings.wal_dir),
+        )
+        result = kg.supersede_triple(subject, predicate, old_value, new_value, agent_id=agent_id, source_closet=source_closet)
+        return {"success": True, **result}
+
     @server.tool(timeout=settings.timeout_read)
     def mempalace_kg_timeline(ctx: Context, entity: str | None = None) -> dict:
         """[MEMPALACE] Chronological timeline of facts."""
@@ -442,6 +473,18 @@ def _register_tools(server, backend, config, settings):
     def mempalace_kg_stats(ctx: Context) -> dict:
         """[MEMPALACE] Knowledge graph overview: entities, triples, current vs expired facts."""
         return kg.stats()
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_kg_history(ctx: Context, subject: str, predicate: str) -> dict:
+        """[MEMPALACE] Get full audit trail for a fact — all historical versions."""
+        history = kg.get_triple_history(subject, predicate)
+        return {
+            "subject": subject,
+            "predicate": predicate,
+            "history": history,
+            "versions": len(history),
+            "current": next((h for h in history if h["current"]), None),
+        }
 
     # ── WRITE TOOLS ──────────────────────────────────────────────
 
@@ -500,6 +543,11 @@ def _register_tools(server, backend, config, settings):
                         "chunk_index": 0,
                         "added_by": added_by,
                         "filed_at": datetime.now().isoformat(),
+                        "agent_id": added_by,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "origin_type": "observation",
+                        "is_latest": True,
+                        "supersedes_id": "",
                     }
                 ],
             )
@@ -573,7 +621,7 @@ def _register_tools(server, backend, config, settings):
         )
 
         try:
-            col.add(
+            col.upsert(
                 ids=[entry_id],
                 documents=[entry],
                 metadatas=[
@@ -586,6 +634,11 @@ def _register_tools(server, backend, config, settings):
                         "agent": agent_name,
                         "filed_at": now.isoformat(),
                         "date": now.strftime('%Y-%m-%d'),
+                        "agent_id": agent_name,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "origin_type": "diary_entry",
+                        "is_latest": True,
+                        "supersedes_id": "",
                     }
                 ],
             )
@@ -733,6 +786,11 @@ def _register_tools(server, backend, config, settings):
                     "description": description,
                     "added_by": added_by,
                     "filed_at": datetime.now().isoformat(),
+                    "agent_id": added_by,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "origin_type": "observation",
+                    "is_latest": True,
+                    "supersedes_id": "",
                 }],
             )
             logger.info(f"Remembered code: {drawer_id} → {wing}/{room}")
@@ -791,6 +849,11 @@ def _register_tools(server, backend, config, settings):
 
                 for dup in to_remove:
                     try:
+                        _wal_log(
+                            "consolidate_delete",
+                            {"deleted_id": dup["id"], "topic": topic, "keeper_id": keeper["id"]},
+                            wal_file=_get_wal_path(settings.wal_dir),
+                        )
                         col.delete(ids=[dup["id"]])
                         merged_count += 1
                     except Exception:

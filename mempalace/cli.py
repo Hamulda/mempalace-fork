@@ -490,6 +490,63 @@ def cmd_optimize(args):
         print(f"Optimize failed: {e}")
 
 
+def cmd_cleanup(args):
+    """Remove old non-latest memories and expired knowledge graph facts."""
+    from datetime import datetime, timedelta
+    from .config import MempalaceConfig
+    from .backends import get_backend
+    from .knowledge_graph import KnowledgeGraph
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    cfg = MempalaceConfig()
+    cutoff = (datetime.utcnow() - timedelta(days=args.days)).isoformat() + "Z"
+    kg_cutoff = (datetime.utcnow() - timedelta(days=args.kg_days)).isoformat()
+
+    print(f"Cleanup cutoff: {cutoff} (ChromaDB), {kg_cutoff} (KG)")
+
+    # ChromaDB cleanup — POUZE is_latest=False nebo is_latest chybí AND staré
+    try:
+        backend = get_backend(cfg.backend)
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
+        all_data = col.get(include=["metadatas"], limit=100000)
+        to_delete = []
+        for i, meta in enumerate(all_data["metadatas"]):
+            ts = meta.get("timestamp", "")
+            is_latest = meta.get("is_latest", True)  # default True pro staré záznamy bez pole
+            if ts and ts < cutoff and not is_latest:
+                to_delete.append(all_data["ids"][i])
+
+        print(f"ChromaDB: {len(to_delete)} drawers eligible for deletion")
+        if not args.dry_run and to_delete:
+            col.delete(ids=to_delete)
+            print(f"  Deleted {len(to_delete)} drawers")
+    except Exception as e:
+        import sys
+        sys.stderr.write(f"ChromaDB cleanup error: {e}\n")
+
+    # KG cleanup — POUZE expired triples (valid_to IS NOT NULL) a staré
+    try:
+        kg = KnowledgeGraph()
+        conn = kg._conn()
+        rows = conn.execute(
+            "SELECT id FROM triples WHERE valid_to IS NOT NULL AND valid_to < ? AND extracted_at < ?",
+            (kg_cutoff, kg_cutoff),
+        ).fetchall()
+        kg_to_delete = [r["id"] for r in rows]
+        print(f"KG: {len(kg_to_delete)} expired triples eligible for deletion")
+        if not args.dry_run and kg_to_delete:
+            for tid in kg_to_delete:
+                conn.execute("DELETE FROM triples WHERE id = ?", (tid,))
+            conn.commit()
+            print(f"  Deleted {len(kg_to_delete)} triples")
+    except Exception as e:
+        import sys
+        sys.stderr.write(f"KG cleanup error: {e}\n")
+
+    if args.dry_run:
+        print("DRY RUN — nothing was deleted.")
+
+
 def _install_launchd_plist(
     label: str,
     program: list,
@@ -976,6 +1033,30 @@ def main():
         help="Collection name (default: mempalace_drawers)",
     )
 
+    # cleanup
+    p_cleanup = sub.add_parser(
+        "cleanup",
+        help="Remove old non-latest memories and expired knowledge graph facts",
+    )
+    p_cleanup.add_argument(
+        "--days",
+        type=int,
+        default=90,
+        help="Delete ChromaDB drawers older than N days (only non-latest)",
+    )
+    p_cleanup.add_argument(
+        "--kg-days",
+        type=int,
+        default=30,
+        help="Delete expired KG triples older than N days",
+    )
+    p_cleanup.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Preview only, no deletion",
+    )
+
     # migrate
     p_migrate = sub.add_parser(
         "migrate",
@@ -1043,6 +1124,7 @@ def main():
         "embed-daemon": cmd_embed_daemon,
         "serve": cmd_serve,
         "optimize": cmd_optimize,
+        "cleanup": cmd_cleanup,
         "setup": cmd_setup,
     }
     dispatch[args.command](args)

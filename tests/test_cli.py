@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mempalace.cli import (
+    cmd_cleanup,
     cmd_compress,
     cmd_hook,
     cmd_init,
@@ -643,3 +644,151 @@ def test_cmd_repair_trailing_slash_does_not_recurse():
     palace_path = os.path.expanduser(args.palace).rstrip(os.sep)
     backup_path = palace_path + ".backup"
     assert not backup_path.startswith(palace_path + os.sep)
+
+
+# ── cmd_cleanup ───────────────────────────────────────────────────────
+
+
+def test_cmd_cleanup_dry_run_no_deletion(tmp_path, monkeypatch):
+    """cleanup --dry-run does not delete any records."""
+    import chromadb
+    from datetime import datetime, timedelta
+
+    # Setup a tiny palace with one old drawer
+    palace_path = str(tmp_path / "palace")
+    client = chromadb.PersistentClient(path=palace_path)
+    col = client.get_or_create_collection("mempalace_drawers")
+
+    old_ts = (datetime.utcnow() - timedelta(days=100)).isoformat() + "Z"
+    col.upsert(
+        ids=["old_drawer_1"],
+        documents=["old content"],
+        metadatas=[{"wing": "w", "room": "r", "timestamp": old_ts, "is_latest": False}],
+    )
+    original_count = col.count()
+
+    args = argparse.Namespace(
+        palace=palace_path,
+        days=90,
+        kg_days=30,
+        dry_run=True,
+    )
+    with patch("mempalace.cli.MempalaceConfig") as mock_cfg:
+        mock_cfg.return_value.backend = "chromadb"
+        mock_cfg.return_value.palace_path = palace_path
+        cmd_cleanup(args)
+
+    assert col.count() == original_count  # Nothing deleted
+
+
+def test_cmd_cleanup_preserves_is_latest_true(tmp_path, monkeypatch):
+    """cleanup never deletes drawers with is_latest=True."""
+    import chromadb
+    from datetime import datetime, timedelta
+
+    palace_path = str(tmp_path / "palace")
+    client = chromadb.PersistentClient(path=palace_path)
+    col = client.get_or_create_collection("mempalace_drawers")
+
+    old_ts = (datetime.utcnow() - timedelta(days=100)).isoformat() + "Z"
+    # is_latest=True — should be protected
+    col.upsert(
+        ids=["latest_drawer"],
+        documents=["latest content"],
+        metadatas=[{"wing": "w", "room": "r", "timestamp": old_ts, "is_latest": True}],
+    )
+
+    args = argparse.Namespace(
+        palace=palace_path,
+        days=90,
+        kg_days=30,
+        dry_run=False,  # Actually delete
+    )
+    with patch("mempalace.cli.MempalaceConfig") as mock_cfg:
+        mock_cfg.return_value.backend = "chromadb"
+        mock_cfg.return_value.palace_path = palace_path
+        cmd_cleanup(args)
+
+    assert col.count() == 1  # latest_drawer still present
+
+
+def test_cmd_cleanup_removes_old_non_latest(tmp_path, monkeypatch):
+    """cleanup deletes drawers that are old AND is_latest=False."""
+    import chromadb
+    from datetime import datetime, timedelta
+
+    palace_path = str(tmp_path / "palace")
+    client = chromadb.PersistentClient(path=palace_path)
+    col = client.get_or_create_collection("mempalace_drawers")
+
+    old_ts = (datetime.utcnow() - timedelta(days=100)).isoformat() + "Z"
+    # is_latest=False — should be deleted
+    col.upsert(
+        ids=["old_drawer"],
+        documents=["old content"],
+        metadatas=[{"wing": "w", "room": "r", "timestamp": old_ts, "is_latest": False}],
+    )
+    # is_latest=True — should be protected
+    col.upsert(
+        ids=["new_drawer"],
+        documents=["new content"],
+        metadatas=[{"wing": "w", "room": "r", "timestamp": old_ts, "is_latest": True}],
+    )
+    assert col.count() == 2
+
+    args = argparse.Namespace(
+        palace=palace_path,
+        days=90,
+        kg_days=30,
+        dry_run=False,
+    )
+    with patch("mempalace.cli.MempalaceConfig") as mock_cfg:
+        mock_cfg.return_value.backend = "chromadb"
+        mock_cfg.return_value.palace_path = palace_path
+        cmd_cleanup(args)
+
+    assert col.count() == 1  # old_drawer gone, new_drawer stays
+
+
+def test_cmd_cleanup_kg_preserves_active_triples(tmp_path):
+    """KG cleanup never deletes triples with valid_to=None (active facts)."""
+    from mempalace.knowledge_graph import KnowledgeGraph
+    import sqlite3
+    import argparse
+
+    kg_path = str(tmp_path / "test_kg.sqlite3")
+    kg = KnowledgeGraph(db_path=kg_path)
+
+    # Active triple (valid_to=None) — should be preserved
+    kg.add_triple("Alice", "knows", "Bob", valid_from="2025-01-01")
+    # Expired triple with old valid_to — will be deleted
+    kg.add_triple("Carol", "status", "online", valid_from="2020-01-01")
+
+    # Directly set valid_to and extracted_at via SQL to make it eligible for cleanup
+    conn = sqlite3.connect(kg_path)
+    conn.execute("UPDATE triples SET valid_to='2020-06-01', extracted_at='2020-06-02' WHERE object='online'")
+    conn.commit()
+    conn.close()
+
+    initial = kg.stats()
+    assert initial["triples"] == 2
+    assert initial["current_facts"] == 1  # Alice knows Bob
+
+    args = argparse.Namespace(
+        palace=str(tmp_path / "palace"),
+        days=90,
+        kg_days=2000,  # ~5 years — catches 2020 expired triple
+        dry_run=False,
+    )
+
+    with patch("mempalace.cli.MempalaceConfig") as mock_cfg, \
+         patch("mempalace.knowledge_graph.KnowledgeGraph") as mock_kg_cls:
+        mock_cfg.return_value.backend = "chromadb"
+        mock_cfg.return_value.palace_path = str(tmp_path / "palace")
+        mock_kg_cls.return_value = kg
+        cmd_cleanup(args)
+
+    final = kg.stats()
+    # Active triple (valid_to=None) must stay
+    assert final["triples"] == 1
+    assert final["current_facts"] == 1

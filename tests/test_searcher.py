@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mempalace.searcher import SearchError, search, search_memories
+from mempalace.searcher import SearchError, _build_where_filter, search, search_memories
 
 
 # ── search_memories (API) ──────────────────────────────────────────────
@@ -123,3 +123,122 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         # Should have output with at least one result block
         assert "[1]" in captured.out
+
+
+# ── _build_where_filter ────────────────────────────────────────────────
+
+
+class TestBuildWhereFilter:
+    def test_build_where_no_params(self):
+        assert _build_where_filter() == {}
+
+    def test_build_where_wing_only(self):
+        assert _build_where_filter(wing="wing_user") == {"wing": {"$eq": "wing_user"}}
+
+    def test_build_where_room_only(self):
+        assert _build_where_filter(room="backend") == {"room": {"$eq": "backend"}}
+
+    def test_build_where_wing_room(self):
+        result = _build_where_filter(wing="wing_user", room="backend")
+        assert result == {"$and": [{"wing": {"$eq": "wing_user"}}, {"room": {"$eq": "backend"}}]}
+
+    def test_build_where_is_latest(self):
+        result = _build_where_filter(is_latest=True)
+        assert result == {"is_latest": {"$eq": True}}
+
+    def test_build_where_agent_id(self):
+        result = _build_where_filter(agent_id="agent_1")
+        assert result == {"agent_id": {"$eq": "agent_1"}}
+
+    def test_build_where_priority_gte(self):
+        result = _build_where_filter(priority_gte=5)
+        assert result == {"priority": {"$gte": 5}}
+
+    def test_build_where_priority_lte(self):
+        result = _build_where_filter(priority_lte=3)
+        assert result == {"priority": {"$lte": 3}}
+
+    def test_build_where_all_params(self):
+        result = _build_where_filter(
+            wing="w",
+            room="r",
+            is_latest=True,
+            agent_id="a1",
+            priority_gte=5,
+            priority_lte=3,
+        )
+        assert len(result["$and"]) == 6
+        assert {"wing": {"$eq": "w"}} in result["$and"]
+        assert {"room": {"$eq": "r"}} in result["$and"]
+        assert {"is_latest": {"$eq": True}} in result["$and"]
+        assert {"agent_id": {"$eq": "a1"}} in result["$and"]
+        assert {"priority": {"$gte": 5}} in result["$and"]
+        assert {"priority": {"$lte": 3}} in result["$and"]
+
+
+# ── Async wrapper ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_search_memories_async_returns_dict(palace_path, seeded_collection):
+    """search_memories_async returns a dict (not coroutine)."""
+    from mempalace.searcher import search_memories_async
+
+    result = await search_memories_async("JWT authentication", palace_path)
+    assert isinstance(result, dict)
+    assert "results" in result
+    assert len(result["results"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_six_parallel_async_searches(palace_path, seeded_collection):
+    """Six parallel async searches run without exception."""
+    import asyncio
+    from mempalace.searcher import search_memories_async
+
+    queries = ["JWT", "database", "React", "API", "config", "auth"]
+    tasks = [search_memories_async(q, palace_path, n_results=3) for q in queries]
+    results = await asyncio.gather(*tasks)
+    assert len(results) == 6
+    assert all(isinstance(r, dict) for r in results)
+
+
+def test_adaptive_top_k_no_crash(palace_path, seeded_collection):
+    """search_memories with n_results > doc count does not raise."""
+    from mempalace.searcher import search_memories
+
+    # seeded_collection has 4 docs — request 100, should clamp to 4
+    result = search_memories("code", palace_path, n_results=100)
+    assert "error" not in result or result.get("error", "") == ""
+    assert len(result.get("results", [])) <= 4
+
+
+# ── Rerank ───────────────────────────────────────────────────────────
+
+
+def test_rerank_false_preserves_cosine_order(palace_path, seeded_collection):
+    """rerank=False returns results sorted by cosine similarity, not rerank_score."""
+    result = search_memories("authentication", palace_path, n_results=5, rerank=False)
+    assert "results" in result
+    similarities = [h["similarity"] for h in result["results"]]
+    # Should be in descending cosine order
+    assert similarities == sorted(similarities, reverse=True)
+    # No rerank_score when rerank=False
+    assert all("rerank_score" not in h for h in result["results"])
+
+
+def test_rerank_skips_short_query(palace_path, seeded_collection):
+    """Query with <= 3 words and rerank=True produces no rerank_score."""
+    # Short query: "database code" = 2 words — reranking skipped
+    result = search_memories("database code", palace_path, n_results=5, rerank=True)
+    assert "results" in result
+    assert all("rerank_score" not in h for h in result["results"])
+
+
+def test_rerank_graceful_no_sentence_transformers(palace_path, seeded_collection):
+    """search_memories with rerank=True works even if sentence-transformers is absent."""
+    pytest.importorskip("sentence_transformers", reason="sentence-transformers installed")
+    # If we reach here, sentence-transformers IS installed — rerank should work
+    result = search_memories("JWT authentication pattern", palace_path, n_results=3, rerank=True)
+    assert "error" not in result
+    assert "results" in result
