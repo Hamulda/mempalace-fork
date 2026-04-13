@@ -165,7 +165,7 @@ def hook_stop(data: dict, harness: str):
 
 
 def hook_session_start(data: dict, harness: str):
-    """Session start hook: initialize session tracking state."""
+    """Session start hook: inject relevant memories as session context."""
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
 
@@ -174,8 +174,38 @@ def hook_session_start(data: dict, harness: str):
     # Initialize session state directory
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Pass through — no blocking on session start
-    _output({})
+    try:
+        from mempalace.config import MempalaceConfig
+        cfg = MempalaceConfig()
+
+        if not cfg.hook_session_start_inject:
+            _output({})
+            return
+
+        # Get project name from CWD — safe fallback
+        cwd = str(data.get("cwd", "")).strip()
+        project_name = os.path.basename(cwd) if cwd else ""
+        if not project_name:
+            _output({})
+            return
+
+        # Run search CLI (timeout 2s to not exceed shell timeout)
+        result = subprocess.run(
+            [sys.executable, "-m", "mempalace", "search", project_name,
+             "--top-k", str(cfg.hook_session_start_top_k), "--format", "lines"],
+            capture_output=True, text=True, timeout=2.0
+        )
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+
+        if not lines:
+            return  # empty results → silent, no output
+
+        context = "## Relevant memories\n" + "\n".join(f"- {l}" for l in lines)
+        _output({"context": context})
+
+    except Exception as e:
+        _log(f"SESSION START inject failed (silent): {e}")
+        return  # silent failure — no output
 
 
 def hook_precompact(data: dict, harness: str):

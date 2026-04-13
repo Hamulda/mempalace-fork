@@ -125,17 +125,33 @@ def cmd_mine(args):
 
 
 def cmd_search(args):
-    from .searcher import search, SearchError
+    from .searcher import search, search_memories, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     try:
-        search(
-            query=args.query,
-            palace_path=palace_path,
-            wing=args.wing,
-            room=args.room,
-            n_results=args.results,
-        )
+        if getattr(args, "format", "pretty") == "lines":
+            # Lines format: output one result per line for hook consumption
+            result = search_memories(
+                query=args.query,
+                palace_path=palace_path,
+                wing=args.wing,
+                room=args.room,
+                n_results=args.results,
+            )
+            if "error" not in result:
+                for hit in result.get("results", []):
+                    text = hit.get("text", "")[:120]
+                    wing_name = hit.get("wing", "?")
+                    room_name = hit.get("room", "?")
+                    print(f"[{wing_name}/{room_name}] {text}")
+        else:
+            search(
+                query=args.query,
+                palace_path=palace_path,
+                wing=args.wing,
+                room=args.room,
+                n_results=args.results,
+            )
     except SearchError:
         sys.exit(1)
 
@@ -817,7 +833,11 @@ def main():
     p_search.add_argument("query", help="What to search for")
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
-    p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument("--results", "--top-k", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--format", choices=["pretty", "lines"], default="pretty",
+        help="Output format: pretty (default) or lines (one result per line)"
+    )
 
     # compress
     p_compress = sub.add_parser(

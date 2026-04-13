@@ -180,6 +180,16 @@ class MempalaceConfig:
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
 
+    @property
+    def hook_session_start_inject(self) -> bool:
+        """Whether session-start hook injects relevant memories as context."""
+        return self._file_config.get("hooks", {}).get("session_start_inject", True)
+
+    @property
+    def hook_session_start_top_k(self) -> int:
+        """How many memories to inject on session start (default: 5)."""
+        return self._file_config.get("hooks", {}).get("session_start_top_k", 5)
+
     def init(self):
         """Create config directory and write default config.json if it doesn't exist."""
         self._config_dir.mkdir(parents=True, exist_ok=True)
