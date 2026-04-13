@@ -45,6 +45,11 @@ class MemPalaceSettings(BaseSettings):
     wal_enabled: bool = True
     wal_dir: str = os.path.expanduser("~/.mempalace/wal")
 
+    # Tool timeouts (sekundy)
+    timeout_embed: int = 15  # embed daemon / vector search operations
+    timeout_read: int = 10  # ChromaDB/LanceDB read operations
+    timeout_write: int = 20  # ChromaDB/LanceDB write operations (writes are slower)
+
     class Config:
         env_prefix = "MEMPALACE_"
         env_file = ".env"

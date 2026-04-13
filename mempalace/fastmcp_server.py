@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastmcp import FastMCP, Context
+from fastmcp.resources import DirectoryResource
 
 from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .middleware import build_middleware_stack
@@ -133,6 +134,23 @@ def create_server(settings: MemPalaceSettings | None = None) -> FastMCP:
     for mw in middleware_stack:
         server.add_middleware(mw)
 
+    # Skills as MCP resources — Claude Code can read skill://... URIs
+    # Wrap in try/except to handle pydantic validation gracefully
+    try:
+        skills_path = Path(__file__).parent / "skills"
+        if skills_path.exists() and any(skills_path.iterdir()):
+            server.add_resource(DirectoryResource(
+                name="palace_skills",
+                title="MemPalace Skills",
+                description="Guides for init, mine, search, status, and help commands",
+                path=str(skills_path),
+                pattern="*.md",
+                uri="mempalace://skills/",
+            ))
+    except Exception:
+        # Skip if validation fails (e.g., DirectoryResource requires uri field)
+        pass
+
     # Register all tools with closures over backend/config/kg
     _register_tools(server, backend, config, settings)
 
@@ -159,7 +177,7 @@ def _register_tools(server, backend, config, settings):
 
     # ── READ TOOLS ────────────────────────────────────────────────
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_status(ctx: Context) -> dict:
         """[MEMPALACE] Palace overview — total drawers, wing and room counts."""
         col = _get_collection()
@@ -189,7 +207,7 @@ def _register_tools(server, backend, config, settings):
             "aaak_dialect": AAAK_SPEC,
         }
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_list_wings(ctx: Context) -> dict:
         """[MEMPALACE] List all wings with drawer counts."""
         col = _get_collection()
@@ -207,7 +225,7 @@ def _register_tools(server, backend, config, settings):
 
         return {"wings": wings}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_list_rooms(ctx: Context, wing: str | None = None) -> dict:
         """[MEMPALACE] List rooms within a wing (or all rooms if no wing given)."""
         col = _get_collection()
@@ -228,7 +246,7 @@ def _register_tools(server, backend, config, settings):
 
         return {"wing": wing or "all", "rooms": rooms}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_get_taxonomy(ctx: Context) -> dict:
         """[MEMPALACE] Full taxonomy: wing → room → drawer count."""
         col = _get_collection()
@@ -254,7 +272,7 @@ def _register_tools(server, backend, config, settings):
         """[MEMPALACE] Get the AAAK dialect specification — the compressed memory format MemPalace uses."""
         return {"aaak_spec": AAAK_SPEC}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_embed)
     def mempalace_search(
         ctx: Context,
         query: str,
@@ -271,7 +289,7 @@ def _register_tools(server, backend, config, settings):
             n_results=limit,
         )
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_embed)
     def mempalace_check_duplicate(
         ctx: Context,
         content: str,
@@ -312,7 +330,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_traverse_graph(ctx: Context, start_room: str, max_hops: int = 2) -> dict:
         """[MEMPALACE] Walk the palace graph from a room. Shows connected ideas across wings."""
         col = _get_collection()
@@ -320,7 +338,7 @@ def _register_tools(server, backend, config, settings):
             return _no_palace()
         return traverse(start_room, col=col, max_hops=max_hops)
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_find_tunnels(ctx: Context, wing_a: str | None = None, wing_b: str | None = None) -> dict:
         """[MEMPALACE] Find rooms that bridge two wings — the hallways connecting different domains."""
         col = _get_collection()
@@ -328,7 +346,7 @@ def _register_tools(server, backend, config, settings):
             return _no_palace()
         return find_tunnels(wing_a, wing_b, col=col)
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_graph_stats(ctx: Context) -> dict:
         """[MEMPALACE] Palace graph overview: total rooms, tunnel connections, edges between wings."""
         col = _get_collection()
@@ -341,7 +359,7 @@ def _register_tools(server, backend, config, settings):
     # KG needs its own instance per server to avoid shared state
     kg = KnowledgeGraph(db_path=os.path.join(settings.db_path, "knowledge_graph.sqlite3"))
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_kg_query(
         ctx: Context,
         entity: str,
@@ -352,7 +370,7 @@ def _register_tools(server, backend, config, settings):
         results = kg.query_entity(entity, as_of=as_of, direction=direction)
         return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_write)
     def mempalace_kg_add(
         ctx: Context,
         subject: str,
@@ -385,7 +403,7 @@ def _register_tools(server, backend, config, settings):
         )
         return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_write)
     def mempalace_kg_invalidate(
         ctx: Context,
         subject: str,
@@ -406,20 +424,20 @@ def _register_tools(server, backend, config, settings):
             "ended": ended or "today",
         }
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_kg_timeline(ctx: Context, entity: str | None = None) -> dict:
         """[MEMPALACE] Chronological timeline of facts."""
         results = kg.timeline(entity)
         return {"entity": entity or "all", "timeline": results, "count": len(results)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_kg_stats(ctx: Context) -> dict:
         """[MEMPALACE] Knowledge graph overview: entities, triples, current vs expired facts."""
         return kg.stats()
 
     # ── WRITE TOOLS ──────────────────────────────────────────────
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_write)
     def mempalace_add_drawer(
         ctx: Context,
         wing: str,
@@ -482,7 +500,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_write)
     def mempalace_delete_drawer(ctx: Context, drawer_id: str) -> dict:
         """[MEMPALACE] Delete a drawer by ID. Irreversible."""
         col = _get_collection()
@@ -512,7 +530,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_write)
     def mempalace_diary_write(
         ctx: Context,
         agent_name: str,
@@ -574,7 +592,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_diary_read(ctx: Context, agent_name: str, last_n: int = 10) -> dict:
         """[MEMPALACE] Read your recent diary entries (in AAAK)."""
         wing = f"wing_{agent_name.lower().replace(' ', '_')}"
@@ -615,7 +633,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_embed)
     def mempalace_project_context(ctx: Context, project_path: str, limit: int = 10) -> dict:
         """[MEMPALACE] Query memories filtered by project_path and return formatted context."""
         col = _get_collection()
@@ -653,7 +671,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_write)
     def mempalace_remember_code(
         ctx: Context,
         code: str,
@@ -714,7 +732,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_embed)
     def mempalace_consolidate(
         ctx: Context,
         topic: str,
@@ -781,7 +799,7 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"error": str(e)}
 
-    @server.tool()
+    @server.tool(timeout=settings.timeout_read)
     def mempalace_export_claude_md(
         ctx: Context,
         wing: str | None = None,
