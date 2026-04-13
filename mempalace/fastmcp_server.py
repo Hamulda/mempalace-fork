@@ -22,6 +22,8 @@ from pathlib import Path
 
 from fastmcp import FastMCP, Context
 from fastmcp.resources import DirectoryResource
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .middleware import build_middleware_stack
@@ -133,6 +135,12 @@ def create_server(settings: MemPalaceSettings | None = None) -> FastMCP:
     server = FastMCP("MemPalace")
     for mw in middleware_stack:
         server.add_middleware(mw)
+
+    # Health check endpoint — lightweight, no MCP handshake needed
+    @server.custom_route("/health", methods=["GET"], name="health")
+    async def health_check(request):
+        from starlette.requests import Request
+        return JSONResponse({"status": "ok", "service": "mempalace"})
 
     # Skills as MCP resources — Claude Code can read skill://... URIs
     # Wrap in try/except to handle pydantic validation gracefully
