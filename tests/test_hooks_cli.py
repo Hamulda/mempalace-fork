@@ -430,3 +430,11 @@ def test_hook_stop_no_http_block():
     src = inspect.getsource(hook_stop)
     assert "hooks/stop" not in src, "hook_stop must not call HTTP /mcp endpoint"
     assert "requests.post" not in src, "hook_stop must not use HTTP POST"
+
+
+def test_hook_session_start_no_subprocess():
+    """hook_session_start must not call 'mempalace search' as subprocess."""
+    import inspect
+    from mempalace.hooks_cli import hook_session_start
+    src = inspect.getsource(hook_session_start)
+    assert "mempalace search" not in src, "hook_session_start must not use subprocess for search"

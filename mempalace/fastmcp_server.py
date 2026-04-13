@@ -96,7 +96,7 @@ FORMAT:
   DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).
   IMPORTANCE: ★ to ★★★★★ (1-5 scale).
   HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.
-  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.
+  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_<project_name>, wing_hardware, wing_research.
   ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).
 
 EXAMPLE:
@@ -161,6 +161,16 @@ def create_server(settings: MemPalaceSettings | None = None) -> FastMCP:
 
     # Register all tools with closures over backend/config/kg
     _register_tools(server, backend, config, settings)
+
+    # Warmup reranker in background — avoid 2s latency on first search
+    import threading
+    def _warmup_reranker():
+        try:
+            from .searcher import _get_reranker
+            _get_reranker()
+        except Exception:
+            pass
+    threading.Thread(target=_warmup_reranker, daemon=True, name="reranker_warmup").start()
 
     return server
 

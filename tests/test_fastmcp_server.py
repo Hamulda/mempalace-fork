@@ -11,6 +11,7 @@ import json
 import pytest
 import pytest_asyncio
 import chromadb
+from unittest.mock import patch, MagicMock
 
 from fastmcp import Client
 from mempalace.fastmcp_server import create_server
@@ -576,3 +577,22 @@ async def test_skills_directory_has_files(client):
     files = os.listdir(skills_dir) if os.path.exists(skills_dir) else []
     assert len(files) > 0, "skills directory should contain instruction files"
     assert any(f.endswith(".md") for f in files), "skills should include markdown files"
+
+
+async def test_search_skill_mentions_hybrid(client):
+    """search.md skill file must mention mempalace_hybrid_search."""
+    import os
+    skills_dir = os.path.join(os.path.dirname(__file__), "..", "mempalace", "skills")
+    search_md = os.path.join(skills_dir, "search.md")
+    if os.path.exists(search_md):
+        content = open(search_md).read()
+        assert "hybrid_search" in content, "search.md must mention hybrid_search"
+
+
+async def test_reranker_warmup_thread_starts(client):
+    """create_server() must start a daemon thread named reranker_warmup."""
+    import inspect
+    from mempalace.fastmcp_server import create_server
+    src = inspect.getsource(create_server)
+    assert 'name="reranker_warmup"' in src, "create_server must start a thread named reranker_warmup"
+    assert "daemon=True" in src, "reranker_warmup thread must be daemon"

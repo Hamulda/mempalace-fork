@@ -193,13 +193,18 @@ def hook_session_start(data: dict, harness: str, transport: str = "cli"):
             _output({})
             return
 
-        # Run search CLI (timeout 2s to not exceed shell timeout)
-        result = subprocess.run(
-            [sys.executable, "-m", "mempalace", "search", project_name,
-             "--top-k", str(cfg.hook_session_start_top_k), "--format", "lines"],
-            capture_output=True, text=True, timeout=2.0
-        )
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        # Direct search (no subprocess — faster, no 2s timeout)
+        try:
+            from mempalace.searcher import search_memories
+            result_data = search_memories(
+                query=project_name,
+                palace_path=cfg.palace_path,
+                n_results=cfg.hook_session_start_top_k,
+            )
+            lines = [r["text"][:120] for r in result_data.get("results", [])]
+        except Exception as e:
+            _log(f"SESSION START direct search failed: {e}")
+            lines = []
 
         if not lines:
             return  # empty results → silent, no output
