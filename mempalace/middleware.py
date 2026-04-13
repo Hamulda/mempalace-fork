@@ -272,6 +272,34 @@ _embed_circuit_middleware = EmbedCircuitBreakerMiddleware(
 _session_tracking_middleware = SessionTrackingMiddleware()
 
 
+def build_middleware_stack(settings) -> list:
+    """Vytvoří čerstvý middleware stack — volej z create_server()."""
+    from fastmcp.server.middleware.caching import ResponseCachingMiddleware, CallToolSettings, ListToolsSettings
+    from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
+    from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
+    from fastmcp.server.middleware.timing import TimingMiddleware
+
+    caching = ResponseCachingMiddleware(
+        list_tools_settings=ListToolsSettings(ttl=float(settings.cache_ttl_metadata)),
+        call_tool_settings=CallToolSettings(
+            ttl=float(settings.cache_ttl_status),
+            included_tools=["mempalace_status", "mempalace_list_wings", "mempalace_get_taxonomy", "mempalace_list_rooms"],
+        ),
+    )
+    invalidation = CacheInvalidationMiddleware(caching)
+    embed_cb = EmbedCircuitBreakerMiddleware(
+        failure_threshold=settings.cb_failure_threshold,
+        recovery_timeout=settings.cb_recovery_timeout,
+    )
+
+    return [
+        SessionTrackingMiddleware(),
+        caching,
+        invalidation,
+        embed_cb,
+    ]
+
+
 def get_caching_middleware() -> ResponseCachingMiddleware:
     return _caching_middleware
 

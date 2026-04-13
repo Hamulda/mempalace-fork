@@ -153,6 +153,13 @@ class MempalaceConfig:
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
 
     @property
+    def backend(self) -> str:
+        """Storage backend: 'chroma' (default) or 'lance'."""
+        return os.environ.get("MEMPALACE_BACKEND") or self._file_config.get(
+            "backend", "chroma"
+        )
+
+    @property
     def people_map(self):
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():

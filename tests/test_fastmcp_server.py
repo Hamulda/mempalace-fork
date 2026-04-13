@@ -13,7 +13,8 @@ import pytest_asyncio
 import chromadb
 
 from fastmcp import Client
-from mempalace.fastmcp_server import mcp
+from mempalace.fastmcp_server import create_server
+from mempalace.settings import MemPalaceSettings
 from mempalace.backends import get_backend
 
 
@@ -37,9 +38,22 @@ def _get_result_data(result):
 
 
 @pytest_asyncio.fixture
-async def client():
-    """In-process FastMCP client — fast, isolated, no subprocess."""
-    async with Client(transport=mcp) as c:
+async def test_settings(tmp_path):
+    """Izolovaná test konfigurace — tmp_path je unikátní per test."""
+    return MemPalaceSettings(
+        db_path=str(tmp_path / "test_palace"),
+        db_backend="chromadb",
+        cache_ttl_status=1,
+        cache_ttl_metadata=1,
+        log_sessions=False,
+    )
+
+
+@pytest_asyncio.fixture
+async def client(test_settings):
+    """Čerstvá server instance per test — plná izolace."""
+    server = create_server(settings=test_settings)
+    async with Client(transport=server) as c:
         yield c
 
 
@@ -48,10 +62,15 @@ async def empty_palace_client(tmp_path):
     """Client with empty palace for write tests."""
     palace_path = tmp_path / "palace"
     palace_path.mkdir()
-    backend = get_backend("chroma")
+    backend = get_backend("chromadb")
     collection = backend.get_collection(str(palace_path), "mempalace_drawers", create=True)
     del collection
-    async with Client(transport=mcp) as c:
+    test_settings = MemPalaceSettings(
+        db_path=str(palace_path),
+        db_backend="chromadb",
+    )
+    server = create_server(settings=test_settings)
+    async with Client(transport=server) as c:
         yield c, str(palace_path)
 
 
@@ -87,7 +106,12 @@ async def seeded_palace_client(tmp_path):
         ],
     )
     del client
-    async with Client(transport=mcp) as c:
+    test_settings = MemPalaceSettings(
+        db_path=str(palace_path),
+        db_backend="chromadb",
+    )
+    server = create_server(settings=test_settings)
+    async with Client(transport=server) as c:
         yield c, str(palace_path)
 
 
@@ -133,11 +157,11 @@ async def test_list_tools_contains_expected(client):
 
 
 async def test_unknown_tool_returns_error(client):
-    """Unknown tool should return error response."""
-    result = await client.call_tool("nonexistent_tool", {})
-    # FastMCP returns CallToolResult with is_error=True or structured_content with error
-    assert result is not None
-    assert result.is_error or (hasattr(result, 'structured_content') and result.structured_content.get('error'))
+    """Unknown tool should raise ToolError."""
+    from fastmcp.exceptions import ToolError
+    with pytest.raises(ToolError) as exc_info:
+        await client.call_tool("nonexistent_tool", {})
+    assert "Unknown tool" in str(exc_info.value)
 
 
 # ── Read Tools ───────────────────────────────────────────────────────

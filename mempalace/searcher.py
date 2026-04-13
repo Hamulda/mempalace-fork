@@ -9,7 +9,7 @@ Returns verbatim text — the actual words, never summaries.
 import logging
 from pathlib import Path
 
-import chromadb
+from .backends import get_backend
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -23,12 +23,15 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
+    from .config import MempalaceConfig
+
     try:
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
+        cfg = MempalaceConfig()
+        backend = get_backend(cfg.backend)
+        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
     except Exception:
         print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+        print(f"  Run: mempalace init <dir> then mempalace mine <dir>")
         raise SearchError(f"No palace found at {palace_path}")
 
     # Build where filter
@@ -97,9 +100,12 @@ def search_memories(
     Programmatic search — returns a dict instead of printing.
     Used by the MCP server and other callers that need data.
     """
+    from .config import MempalaceConfig
+
     try:
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
+        cfg = MempalaceConfig()
+        backend = get_backend(cfg.backend)
+        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {

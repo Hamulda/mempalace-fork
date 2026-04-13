@@ -1,9 +1,9 @@
 {
   "mempalace": {
-    "command": "python3",
+    "command": "/Users/vojtechhamada/.pyenv/versions/3.12.12/bin/python3",
     "args": [
       "-m",
-      "mempalace.mcp_server"
+      "mempalace.fastmcp_server"
     ]
   }
 }

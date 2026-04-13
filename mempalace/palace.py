@@ -42,10 +42,17 @@ def get_collection(palace_path: str, collection_name: str = "mempalace_drawers")
     except (OSError, NotImplementedError):
         pass
     client = chromadb.PersistentClient(path=palace_path)
+    # Increase HNSW max_batch_size to avoid "cannot add N records" errors when
+    # mining large projects. Default is 100; bump to 10000 for comfortable headroom.
+    hnsw_cfg = {
+        "hnsw_configuration": {
+            "max_batch_size": 10000,
+        }
+    }
     try:
         return client.get_collection(collection_name)
     except Exception:
-        return client.create_collection(collection_name)
+        return client.create_collection(collection_name, **hnsw_cfg)
 
 
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:

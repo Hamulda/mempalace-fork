@@ -23,6 +23,8 @@ import sys
 import json
 import logging
 import hashlib
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -30,9 +32,8 @@ from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .version import __version__
 from .searcher import search_memories
 from .palace_graph import traverse, find_tunnels, graph_stats
-import chromadb
-
 from .knowledge_graph import KnowledgeGraph
+from .backends import get_backend
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
@@ -65,6 +66,48 @@ else:
 
 _client_cache = None
 _collection_cache = None
+
+
+# ==================== METADATA CACHE ====================
+
+
+class _MetaCache:
+    """
+    Jednoduchá TTL cache pro metadata operace (get/list).
+    Separátní od QueryCache – ta pokrývá jen vector search.
+    """
+
+    def __init__(self, ttl: float = 30.0):
+        self._ttl = ttl
+        self._cache: dict[str, tuple[object, float]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str):
+        with self._lock:
+            if key not in self._cache:
+                return None
+            data, ts = self._cache[key]
+            if time.monotonic() - ts > self._ttl:
+                del self._cache[key]
+                return None
+            return data
+
+    def set(self, key: str, data: object) -> None:
+        with self._lock:
+            self._cache[key] = (data, time.monotonic())
+
+    def invalidate(self, prefix: str = "") -> None:
+        """Invaliduj vše nebo klíče začínající prefixem."""
+        with self._lock:
+            if prefix:
+                keys = [k for k in self._cache if k.startswith(prefix)]
+                for k in keys:
+                    del self._cache[k]
+            else:
+                self._cache.clear()
+
+
+_meta_cache = _MetaCache(ttl=30.0)
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -100,27 +143,20 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         logger.error(f"WAL write failed: {e}")
 
 
-_client_cache = None
 _collection_cache = None
 
 
-def _get_client():
-    """Return a singleton ChromaDB PersistentClient."""
-    global _client_cache
-    if _client_cache is None:
-        _client_cache = chromadb.PersistentClient(path=_config.palace_path)
-    return _client_cache
-
-
 def _get_collection(create=False):
-    """Return the ChromaDB collection, caching the client between calls."""
+    """Return the palace collection using the configured backend."""
     global _collection_cache
+    if _collection_cache is not None:
+        return _collection_cache
+
     try:
-        client = _get_client()
-        if create:
-            _collection_cache = client.get_or_create_collection(_config.collection_name)
-        elif _collection_cache is None:
-            _collection_cache = client.get_collection(_config.collection_name)
+        backend = get_backend(_config.backend)
+        _collection_cache = backend.get_collection(
+            _config.palace_path, _config.collection_name, create=create
+        )
         return _collection_cache
     except Exception:
         return None
@@ -137,6 +173,10 @@ def _no_palace():
 
 
 def tool_status():
+    cache_key = f"status:{_config.palace_path}"
+    cached = _meta_cache.get(cache_key)
+    if cached is not None:
+        return cached
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -152,7 +192,7 @@ def tool_status():
             rooms[r] = rooms.get(r, 0) + 1
     except Exception:
         pass
-    return {
+    result = {
         "total_drawers": count,
         "wings": wings,
         "rooms": rooms,
@@ -160,6 +200,8 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
+    _meta_cache.set(cache_key, result)
+    return result
 
 
 # ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
@@ -196,6 +238,10 @@ When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
 def tool_list_wings():
+    cache_key = f"wings:{_config.palace_path}"
+    cached = _meta_cache.get(cache_key)
+    if cached is not None:
+        return cached
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -207,10 +253,16 @@ def tool_list_wings():
             wings[w] = wings.get(w, 0) + 1
     except Exception:
         pass
-    return {"wings": wings}
+    result = {"wings": wings}
+    _meta_cache.set(cache_key, result)
+    return result
 
 
 def tool_list_rooms(wing: str = None):
+    cache_key = f"rooms:{_config.palace_path}:{wing}" if wing else f"rooms:{_config.palace_path}:all"
+    cached = _meta_cache.get(cache_key)
+    if cached is not None:
+        return cached
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -225,10 +277,16 @@ def tool_list_rooms(wing: str = None):
             rooms[r] = rooms.get(r, 0) + 1
     except Exception:
         pass
-    return {"wing": wing or "all", "rooms": rooms}
+    result = {"wing": wing or "all", "rooms": rooms}
+    _meta_cache.set(cache_key, result)
+    return result
 
 
 def tool_get_taxonomy():
+    cache_key = f"taxonomy:{_config.palace_path}"
+    cached = _meta_cache.get(cache_key)
+    if cached is not None:
+        return cached
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -243,7 +301,9 @@ def tool_get_taxonomy():
             taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
     except Exception:
         pass
-    return {"taxonomy": taxonomy}
+    result = {"taxonomy": taxonomy}
+    _meta_cache.set(cache_key, result)
+    return result
 
 
 def tool_search(query: str, limit: int = 5, wing: str = None, room: str = None):
@@ -376,6 +436,7 @@ def tool_add_drawer(
             ],
         )
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+        _meta_cache.invalidate()
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -585,21 +646,275 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
         return {"error": str(e)}
 
 
+# ==================== NEW MCP TOOLS ====================
+
+
+def tool_project_context(project_path: str, limit: int = 10):
+    """Query memories filtered by project_path and return formatted context."""
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    try:
+        results = col.query(
+            query_texts=[project_path],
+            n_results=limit,
+            where={"project": project_path},
+            include=["documents", "metadatas", "distances"],
+        )
+
+        memories = []
+        if results["ids"] and results["ids"][0]:
+            for i, drawer_id in enumerate(results["ids"][0]):
+                doc = results["documents"][0][i]
+                meta = results["metadatas"][0][i]
+                dist = results["distances"][0][i]
+                similarity = round(1 - dist, 3)
+                memories.append({
+                    "id": drawer_id,
+                    "wing": meta.get("wing", "?"),
+                    "room": meta.get("room", "?"),
+                    "similarity": similarity,
+                    "content": doc,
+                })
+
+        return {
+            "project_path": project_path,
+            "memories": memories,
+            "count": len(memories),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_remember_code(
+    code: str,
+    description: str,
+    wing: str,
+    room: str,
+    source_file: str = None,
+    added_by: str = "mcp"
+):
+    """
+    Store code with description, separating embedding from storage.
+    The description is used for semantic search while the code is stored verbatim.
+    """
+    try:
+        wing = sanitize_name(wing, "wing")
+        room = sanitize_name(room, "room")
+        code = sanitize_content(code)
+        description = sanitize_content(description)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    col = _get_collection(create=True)
+    if not col:
+        return _no_palace()
+
+    # Use description for deduplication, but store code as content
+    drawer_id = f"code_{wing}_{room}_{hashlib.sha256((wing + room + description[:100]).encode()).hexdigest()[:24]}"
+
+    _wal_log(
+        "remember_code",
+        {
+            "drawer_id": drawer_id,
+            "wing": wing,
+            "room": room,
+            "added_by": added_by,
+            "code_length": len(code),
+            "description_preview": description[:200],
+        },
+    )
+
+    try:
+        existing = col.get(ids=[drawer_id])
+        if existing and existing["ids"]:
+            return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+
+        col.upsert(
+            ids=[drawer_id],
+            documents=[f"{description}\n\n```\n{code}\n```"],
+            metadatas=[{
+                "wing": wing,
+                "room": room,
+                "source_file": source_file or "",
+                "type": "code_memory",
+                "description": description,
+                "added_by": added_by,
+                "filed_at": datetime.now().isoformat(),
+            }],
+        )
+        logger.info(f"Remembered code: {drawer_id} → {wing}/{room}")
+        _meta_cache.invalidate()
+        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def tool_consolidate(topic: str, merge: bool = False, threshold: float = 0.85):
+    """
+    Find and optionally merge duplicate memories by topic.
+    Helps reduce storage and improve recall by consolidating similar memories.
+    """
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    try:
+        results = col.query(
+            query_texts=[topic],
+            n_results=50,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        if not results["ids"] or not results["ids"][0]:
+            return {"topic": topic, "duplicates": [], "merged": 0}
+
+        # Group similar memories
+        duplicates = []
+        seen = set()
+
+        for i, drawer_id in enumerate(results["ids"][0]):
+            if drawer_id in seen:
+                continue
+
+            dist = results["distances"][0][i]
+            similarity = round(1 - dist, 3)
+
+            if similarity >= threshold:
+                doc = results["documents"][0][i]
+                meta = results["metadatas"][0][i]
+                duplicates.append({
+                    "id": drawer_id,
+                    "wing": meta.get("wing", "?"),
+                    "room": meta.get("room", "?"),
+                    "similarity": similarity,
+                    "content": doc[:300] + "..." if len(doc) > 300 else doc,
+                })
+                seen.add(drawer_id)
+
+        merged_count = 0
+        if merge and len(duplicates) > 1:
+            # Keep the first (most similar), delete the rest
+            keeper = duplicates[0]
+            to_remove = duplicates[1:]
+
+            for dup in to_remove:
+                try:
+                    col.delete(ids=[dup["id"]])
+                    merged_count += 1
+                except Exception:
+                    pass
+
+            logger.info(f"Consolidated {merged_count} duplicate memories for topic: {topic}")
+        if merge:
+            _meta_cache.invalidate()
+
+        return {
+            "topic": topic,
+            "duplicates": duplicates,
+            "merged": merged_count if merge else None,
+            "total_found": len(duplicates),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_export_claude_md(
+    wing: str = None,
+    room: str = None,
+    format: str = "markdown"
+):
+    """
+    Export memories to CLAUDE.md format for use as project documentation.
+    """
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    try:
+        where = {}
+        if wing:
+            where["wing"] = wing
+        if room:
+            where["room"] = room
+
+        kwargs = {"include": ["documents", "metadatas"], "limit": 10000}
+        if where:
+            kwargs["where"] = where
+
+        results = col.get(**kwargs)
+
+        if not results["ids"]:
+            return {
+                "export": "",
+                "count": 0,
+                "message": "No memories found for the specified criteria.",
+            }
+
+        memories = []
+        for doc, meta in zip(results["documents"], results["metadatas"]):
+            memories.append({
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "content": doc,
+                "source_file": meta.get("source_file", ""),
+            })
+
+        if format == "json":
+            return {
+                "export": memories,
+                "count": len(memories),
+                "format": "json",
+            }
+
+        # Markdown format
+        lines = [
+            "# MemPalace Export",
+            "",
+            f"Exported at: {datetime.now().isoformat()}",
+            f"Total memories: {len(memories)}",
+            "",
+        ]
+
+        if wing:
+            lines.append(f"## Wing: {wing}")
+        if room:
+            lines.append(f"### Room: {room}")
+
+        for mem in memories:
+            lines.append("")
+            lines.append(f"### [{mem['wing']}] {mem['room']}")
+            if mem['source_file']:
+                lines.append(f"*Source: {mem['source_file']}*")
+            lines.append("")
+            lines.append(mem['content'])
+            lines.append("---")
+
+        return {
+            "export": "\n".join(lines),
+            "count": len(memories),
+            "format": "markdown",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ==================== MCP PROTOCOL ====================
 
 TOOLS = {
     "mempalace_status": {
-        "description": "Palace overview — total drawers, wing and room counts",
+        "description": "[MEMPALACE] Palace overview — total drawers, wing and room counts",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_status,
     },
     "mempalace_list_wings": {
-        "description": "List all wings with drawer counts",
+        "description": "[MEMPALACE] List all wings with drawer counts",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_list_wings,
     },
     "mempalace_list_rooms": {
-        "description": "List rooms within a wing (or all rooms if no wing given)",
+        "description": "[MEMPALACE] List rooms within a wing (or all rooms if no wing given)",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -609,17 +924,17 @@ TOOLS = {
         "handler": tool_list_rooms,
     },
     "mempalace_get_taxonomy": {
-        "description": "Full taxonomy: wing → room → drawer count",
+        "description": "[MEMPALACE] Full taxonomy: wing → room → drawer count",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_get_taxonomy,
     },
     "mempalace_get_aaak_spec": {
-        "description": "Get the AAAK dialect specification — the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
+        "description": "[MEMPALACE] Get the AAAK dialect specification — the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_get_aaak_spec,
     },
     "mempalace_kg_query": {
-        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+        "description": "[MEMPALACE] Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -641,7 +956,7 @@ TOOLS = {
         "handler": tool_kg_query,
     },
     "mempalace_kg_add": {
-        "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
+        "description": "[MEMPALACE] Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -665,7 +980,7 @@ TOOLS = {
         "handler": tool_kg_add,
     },
     "mempalace_kg_invalidate": {
-        "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house.",
+        "description": "[MEMPALACE] Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -682,7 +997,7 @@ TOOLS = {
         "handler": tool_kg_invalidate,
     },
     "mempalace_kg_timeline": {
-        "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
+        "description": "[MEMPALACE] Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -695,12 +1010,12 @@ TOOLS = {
         "handler": tool_kg_timeline,
     },
     "mempalace_kg_stats": {
-        "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
+        "description": "[MEMPALACE] Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_kg_stats,
     },
     "mempalace_traverse": {
-        "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
+        "description": "[MEMPALACE] Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -718,7 +1033,7 @@ TOOLS = {
         "handler": tool_traverse_graph,
     },
     "mempalace_find_tunnels": {
-        "description": "Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
+        "description": "[MEMPALACE] Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -729,12 +1044,12 @@ TOOLS = {
         "handler": tool_find_tunnels,
     },
     "mempalace_graph_stats": {
-        "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
+        "description": "[MEMPALACE] Palace graph overview: total rooms, tunnel connections, edges between wings.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_graph_stats,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores.",
+        "description": "[MEMPALACE] Semantic search. Returns verbatim drawer content with similarity scores.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -748,7 +1063,7 @@ TOOLS = {
         "handler": tool_search,
     },
     "mempalace_check_duplicate": {
-        "description": "Check if content already exists in the palace before filing",
+        "description": "[MEMPALACE] Check if content already exists in the palace before filing",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -763,7 +1078,7 @@ TOOLS = {
         "handler": tool_check_duplicate,
     },
     "mempalace_add_drawer": {
-        "description": "File verbatim content into the palace. Checks for duplicates first.",
+        "description": "[MEMPALACE] File verbatim content into the palace. Checks for duplicates first.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -784,7 +1099,7 @@ TOOLS = {
         "handler": tool_add_drawer,
     },
     "mempalace_delete_drawer": {
-        "description": "Delete a drawer by ID. Irreversible.",
+        "description": "[MEMPALACE] Delete a drawer by ID. Irreversible.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -795,7 +1110,7 @@ TOOLS = {
         "handler": tool_delete_drawer,
     },
     "mempalace_diary_write": {
-        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
+        "description": "[MEMPALACE] Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -817,7 +1132,7 @@ TOOLS = {
         "handler": tool_diary_write,
     },
     "mempalace_diary_read": {
-        "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded — your journal across sessions.",
+        "description": "[MEMPALACE] Read your recent diary entries (in AAAK). See what past versions of yourself recorded — your journal across sessions.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -833,6 +1148,71 @@ TOOLS = {
             "required": ["agent_name"],
         },
         "handler": tool_diary_read,
+    },
+    "mempalace_project_context": {
+        "description": "[MEMPALACE] Query memories filtered by project_path and return formatted context for the current project.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_path": {
+                    "type": "string",
+                    "description": "Project path to filter memories by (e.g. '/Users/.../MyProject')",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max memories to return (default 10)",
+                },
+            },
+            "required": ["project_path"],
+        },
+        "handler": tool_project_context,
+    },
+    "mempalace_remember_code": {
+        "description": "[MEMPALACE] Store code with description, separating embedding from storage for better semantic search.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "The code content to store"},
+                "description": {"type": "string", "description": "Natural language description of what this code does"},
+                "wing": {"type": "string", "description": "Wing (project name)"},
+                "room": {"type": "string", "description": "Room (aspect: implementation, decisions, meetings...)"},
+                "source_file": {"type": "string", "description": "Source file path (optional)"},
+                "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+            },
+            "required": ["code", "description", "wing", "room"],
+        },
+        "handler": tool_remember_code,
+    },
+    "mempalace_consolidate": {
+        "description": "[MEMPALACE] Find and optionally merge duplicate memories by topic to reduce storage and improve recall.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "Topic to search for duplicates"},
+                "merge": {"type": "boolean", "description": "If True, merge duplicates into one (default False)"},
+                "threshold": {
+                    "type": "number",
+                    "description": "Similarity threshold for duplicate detection 0-1 (default 0.85)",
+                },
+            },
+            "required": ["topic"],
+        },
+        "handler": tool_consolidate,
+    },
+    "mempalace_export_claude_md": {
+        "description": "[MEMPALACE] Export memories to CLAUDE.md format for use as project documentation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Wing to export from (optional — exports all if not specified)"},
+                "room": {"type": "string", "description": "Room to export from (optional)"},
+                "format": {
+                    "type": "string",
+                    "description": "Export format: 'markdown' or 'json' (default: markdown)",
+                },
+            },
+        },
+        "handler": tool_export_claude_md,
     },
 }
 
@@ -921,25 +1301,85 @@ def handle_request(request):
     }
 
 
+def serve_http(host: str = "127.0.0.1", port: int = 8766) -> None:
+    """Run MemPalace MCP server over HTTP using Starlette + Uvicorn."""
+    try:
+        from starlette.applications import Starlette
+        from starlette.routing import Route, Mount
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, Response
+        import uvicorn
+    except ImportError:
+        logger.error("HTTP transport requires starlette and uvicorn. Install with: pip install mempalace[lance]")
+        sys.exit(1)
+
+    async def http_handle(request: Request) -> Response:
+        """Handle MCP HTTP requests — JSON POST or SSE GET."""
+        content_type = request.headers.get("content-type", "")
+
+        if request.method == "GET":
+            # SSE stream for server-sent events (optional upgrade path)
+            return JSONResponse({
+                "error": "SSE not implemented. Use POST with application/json."
+            }, status_code=400)
+
+        if request.method == "POST" and "application/json" in content_type:
+            try:
+                body = await request.body()
+                request_data = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+            response_data = handle_request(request_data)
+
+            if response_data is None:
+                return Response(status_code=204)
+
+            return JSONResponse(response_data)
+
+        return JSONResponse({"error": "Unsupported media type"}, status_code=415)
+
+    async def health(request: Request) -> Response:
+        return JSONResponse({"status": "ok", "transport": "http"})
+
+    routes = [
+        Route("/mcp", http_handle, methods=["GET", "POST"]),
+        Route("/health", health, methods=["GET"]),
+    ]
+
+    app = Starlette(routes=routes)
+
+    logger.info("MemPalace MCP HTTP server starting at http://%s:%d/mcp", host, port)
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
 def main():
-    logger.info("MemPalace MCP Server starting...")
-    while True:
-        try:
-            line = sys.stdin.readline()
-            if not line:
+    transport = os.environ.get("MEMPALACE_TRANSPORT", "stdio")
+
+    if transport == "http":
+        port = int(os.environ.get("MEMPALACE_HTTP_PORT", "8766"))
+        host = os.environ.get("MEMPALACE_HTTP_HOST", "127.0.0.1")
+        serve_http(host=host, port=port)
+    else:
+        # Default stdio transport
+        logger.info("MemPalace MCP Server starting (stdio)...")
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                request = json.loads(line)
+                response = handle_request(request)
+                if response is not None:
+                    sys.stdout.write(json.dumps(response) + "\n")
+                    sys.stdout.flush()
+            except KeyboardInterrupt:
                 break
-            line = line.strip()
-            if not line:
-                continue
-            request = json.loads(line)
-            response = handle_request(request)
-            if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
+            except Exception as e:
+                logger.error(f"Server error: {e}")
 
 
 if __name__ == "__main__":

@@ -18,4 +18,4 @@ logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICA
 if platform.machine() == "arm64" and platform.system() == "Darwin":
     os.environ.setdefault("ORT_DISABLE_COREML", "1")
 
-__all__ = ["main", "__version__"]
+__all__ = ["main", "__version__", "circuit_breaker"]
