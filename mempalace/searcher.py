@@ -341,6 +341,96 @@ async def search_memories_async(
     )
 
 
+
+# BM25 module-level state
+_bm25_index = None
+_bm25_corpus = None
+_bm25_ids = None
+_bm25_lock = threading.Lock()
+
+
+def _get_bm25(col):
+    """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids) or (None, None, None)."""
+    global _bm25_index, _bm25_corpus, _bm25_ids
+    try:
+        from rank_bm25 import BM25Okapi
+    except ImportError:
+        return None, None, None
+
+    with _bm25_lock:
+        try:
+            data = col.get(include=["documents", "metadatas"], limit=50000)
+            docs = data["documents"]
+            ids = data["ids"]
+            if not docs:
+                return None, None, None
+            tokenized = [d.lower().split() for d in docs]
+            bm25 = BM25Okapi(tokenized)
+            return bm25, docs, ids
+        except Exception as e:
+            logger.warning("BM25 index build failed: %s", e)
+            return None, None, None
+
+
+def _bm25_search(query: str, col, n_results: int = 10, wing: str = None, room: str = None) -> list:
+    """Keyword search using BM25. Returns list of hit dicts compatible with search_memories() output."""
+    bm25, docs, ids = _get_bm25(col)
+    if bm25 is None:
+        return []
+
+    try:
+        tokenized_query = query.lower().split()
+        scores = bm25.get_scores(tokenized_query)
+        top_n = min(n_results * 2, len(scores))
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
+        max_score = max(scores) if max(scores) > 0 else 1.0
+
+        data = col.get(include=["metadatas"], ids=[ids[i] for i in top_indices])
+
+        hits = []
+        for i, idx in enumerate(top_indices):
+            if scores[idx] <= 0:
+                continue
+            meta = data["metadatas"][i] if data["metadatas"] else {}
+            if wing and meta.get("wing") != wing:
+                continue
+            if room and meta.get("room") != room:
+                continue
+            hits.append({
+                "text": docs[idx],
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": meta.get("source_file", "?"),
+                "similarity": round(float(scores[idx]) / max_score, 3),
+                "source": "bm25",
+                "bm25_score": round(float(scores[idx]), 4),
+            })
+        return hits[:n_results]
+    except Exception as e:
+        logger.warning("BM25 search failed: %s", e)
+        return []
+
+
+def _rrf_merge(result_lists: list, k: int = 60) -> list:
+    """Reciprocal Rank Fusion — combines results from multiple retrieval systems."""
+    scores = {}
+    for result_list in result_lists:
+        for rank, hit in enumerate(result_list):
+            key = hit["text"][:80]
+            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+
+    seen = {}
+    for hit_list in result_lists:
+        for hit in hit_list:
+            key = hit["text"][:80]
+            if key not in seen:
+                seen[key] = hit
+                seen[key]["rrf_score"] = round(scores.get(key, 0), 6)
+
+    sorted_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
+    return [seen[k] for k in sorted_keys if k in seen]
+
+
 def hybrid_search(
     query: str,
     palace_path: str,
@@ -352,6 +442,7 @@ def hybrid_search(
     agent_id: str = None,
 ) -> dict:
     from datetime import date
+    from .config import MempalaceConfig
 
     # Vrstva 1: ChromaDB semantic search
     chroma = search_memories(
@@ -359,6 +450,16 @@ def hybrid_search(
         n_results=n_results, is_latest=True, agent_id=agent_id, rerank=rerank
     )
     hits = chroma.get("results", [])
+
+    # Vrstva 1b: BM25 keyword search (zachycuji presne vyrazy, verze, identifikatory)
+    bm25_hits = []
+    try:
+        cfg = MempalaceConfig()
+        backend = get_backend(cfg.backend)
+        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
+        bm25_hits = _bm25_search(query, col, n_results=n_results, wing=wing, room=room)
+    except Exception as e:
+        logger.warning("BM25 layer failed: %s", e)
 
     # Vrstva 2: KG entity search
     kg_hits = []
@@ -388,21 +489,16 @@ def hybrid_search(
         except Exception as e:
             logger.warning("KG layer failed in hybrid_search, ChromaDB only: %s", e)
 
-    # Sloučit + deduplikovat (ChromaDB první)
-    seen_texts = set()
-    merged = []
-    for h in hits + kg_hits:
-        key = h["text"][:80]
-        if key not in seen_texts:
-            seen_texts.add(key)
-            merged.append(h)
+    # Reciprocal Rank Fusion — kombinuje vysledky ze vsech tri vrstev
+    merged = _rrf_merge([hits, bm25_hits, kg_hits])[:n_results]
 
     return {
         "query": query,
         "filters": {"wing": wing, "room": room, "agent_id": agent_id},
-        "results": merged[:n_results],
-        "sources": {"chroma": len(hits), "kg": len(kg_hits)},
+        "results": merged,
+        "sources": {"chroma": len(hits), "bm25": len(bm25_hits), "kg": len(kg_hits)},
     }
+
 
 async def hybrid_search_async(
     query: str, palace_path: str, wing: str = None, room: str = None,

@@ -403,3 +403,93 @@ class TestHybridSearch:
 
         # Keys should differ
         assert keys_after_first != keys_after_second, "Different is_latest must produce different cache key"
+
+
+class TestBM25Hybrid:
+    def test_bm25_search_exact_match(self, palace_path, seeded_collection):
+        """BM25 finds exact token matches that semantic search might rank lower."""
+        from mempalace.searcher import hybrid_search
+        from mempalace.backends import get_backend
+
+        # Add 10 drawers — "worker" appears in one doc only → positive IDF
+        backend = get_backend("chromadb")
+        col = backend.get_collection(palace_path, "mempalace_drawers")
+        col.add(
+            ids=["tech_doc"] + [f"other_doc_{i}" for i in range(9)],
+            documents=["Set DEBUG=true and run: worker service"]
+            + [f"Configure the service at port {8080+i} and start the task" for i in range(9)],
+            metadatas=[{"wing": "backend", "room": "api", "is_latest": True}] * 10,
+        )
+
+        # "worker" is a standalone token in doc1; BM25 should find it
+        result = hybrid_search("worker", palace_path, n_results=5, use_kg=False)
+        sources = result.get("sources", {})
+        assert sources.get("bm25", 0) >= 1, "BM25 should find exact token match"
+
+    def test_bm25_graceful_no_rank_bm25(self, palace_path, seeded_collection):
+        """Without rank_bm25 installed, hybrid_search still returns results."""
+        import mempalace.searcher as sr
+        from mempalace.searcher import hybrid_search
+
+        # Simulate rank_bm25 not available by patching import
+        import builtins
+        real_import = builtins.__import__
+        def fake_import(name, *args, **kwargs):
+            if name == "rank_bm25":
+                raise ImportError("rank_bm25 not installed")
+            return real_import(name, *args, **kwargs)
+        builtins.__import__ = fake_import
+
+        try:
+            # Reload to pick up the missing import
+            import importlib
+            import mempalace.query_cache
+            importlib.reload(mempalace.query_cache)
+
+            result = hybrid_search("JWT", palace_path, n_results=5, use_kg=False)
+            assert "results" in result
+        finally:
+            builtins.__import__ = real_import
+
+    def test_rrf_merge_combines_sources(self):
+        """RRF gives higher score to hits appearing in multiple result lists."""
+        from mempalace.searcher import _rrf_merge
+
+        list1 = [{"text": "shared result"}, {"text": "unique1"}]
+        list2 = [{"text": "shared result"}, {"text": "unique2"}]
+
+        result = _rrf_merge([list1, list2])
+
+        # Find shared result
+        shared = next((h for h in result if h["text"] == "shared result"), None)
+        assert shared is not None
+        assert shared.get("rrf_score", 0) > 0, "Shared hit should have rrf_score"
+
+    def test_hybrid_search_sources_has_bm25(self, palace_path, seeded_collection):
+        """hybrid_search result['sources'] must contain 'bm25' key."""
+        from mempalace.searcher import hybrid_search
+
+        result = hybrid_search("JWT", palace_path, n_results=5, use_kg=False)
+        assert "bm25" in result.get("sources", {}), "sources must have bm25 key"
+
+    def test_bm25_min_score_threshold(self, palace_path, seeded_collection):
+        """BM25 hits with score > 0 are kept; zero-score hits are filtered."""
+        from mempalace.searcher import _bm25_search
+        from mempalace.backends import get_backend
+
+        backend = get_backend("chromadb")
+        col = backend.get_collection(palace_path, "mempalace_drawers")
+
+        # Add 10 docs where "xyzzy" appears in one — gives positive IDF with 10 docs
+        col.add(
+            ids=["unique1"] + [f"other_{i}" for i in range(9)],
+            documents=["foo bar xyzzy quux"] + [f"foo bar baz quux number {i}" for i in range(9)],
+            metadatas=[{"wing": "notes", "room": "test", "is_latest": True}] * 10,
+        )
+
+        hits = _bm25_search("xyzzy", col, n_results=10)
+        # xyzzy appears in doc1 only → positive IDF → positive score
+        xyzzy_hits = [h for h in hits if "xyzzy" in h["text"]]
+        assert len(xyzzy_hits) >= 1, "xyzzy should be found"
+        assert all(h.get("bm25_score", 0) > 0 for h in xyzzy_hits), "BM25 score must be > 0 for discriminative term"
+
