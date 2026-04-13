@@ -119,7 +119,7 @@ Add to your OpenClaw MCP configuration:
   "mcpServers": {
     "mempalace": {
       "command": "python3",
-      "args": ["-m", "mempalace.mcp_server"]
+      "args": ["-m", "mempalace.fastmcp_server"]
     }
   }
 }
@@ -128,14 +128,14 @@ Add to your OpenClaw MCP configuration:
 Or via CLI:
 
 ```bash
-openclaw mcp set mempalace '{"command":"python3","args":["-m","mempalace.mcp_server"]}'
+openclaw mcp set mempalace '{"command":"python3","args":["-m","mempalace.fastmcp_server"]}'
 ```
 
 ### Other MCP hosts
 
 ```bash
 # Claude Code
-claude mcp add mempalace -- python -m mempalace.mcp_server
+claude mcp add mempalace -- python -m mempalace.fastmcp_server
 
 # Cursor — add to .cursor/mcp.json
 # Codex — add to .codex/mcp.json

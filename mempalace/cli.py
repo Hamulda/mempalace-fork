@@ -600,7 +600,7 @@ For stdio transport, add to ~/.claude/config.json:
   "mcpServers": {{
     "mempalace": {{
       "command": "python",
-      "args": ["-m", "mempalace.mcp_server"]
+      "args": ["-m", "mempalace.fastmcp_server"]
     }}
   }}
 }}
@@ -614,7 +614,7 @@ For stdio transport, add to ~/.claude/config.json:
 
 def cmd_mcp(args):
     """Show how to wire MemPalace into MCP-capable hosts."""
-    base_server_cmd = "python -m mempalace.mcp_server"
+    base_server_cmd = "python -m mempalace.fastmcp_server"
 
     if args.palace:
         resolved_palace = str(Path(args.palace).expanduser())
