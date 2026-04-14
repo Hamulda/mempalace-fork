@@ -237,12 +237,22 @@ def _register_tools(server, backend, config, settings):
         wings = {}
         rooms = {}
         try:
-            all_meta = col.get(include=["metadatas"], limit=10000)["metadatas"]
-            for m in all_meta:
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                wings[w] = wings.get(w, 0) + 1
-                rooms[r] = rooms.get(r, 0) + 1
+            # Iterative aggregation — no fixed limit, processes ALL records
+            _BATCH = 500
+            offset = 0
+            while True:
+                batch = col.get(include=["metadatas"], limit=_BATCH, offset=offset)
+                metas = batch.get("metadatas", [])
+                if not metas:
+                    break
+                for m in metas:
+                    w = m.get("wing", "unknown")
+                    r = m.get("room", "unknown")
+                    wings[w] = wings.get(w, 0) + 1
+                    rooms[r] = rooms.get(r, 0) + 1
+                if len(metas) < _BATCH:
+                    break
+                offset += len(metas)
         except Exception:
             pass
 
@@ -279,10 +289,19 @@ def _register_tools(server, backend, config, settings):
 
         wings = {}
         try:
-            all_meta = col.get(include=["metadatas"], limit=10000)["metadatas"]
-            for m in all_meta:
-                w = m.get("wing", "unknown")
-                wings[w] = wings.get(w, 0) + 1
+            _BATCH = 500
+            offset = 0
+            while True:
+                batch = col.get(include=["metadatas"], limit=_BATCH, offset=offset)
+                metas = batch.get("metadatas", [])
+                if not metas:
+                    break
+                for m in metas:
+                    w = m.get("wing", "unknown")
+                    wings[w] = wings.get(w, 0) + 1
+                if len(metas) < _BATCH:
+                    break
+                offset += len(metas)
         except Exception:
             pass
 
@@ -297,13 +316,22 @@ def _register_tools(server, backend, config, settings):
 
         rooms = {}
         try:
-            kwargs = {"include": ["metadatas"], "limit": 10000}
-            if wing:
-                kwargs["where"] = {"wing": wing}
-            all_meta = col.get(**kwargs)["metadatas"]
-            for m in all_meta:
-                r = m.get("room", "unknown")
-                rooms[r] = rooms.get(r, 0) + 1
+            _BATCH = 500
+            offset = 0
+            while True:
+                kwargs = {"include": ["metadatas"], "limit": _BATCH, "offset": offset}
+                if wing:
+                    kwargs["where"] = {"wing": wing}
+                batch = col.get(**kwargs)
+                metas = batch.get("metadatas", [])
+                if not metas:
+                    break
+                for m in metas:
+                    r = m.get("room", "unknown")
+                    rooms[r] = rooms.get(r, 0) + 1
+                if len(metas) < _BATCH:
+                    break
+                offset += len(metas)
         except Exception:
             pass
 
@@ -318,13 +346,22 @@ def _register_tools(server, backend, config, settings):
 
         taxonomy = {}
         try:
-            all_meta = col.get(include=["metadatas"], limit=10000)["metadatas"]
-            for m in all_meta:
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                if w not in taxonomy:
-                    taxonomy[w] = {}
-                taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+            _BATCH = 500
+            offset = 0
+            while True:
+                batch = col.get(include=["metadatas"], limit=_BATCH, offset=offset)
+                metas = batch.get("metadatas", [])
+                if not metas:
+                    break
+                for m in metas:
+                    w = m.get("wing", "unknown")
+                    r = m.get("room", "unknown")
+                    if w not in taxonomy:
+                        taxonomy[w] = {}
+                    taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+                if len(metas) < _BATCH:
+                    break
+                offset += len(metas)
         except Exception:
             pass
 
@@ -717,9 +754,8 @@ def _register_tools(server, backend, config, settings):
                         "source_file": source_file or "",
                         "chunk_index": 0,
                         "added_by": added_by,
-                        "entities": json.dumps(entities) if entities else "",
-                        "filed_at": datetime.now().isoformat(),
                         "agent_id": added_by,
+                        "entities": json.dumps(entities) if entities else "",
                         "timestamp": datetime.utcnow().isoformat() + "Z",
                         "origin_type": "observation",
                         "is_latest": True,
@@ -824,17 +860,15 @@ def _register_tools(server, backend, config, settings):
                     {
                         "wing": wing,
                         "room": room,
-                        "hall": "hall_diary",
-                        "topic": topic,
-                        "type": "diary_entry",
-                        "agent": agent_name,
-                        "filed_at": now.isoformat(),
-                        "date": now.strftime('%Y-%m-%d'),
+                        "source_file": f"diary://{agent_name}/{now.strftime('%Y-%m-%d')}",
+                        "added_by": agent_name,
                         "agent_id": agent_name,
+                        "topic": topic,
                         "timestamp": datetime.utcnow().isoformat() + "Z",
                         "origin_type": "diary_entry",
                         "is_latest": True,
                         "supersedes_id": "",
+                        "chunk_index": 0,
                     }
                 ],
             )
@@ -996,14 +1030,13 @@ def _register_tools(server, backend, config, settings):
                     "wing": wing,
                     "room": room,
                     "source_file": source_file or "",
-                    "type": "code_memory",
+                    "chunk_index": 0,
+                    "added_by": added_by,
+                    "agent_id": added_by,
                     "description": description,
                     "entities": json.dumps(entities) if entities else "",
-                    "added_by": added_by,
-                    "filed_at": datetime.now().isoformat(),
-                    "agent_id": added_by,
                     "timestamp": datetime.utcnow().isoformat() + "Z",
-                    "origin_type": "observation",
+                    "origin_type": "code_memory",
                     "is_latest": True,
                     "supersedes_id": "",
                 }],

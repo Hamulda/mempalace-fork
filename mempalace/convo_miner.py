@@ -16,7 +16,9 @@ from datetime import datetime
 from collections import defaultdict
 
 from .normalize import normalize
-from .palace import SKIP_DIRS, get_collection, file_already_mined
+from .config import MempalaceConfig
+from .backends import get_backend
+from .palace import SKIP_DIRS, file_already_mined
 
 
 # File types that might contain conversations
@@ -264,7 +266,12 @@ def mine_convos(
         print("  DRY RUN — nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = get_collection(palace_path) if not dry_run else None
+    if not dry_run:
+        cfg = MempalaceConfig()
+        backend = get_backend(cfg.backend)
+        collection = backend.get_collection(palace_path, cfg.collection_name, create=True)
+    else:
+        collection = None
 
     total_drawers = 0
     files_skipped = 0
@@ -344,7 +351,11 @@ def mine_convos(
                             "source_file": source_file,
                             "chunk_index": chunk["chunk_index"],
                             "added_by": agent,
-                            "filed_at": datetime.now().isoformat(),
+                            "agent_id": agent,
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "origin_type": "convo",
+                            "is_latest": True,
+                            "supersedes_id": "",
                             "ingest_mode": "convos",
                             "extract_mode": extract_mode,
                         }

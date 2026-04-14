@@ -5,6 +5,9 @@ miner.py — Files everything into the palace.
 Reads mempalace.yaml from the project directory to know the wing + rooms.
 Routes each file to the right room based on content.
 Stores verbatim chunks as drawers. No summaries. Ever.
+
+Storage: Uses get_backend(config.backend) — LanceDB is canonical primary,
+ChromaDB is legacy compat via the same abstraction layer.
 """
 
 import os
@@ -15,9 +18,9 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-import chromadb
-
-from .palace import SKIP_DIRS, get_collection, file_already_mined
+from .config import MempalaceConfig
+from .backends import get_backend
+from .palace import SKIP_DIRS, file_already_mined  # Only SKIP_DIRS and file_already_mined remain from palace.py
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -382,7 +385,11 @@ def add_drawer(
             "source_file": source_file,
             "chunk_index": chunk_index,
             "added_by": agent,
-            "filed_at": datetime.now().isoformat(),
+            "agent_id": agent,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "origin_type": "observation",
+            "is_latest": True,
+            "supersedes_id": "",
         }
         # Store file mtime so we can detect modifications later.
         try:
@@ -569,7 +576,9 @@ def mine(
     print(f"{'─' * 55}\n")
 
     if not dry_run:
-        collection = get_collection(palace_path)
+        cfg = MempalaceConfig()
+        backend = get_backend(cfg.backend)
+        collection = backend.get_collection(palace_path, cfg.collection_name, create=True)
     else:
         collection = None
 
@@ -613,18 +622,28 @@ def mine(
 
 
 def status(palace_path: str):
-    """Show what's been filed in the palace."""
+    """Show what's been filed in the palace.
+
+    Uses canonical backend factory — Lance is primary, Chroma is legacy compat.
+    """
+    from .config import MempalaceConfig
+
+    cfg = MempalaceConfig()
     try:
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
+        backend = get_backend(cfg.backend)
+        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
     except Exception:
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         return
 
     # Count by wing and room
-    r = col.get(limit=10000, include=["metadatas"])
-    metas = r["metadatas"]
+    try:
+        r = col.get(limit=10000, include=["metadatas"])
+    except Exception as e:
+        print(f"\n  Error reading palace: {e}")
+        return
+    metas = r.get("metadatas", [])
 
     wing_rooms = defaultdict(lambda: defaultdict(int))
     for m in metas:

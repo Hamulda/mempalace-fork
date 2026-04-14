@@ -324,12 +324,13 @@ async def search_memories_async(
 
 
 
-# BM25 module-level state
+# BM25 module-level state — path-aware to prevent cross-palace contamination
 _bm25_index = None
 _bm25_corpus = None
 _bm25_ids = None
 _bm25_metas = None
 _bm25_lock = threading.Lock()
+_bm25_path_cached: str | None = None  # palace_path of the current index
 
 # KG singleton — reused across hybrid_search calls, thread-safe
 _kg_instance = None
@@ -365,22 +366,33 @@ def _get_kg(palace_path: str):
     return _kg_instance
 
 
-def _get_bm25(col):
-    """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids, metas) or (None, None, None, None)."""
-    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
+def _get_bm25(col, palace_path: str):
+    """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids, metas) or (None, None, None, None).
+
+    Index is cached per palace_path — switching palaces invalidates the cache.
+    """
+    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas, _bm25_path_cached
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
         return None, None, None, None
 
-    # Return cached index if already built
-    if _bm25_index is not None:
+    # Return cached index only if same palace_path
+    if _bm25_index is not None and _bm25_path_cached == palace_path:
         return _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
 
     with _bm25_lock:
         # Double-check after acquiring lock
-        if _bm25_index is not None:
+        if _bm25_index is not None and _bm25_path_cached == palace_path:
             return _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
+
+        # Different palace — invalidate stale index
+        if _bm25_index is not None and _bm25_path_cached != palace_path:
+            logger.debug("BM25 cache invalidated: palace changed (%s → %s)", _bm25_path_cached, palace_path)
+            _bm25_index = None
+            _bm25_corpus = None
+            _bm25_ids = None
+            _bm25_metas = None
 
         try:
             data = col.get(include=["documents", "metadatas"], limit=50000)
@@ -397,15 +409,16 @@ def _get_bm25(col):
             _bm25_corpus = docs
             _bm25_ids = ids
             _bm25_metas = metas
+            _bm25_path_cached = palace_path
             return bm25, docs, ids, metas
         except Exception as e:
             logger.warning("BM25 index build failed: %s", e)
             return None, None, None, None
 
 
-def _bm25_search(query: str, col, n_results: int = 10, wing: str = None, room: str = None) -> list:
+def _bm25_search(query: str, col, palace_path: str, n_results: int = 10, wing: str = None, room: str = None) -> list:
     """Keyword search using BM25. Returns list of hit dicts compatible with search_memories() output."""
-    bm25, docs, ids, metas = _get_bm25(col)
+    bm25, docs, ids, metas = _get_bm25(col, palace_path)
     if bm25 is None:
         return []
 
@@ -515,7 +528,7 @@ def hybrid_search(
         cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
         col = backend.get_collection(palace_path, cfg.collection_name, create=False)
-        bm25_hits = _bm25_search(query, col, n_results=n_results, wing=wing, room=room)
+        bm25_hits = _bm25_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
     except Exception as e:
         logger.warning("BM25 layer failed: %s", e)
 
