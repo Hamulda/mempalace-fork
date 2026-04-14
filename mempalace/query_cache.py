@@ -109,6 +109,27 @@ class QueryCache:
         with self._lock:
             self._last_write[collection] = time.monotonic()
 
+    def get_value(self, key: str) -> Optional[Any]:
+        """Return cached value by key string, or None if missing/expired. Used by search_memories."""
+        try:
+            value, ts = self._cache[key]
+            if time.monotonic() - ts < self._ttl:
+                return value
+            del self._cache[key]
+        except (KeyError, TypeError, AttributeError):
+            pass
+        return None
+
+    def set_value(self, key: str, value: Any) -> None:
+        """Store value by key string with TTL. Used by search_memories."""
+        try:
+            self._cache[key] = (value, time.monotonic())
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
+        except Exception:
+            pass
+
     def stats(self) -> dict:
         with self._lock:
             total = self._hits + self._misses

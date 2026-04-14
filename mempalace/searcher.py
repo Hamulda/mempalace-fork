@@ -36,20 +36,6 @@ def _get_query_cache():
                 _query_cache = QueryCache()
     return _query_cache
 
-# Query cache singleton (lazy, thread-safe)
-_query_cache = None
-_query_cache_lock = threading.Lock()
-
-
-def _get_query_cache():
-    global _query_cache
-    if _query_cache is None:
-        with _query_cache_lock:
-            if _query_cache is None:
-                from .query_cache import QueryCache
-                _query_cache = QueryCache()
-    return _query_cache
-
 
 def _get_reranker():
     global _reranker
@@ -199,13 +185,10 @@ def search_memories(
     try:
         import time
         cache = _get_query_cache()
-        cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}"
-        if cache_key in cache._cache:
-            cached_result, cached_ts = cache._cache[cache_key]
-            if time.monotonic() - cached_ts < cache._ttl:
-                return cached_result
-            else:
-                del cache._cache[cache_key]
+        cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
+        cached_result = cache.get_value(cache_key)
+        if cached_result is not None:
+            return cached_result
     except Exception:
         pass
 
@@ -294,13 +277,9 @@ def search_memories(
     # Cache result (skip errors)
     if "error" not in result_dict:
         try:
-            import time
             cache = _get_query_cache()
-            cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}"
-            cache._cache[cache_key] = (result_dict, time.monotonic())
-            # Evict if over maxsize
-            while len(cache._cache) > cache._maxsize:
-                cache._cache.popitem(last=False)
+            cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
+            cache.set_value(cache_key, result_dict)
         except Exception:
             pass
 
@@ -346,35 +325,51 @@ async def search_memories_async(
 _bm25_index = None
 _bm25_corpus = None
 _bm25_ids = None
+_bm25_metas = None
 _bm25_lock = threading.Lock()
 
 
 def _get_bm25(col):
-    """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids) or (None, None, None)."""
-    global _bm25_index, _bm25_corpus, _bm25_ids
+    """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids, metas) or (None, None, None, None)."""
+    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
-        return None, None, None
+        return None, None, None, None
+
+    # Return cached index if already built
+    if _bm25_index is not None:
+        return _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
 
     with _bm25_lock:
+        # Double-check after acquiring lock
+        if _bm25_index is not None:
+            return _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
+
         try:
             data = col.get(include=["documents", "metadatas"], limit=50000)
             docs = data["documents"]
             ids = data["ids"]
+            metas = data.get("metadatas", [])
             if not docs:
-                return None, None, None
+                return None, None, None, None
             tokenized = [d.lower().split() for d in docs]
             bm25 = BM25Okapi(tokenized)
-            return bm25, docs, ids
+
+            # Store in globals for reuse
+            _bm25_index = bm25
+            _bm25_corpus = docs
+            _bm25_ids = ids
+            _bm25_metas = metas
+            return bm25, docs, ids, metas
         except Exception as e:
             logger.warning("BM25 index build failed: %s", e)
-            return None, None, None
+            return None, None, None, None
 
 
 def _bm25_search(query: str, col, n_results: int = 10, wing: str = None, room: str = None) -> list:
     """Keyword search using BM25. Returns list of hit dicts compatible with search_memories() output."""
-    bm25, docs, ids = _get_bm25(col)
+    bm25, docs, ids, metas = _get_bm25(col)
     if bm25 is None:
         return []
 
@@ -385,13 +380,11 @@ def _bm25_search(query: str, col, n_results: int = 10, wing: str = None, room: s
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
         max_score = max(scores) if max(scores) > 0 else 1.0
 
-        data = col.get(include=["metadatas"], ids=[ids[i] for i in top_indices])
-
         hits = []
         for i, idx in enumerate(top_indices):
             if scores[idx] <= 0:
                 continue
-            meta = data["metadatas"][i] if data["metadatas"] else {}
+            meta = metas[idx] if metas and idx < len(metas) else {}
             if wing and meta.get("wing") != wing:
                 continue
             if room and meta.get("room") != room:
