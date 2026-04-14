@@ -193,29 +193,38 @@ def hook_session_start(data: dict, harness: str, transport: str = "cli"):
             _output({})
             return
 
-        # Direct search (no subprocess — faster, no 2s timeout)
+        # Thread-based timeout wrapper for search
+        import concurrent.futures
+        from mempalace.searcher import search_memories
+        result_data = {}
         try:
-            from mempalace.searcher import search_memories
-            result_data = search_memories(
-                query=project_name,
-                palace_path=cfg.palace_path,
-                n_results=cfg.hook_session_start_top_k,
-            )
-            lines = [r["text"][:120] for r in result_data.get("results", [])]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(
+                    search_memories,
+                    query=project_name,
+                    palace_path=cfg.palace_path,
+                    n_results=cfg.hook_session_start_top_k,
+                )
+                result_data = future.result(timeout=5.0)
+        except concurrent.futures.TimeoutError:
+            _log(f"SESSION START search timed out after 5s for project: {project_name}")
+            result_data = {}
         except Exception as e:
             _log(f"SESSION START direct search failed: {e}")
-            lines = []
+            result_data = {}
+
+        lines = [r["text"][:120] for r in result_data.get("results", [])]
 
         if not lines:
             _output({})
-            return  # empty results → output empty dict
+            return
 
         context = "## Relevant memories\n" + "\n".join(f"- {l}" for l in lines)
         _output({"context": context})
 
     except Exception as e:
         _log(f"SESSION START inject failed (silent): {e}")
-        return  # silent failure — no output
+        return
 
 
 def hook_precompact(data: dict, harness: str, transport: str = "cli"):
@@ -230,15 +239,16 @@ def hook_precompact(data: dict, harness: str, transport: str = "cli"):
     if mempal_dir and os.path.isdir(mempal_dir):
         try:
             log_path = STATE_DIR / "hook.log"
+            mine_timeout = int(os.environ.get("MEMPALACE_MINE_TIMEOUT", "120"))
             with open(log_path, "a") as log_f:
                 subprocess.run(
                     [sys.executable, "-m", "mempalace", "mine", mempal_dir],
                     stdout=log_f,
                     stderr=log_f,
-                    timeout=60,
+                    timeout=mine_timeout,
                 )
-        except OSError:
-            pass
+        except (OSError, subprocess.TimeoutExpired) as e:
+            _log(f"mine timed out or failed during precompact: {e}")
 
     # Always block -- compaction = save everything
     _output({"decision": "block", "reason": PRECOMPACT_BLOCK_REASON})

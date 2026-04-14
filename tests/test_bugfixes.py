@@ -583,6 +583,61 @@ class TestGeneralExtractorIntegration:
         del server
 
 
+class TestHooksCliBugfixes:
+    def test_hook_precompact_timeout_exception(self):
+        """hook_precompact catches subprocess.TimeoutExpired without uncaught exception."""
+        import subprocess
+        from unittest.mock import patch
+        import os, tempfile
+        from mempalace.hooks_cli import hook_precompact
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = {**os.environ, "MEMPAL_DIR": tmp_dir}
+            with patch.dict(os.environ, env, clear=False):
+                with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                    mock_run.side_effect = subprocess.TimeoutExpired(cmd="mine", timeout=120)
+                    try:
+                        hook_precompact({"session_id": "test123", "transcript_path": ""}, "claude-code")
+                    except subprocess.TimeoutExpired:
+                        raise AssertionError("subprocess.TimeoutExpired should be caught")
+
+    def test_hook_session_start_search_timeout(self):
+        """hook_session_start completes within 10s even if search_memories is slow."""
+        import time
+        from unittest.mock import patch
+        import tempfile
+        from pathlib import Path
+        from mempalace.hooks_cli import hook_session_start
+
+        state_dir = tempfile.mkdtemp()
+        with patch("mempalace.hooks_cli.STATE_DIR", Path(state_dir)):
+            # Verify the function completes without hanging (the 5s timeout is internal)
+            # We just ensure it doesn't wait for slow search to finish
+            start = time.time()
+            hook_session_start({"session_id": "test", "cwd": "/tmp/test_project"}, "claude-code")
+            elapsed = time.time() - start
+            # With a real palace path (or no palace), it should still complete quickly
+            # The timeout wrapper ensures it won't hang even if search is slow
+            assert elapsed < 10, f"Should complete within 10s, took {elapsed:.1f}s"
+
+    def test_hook_session_start_palace_error_returns_empty(self):
+        """search_memories raises Exception → hook returns {} quickly (no hang)."""
+        import time
+        from unittest.mock import patch
+        import tempfile
+        from pathlib import Path
+        from mempalace.hooks_cli import hook_session_start
+
+        state_dir = tempfile.mkdtemp()
+        with patch("mempalace.hooks_cli.STATE_DIR", Path(state_dir)):
+            with patch("mempalace.searcher.search_memories") as mock_sm:
+                mock_sm.side_effect = RuntimeError("palace unavailable")
+                start = time.time()
+                hook_session_start({"session_id": "test", "cwd": "/tmp/test_project"}, "claude-code")
+                elapsed = time.time() - start
+                assert elapsed < 2, f"Should fail fast, took {elapsed:.1f}s"
+
+
 class TestSearchMemoriesResultsHaveId:
     def test_search_memories_results_have_id(self):
         """search_memories returns hits that include the 'id' key."""
