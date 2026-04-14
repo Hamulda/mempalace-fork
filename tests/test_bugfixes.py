@@ -549,6 +549,40 @@ class TestRrfMergeIdKey:
         assert "id2" in ids
 
 
+class TestGeneralExtractorIntegration:
+    def test_general_extractor_import(self):
+        """extract_memories is importable from general_extractor."""
+        from mempalace.general_extractor import extract_memories
+        assert callable(extract_memories)
+
+    def test_general_extractor_extract(self):
+        """extract_memories returns list (possibly empty) for text input."""
+        from mempalace.general_extractor import extract_memories
+        result = extract_memories("Alice works at Google. We decided to use Python.")
+        # Should return a list, not raise
+        assert isinstance(result, list)
+
+    async def test_add_drawer_general_extraction_no_crash(self, palace_path, collection):
+        """add_drawer with content that triggers general_extractor does not crash."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_add_drawer",
+                {
+                    "wing": "test",
+                    "room": "room",
+                    "content": "We decided to use Python because it works. "
+                               "I always prefer functional style. "
+                               "Finally got it working after a bug fix.",
+                    "added_by": "test",
+                },
+            )
+            data = _get_result_data(result)
+            assert data.get("success") is True, f"add_drawer should succeed, got: {data}"
+        del server
+
+
 class TestSearchMemoriesResultsHaveId:
     def test_search_memories_results_have_id(self):
         """search_memories returns hits that include the 'id' key."""

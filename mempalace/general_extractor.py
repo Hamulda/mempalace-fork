@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# DEPRECATED: use entity_detector.py for entity extraction (F175)
+# This module is kept for backward compatibility and general fact extraction.
+# Called from fastmcp_server.py mempalace_add_drawer() as background thread (F181).
 """
 general_extractor.py — Extract 5 types of memories from text.
 

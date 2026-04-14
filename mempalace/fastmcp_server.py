@@ -687,6 +687,25 @@ def _register_tools(server, backend, config, settings):
         except Exception:
             pass  # Entity extraction is best-effort
 
+        # PART 4b: General fact extraction (background, complementary to entity extraction)
+        def _extract_general_facts(text: str, drawer_id: str):
+            try:
+                from .general_extractor import extract_memories
+                facts = extract_memories(text)
+                for fact in (facts or [])[:10]:
+                    fact_text = str(fact.get("content", "")) if isinstance(fact, dict) else str(fact)
+                    if fact_text:
+                        logger.debug("general fact: %s from drawer %s", fact_text[:50], drawer_id)
+            except (ImportError, Exception) as e:
+                logger.debug("general_extractor skipped: %s", e)
+
+        threading.Thread(
+            target=_extract_general_facts,
+            args=(content, drawer_id),
+            daemon=True,
+            name=f"gen_extract_{drawer_id[:12]}"
+        ).start()
+
         try:
             col.upsert(
                 ids=[drawer_id],
