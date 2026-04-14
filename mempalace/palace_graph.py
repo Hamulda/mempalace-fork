@@ -12,20 +12,20 @@ Enables queries like:
   "Find all rooms connected to riley-college-apps"
   "What topics bridge wing_hardware and wing_myproject?"
 
-No external graph DB needed — built from ChromaDB metadata.
+Storage: Uses get_backend(config.backend) — LanceDB is canonical primary,
+ChromaDB is legacy compat via the same abstraction layer.
 """
 
 from collections import defaultdict, Counter
 from .config import MempalaceConfig
-
-import chromadb
+from .backends import get_backend
 
 
 def _get_collection(config=None):
     config = config or MempalaceConfig()
     try:
-        client = chromadb.PersistentClient(path=config.palace_path)
-        return client.get_collection(config.collection_name)
+        backend = get_backend(config.backend)
+        return backend.get_collection(config.palace_path, config.collection_name, create=False)
     except Exception:
         return None
 

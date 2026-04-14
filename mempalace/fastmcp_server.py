@@ -908,7 +908,7 @@ def _register_tools(server, backend, config, settings):
                 entries.append(
                     {
                         "date": meta.get("date", ""),
-                        "timestamp": meta.get("filed_at", ""),
+                        "timestamp": meta.get("timestamp", ""),
                         "topic": meta.get("topic", ""),
                         "content": doc,
                     }
@@ -1102,16 +1102,16 @@ def _register_tools(server, backend, config, settings):
 
             merged_count = 0
             if merge and len(duplicates) > 1:
-                # Sort by filed_at descending — newest as keeper
+                # Sort by timestamp descending — newest as keeper
                 duplicates_with_ts = []
                 for dup in duplicates:
                     try:
                         raw = col.get(ids=[dup["id"]], include=["metadatas"])
-                        ts = raw["metadatas"][0].get("filed_at", "") if raw["metadatas"] else ""
+                        ts = raw["metadatas"][0].get("timestamp", "") if raw["metadatas"] else ""
                     except Exception:
                         ts = ""
-                    duplicates_with_ts.append({**dup, "_filed_at": ts})
-                duplicates_with_ts.sort(key=lambda x: x["_filed_at"], reverse=True)
+                    duplicates_with_ts.append({**dup, "_timestamp": ts})
+                duplicates_with_ts.sort(key=lambda x: x["_timestamp"], reverse=True)
                 duplicates = duplicates_with_ts
                 keeper = duplicates[0]
                 to_remove = duplicates[1:]

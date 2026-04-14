@@ -23,7 +23,7 @@ class MemPalaceSettings(BaseSettings):
 
     # Database (zachovat stávající env vars z config.py)
     db_path: str = os.path.expanduser("~/.mempalace/palace")
-    db_backend: Literal["chromadb", "lancedb"] = "chromadb"
+    db_backend: Literal["lance", "chroma"] = "lance"  # canonical: lance is primary, chroma is legacy compat
     collection_name: str = "mempalace_drawers"
 
     # Cache TTL (zachovat hodnoty z middleware.py)

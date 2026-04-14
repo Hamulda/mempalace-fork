@@ -366,10 +366,12 @@ def _get_kg(palace_path: str):
     return _kg_instance
 
 
-def _get_bm25(col, palace_path: str):
+def _get_bm25(col, palace_path: str, max_docs: int = 10000):
     """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids, metas) or (None, None, None, None).
 
     Index is cached per palace_path — switching palaces invalidates the cache.
+    Memory-safe: loads in batches of 2000, checks memory pressure before/after each batch.
+    Stops early if memory becomes critical.
     """
     global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas, _bm25_path_cached
     try:
@@ -394,23 +396,74 @@ def _get_bm25(col, palace_path: str):
             _bm25_ids = None
             _bm25_metas = None
 
+        # Memory guard check before starting build
         try:
-            data = col.get(include=["documents", "metadatas"], limit=50000)
-            docs = data["documents"]
-            ids = data["ids"]
-            metas = data.get("metadatas", [])
-            if not docs:
+            from .memory_guard import MemoryGuard, MemoryPressure
+            guard = MemoryGuard.get()
+            if guard.pressure == MemoryPressure.CRITICAL:
+                logger.warning("BM25 build skipped: memory pressure CRITICAL")
                 return None, None, None, None
-            tokenized = [d.lower().split() for d in docs]
+        except Exception:
+            pass  # MemoryGuard not available, proceed cautiously
+
+        try:
+            # Batched collection read — load incrementally to avoid RAM spike
+            BATCH = 2000
+            all_docs = []
+            all_ids = []
+            all_metas = []
+            offset = 0
+
+            while True:
+                batch = col.get(limit=BATCH, offset=offset, include=["documents", "metadatas"])
+                batch_docs = batch.get("documents", [])
+                if not batch_docs:
+                    break
+
+                all_docs.extend(batch_docs)
+                all_ids.extend(batch.get("ids", []))
+                all_metas.extend(batch.get("metadatas", []))
+
+                # Memory pressure check mid-build
+                try:
+                    from .memory_guard import MemoryGuard, MemoryPressure
+                    guard = MemoryGuard.get()
+                    if guard.pressure == MemoryPressure.CRITICAL:
+                        logger.warning("BM25 build interrupted: memory became CRITICAL at offset %d", offset)
+                        break
+                    elif guard.pressure == MemoryPressure.WARN:
+                        # Halve batch size under warning
+                        BATCH = 1000
+                except Exception:
+                    pass
+
+                offset += len(batch_docs)
+
+                # Early exit: stop if we've loaded max_docs
+                if len(all_docs) >= max_docs:
+                    logger.debug("BM25 build limited to %d documents (memory safety)", max_docs)
+                    all_docs = all_docs[:max_docs]
+                    all_ids = all_ids[:max_docs]
+                    all_metas = all_metas[:max_docs]
+                    break
+
+                if len(batch_docs) < BATCH:
+                    break
+
+            if not all_docs:
+                return None, None, None, None
+
+            tokenized = [d.lower().split() for d in all_docs]
             bm25 = BM25Okapi(tokenized)
 
             # Store in globals for reuse
             _bm25_index = bm25
-            _bm25_corpus = docs
-            _bm25_ids = ids
-            _bm25_metas = metas
+            _bm25_corpus = all_docs
+            _bm25_ids = all_ids
+            _bm25_metas = all_metas
             _bm25_path_cached = palace_path
-            return bm25, docs, ids, metas
+            logger.debug("BM25 index built: %d docs", len(all_docs))
+            return bm25, all_docs, all_ids, all_metas
         except Exception as e:
             logger.warning("BM25 index build failed: %s", e)
             return None, None, None, None

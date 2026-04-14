@@ -25,7 +25,9 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "chromadb>=0.5.0,<0.7",
+    "lancedb>=0.20.0",
+    "fastembed>=0.4.0",
+    "pyarrow>=14.0.0",
     "pyyaml>=6.0,<7",
     "pydantic-settings>=2.0.0",
     "fastmcp>=2.14.0",
@@ -41,12 +43,9 @@ mempalace = "mempalace:main"
 mempalace-embed-daemon = "mempalace.embed_daemon:run_daemon"
 
 [project.optional-dependencies]
-lance = [
-    "lancedb>=0.20.0",
-    "fastembed>=0.4.0",
-    "pyarrow>=14.0.0",
-    "tantivy>=0.22.0",
-    "pylance",
+# ChromaDB — legacy compatibility only, NOT a default. Use only if LanceDB is unavailable.
+chromadb = [
+    "chromadb>=0.5.0,<0.7",
 ]
 apple = [
     "mlx>=0.26.0",

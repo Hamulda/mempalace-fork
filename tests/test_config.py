@@ -30,3 +30,44 @@ def test_init():
     cfg = MempalaceConfig(config_dir=tmpdir)
     cfg.init()
     assert os.path.exists(os.path.join(tmpdir, "config.json"))
+
+
+# ── backend ─────────────────────────────────────────────────────────────
+
+
+def test_backend_defaults_to_lance():
+    """Canonical storage is Lance — backend defaults to 'lance', not 'chroma'."""
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.backend == "lance"
+
+
+def test_backend_reads_file_lance(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    (tmp_path / "config.json").write_text(json.dumps({"backend": "lance"}))
+    assert cfg.backend == "lance"
+
+
+def test_backend_reads_file_chroma(tmp_path):
+    """Legacy Chroma backend is still readable when explicitly configured."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    (tmp_path / "config.json").write_text(json.dumps({"backend": "chroma"}))
+    # Re-init to re-read after writing
+    cfg2 = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg2.backend == "chroma"
+
+
+def test_backend_env_overrides_file(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    (tmp_path / "config.json").write_text(json.dumps({"backend": "chroma"}))
+    os.environ["MEMPALACE_BACKEND"] = "lance"
+    try:
+        assert cfg.backend == "lance"
+    finally:
+        del os.environ["MEMPALACE_BACKEND"]
+
+
+def test_backend_unknown_value_defaults_to_lance(tmp_path):
+    """If config has garbage value, treat 'lance' as the safe default."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    (tmp_path / "config.json").write_text(json.dumps({"backend": "garbage"}))
+    assert cfg.backend == "lance"

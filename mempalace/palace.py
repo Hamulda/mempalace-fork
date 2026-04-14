@@ -1,11 +1,14 @@
 """
 palace.py — Shared palace operations.
 
-Consolidates ChromaDB access patterns used by both miners and the MCP server.
+Provides:
+  - SKIP_DIRS: set of directory names to skip during mining
+  - file_already_mined(): check if a file was already mined (backend-agnostic)
+
+Canonical storage: LanceDB primary, ChromaDB legacy compat via backends abstraction.
 """
 
 import os
-import chromadb
 
 SKIP_DIRS = {
     ".git",
@@ -32,22 +35,6 @@ SKIP_DIRS = {
     "htmlcov",
     "target",
 }
-
-
-def get_collection(palace_path: str, collection_name: str = "mempalace_drawers"):
-    """Get or create the palace ChromaDB collection."""
-    os.makedirs(palace_path, exist_ok=True)
-    try:
-        os.chmod(palace_path, 0o700)
-    except (OSError, NotImplementedError):
-        pass
-    client = chromadb.PersistentClient(path=palace_path)
-    # Increase HNSW max_batch_size to avoid "cannot add N records" errors when
-    # mining large projects. Default is 100; bump to 10000 for comfortable headroom.
-    try:
-        return client.get_collection(collection_name)
-    except Exception:
-        return client.create_collection(collection_name, get_or_create=True)
 
 
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:

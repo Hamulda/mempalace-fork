@@ -148,16 +148,33 @@ class MempalaceConfig:
         return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
 
     @property
-    def collection_name(self):
-        """ChromaDB collection name."""
+    def collection_name(self) -> str:
+        """Collection name for both Lance and Chroma backends (same table/schema)."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
 
     @property
     def backend(self) -> str:
-        """Storage backend: 'chroma' (default) or 'lance'."""
-        return os.environ.get("MEMPALACE_BACKEND") or self._file_config.get(
-            "backend", "chroma"
-        )
+        """
+        Storage backend: 'lance' (canonical primary) or 'chroma' (legacy compat).
+
+        Legacy note:
+          config.json historically defaulted to 'chroma' (before Lance existed).
+          New installations should set 'lance' explicitly.
+          If config is missing or set to an unknown value, code that reads
+          this property should treat 'lance' as the canonical default.
+
+        settings.py uses 'db_backend' with values 'chromadb'/'lancedb' —
+        that is a separate Pydantic layer for the server binary.
+        This config.py backend is what the CLI reads for CLI operations
+        (status, mine, search, cleanup, etc.).
+        """
+        env_val = os.environ.get("MEMPALACE_BACKEND")
+        if env_val:
+            return env_val
+        file_val = self._file_config.get("backend", "")
+        if file_val in ("lance", "chroma"):
+            return file_val
+        return "lance"  # canonical default — Lance is primary storage
 
     @property
     def people_map(self):

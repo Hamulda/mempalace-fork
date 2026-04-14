@@ -188,10 +188,34 @@ _fallback_lock = threading.Lock()
 
 
 def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
-    """In-process fallback — loads fastembed directly into this process."""
+    """In-process fallback — loads fastembed into this process.
+
+    Memory guardrail: refuse to load model if memory is already critical.
+    On M1 8GB, fastembed model needs ~500MB RAM — loading at critical pressure
+    would cause system instability.
+    """
     global _fallback_model
     with _fallback_lock:
         if _fallback_model is None:
+            # Memory pressure check before loading model
+            try:
+                from ..memory_guard import MemoryGuard, MemoryPressure
+                guard = MemoryGuard.get()
+                if guard.pressure == MemoryPressure.CRITICAL:
+                    raise MemoryPressureError(
+                        f"Cannot load in-process embedding model: "
+                        f"memory pressure is {guard.used_ratio:.0%}. "
+                        f"Start the embed daemon instead: mempalace embed-daemon start"
+                    )
+                if guard.pressure == MemoryPressure.WARN:
+                    logger.warning(
+                        "Memory pressure is WARN (%.0f%%). "
+                        "Loading in-process embedding model — consider starting the daemon instead.",
+                        guard.used_ratio * 100
+                    )
+            except ImportError:
+                pass  # MemoryGuard not available, proceed cautiously
+
             logger.warning(
                 "Using in-process embedding (no daemon). "
                 "Run: mempalace embed-daemon start"
@@ -1181,10 +1205,25 @@ class LanceCollection(BaseCollection):
                         .to_pandas()
                     )
             elif where:
-                all_results = self._table.to_pandas()
-                results = _apply_where_filter(all_results, where)
+                # Use SQL WHERE for filtering — but also enforce a hard limit
+                # to prevent full-table materialization when no limit is specified.
+                # 5000 is a safe default that fits comfortably in 8GB RAM.
+                effective_limit = min(limit or 5000, 5000)
+                sql_filter = _where_to_sql(where)
+                if sql_filter:
+                    results = (
+                        self._table.search()
+                        .where(sql_filter, prefilter=True)
+                        .limit(effective_limit)
+                        .to_pandas()
+                    )
+                else:
+                    results = self._table.search().limit(effective_limit).to_pandas()
             else:
-                results = self._table.to_pandas()
+                # No filter — enforce hard limit to prevent full-table RAM spike.
+                # 5000 is a safe default that fits comfortably in 8GB RAM.
+                effective_limit = min(limit or 5000, 5000)
+                results = self._table.search().limit(effective_limit).to_pandas()
         except Exception:
             return {"ids": [], "documents": [], "metadatas": []}
 
@@ -1220,16 +1259,26 @@ class LanceCollection(BaseCollection):
 
             self._write_with_retry(do_delete)
         elif where:
-            all_results = self._table.to_pandas()
-            filtered = _apply_where_filter(all_results, where)
-            if not filtered.empty:
-                matching_ids = filtered["id"].tolist()
-
-                def do_delete_where():
+            # Use SQL WHERE for deletion — avoids full table materialization.
+            sql_filter = _where_to_sql(where)
+            if sql_filter:
+                # First check how many rows match to avoid unbounded delete
+                try:
+                    count_match = (
+                        self._table.search()
+                        .where(sql_filter, prefilter=True)
+                        .limit(1000)
+                        .to_pandas()
+                    )
+                    if count_match.empty:
+                        return
+                    matching_ids = count_match["id"].tolist()
                     for mid in matching_ids:
-                        self._table.delete(f"id = '{mid}'")
-
-                self._write_with_retry(do_delete_where)
+                        self._write_with_retry(
+                            lambda i=mid: self._table.delete(f"id = '{i}'")
+                        )
+                except Exception:
+                    pass  # If we can't check, skip delete rather than risk RAM spike
 
     def count(self) -> int:
         try:

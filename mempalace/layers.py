@@ -8,12 +8,12 @@ Load only what you need, when you need it.
     Layer 0: Identity       (~100 tokens)   — Always loaded. "Who am I?"
     Layer 1: Essential Story (~500-800)      — Always loaded. Top moments from the palace.
     Layer 2: On-Demand      (~200-500 each)  — Loaded when a topic/wing comes up.
-    Layer 3: Deep Search    (unlimited)      — Full ChromaDB semantic search.
+    Layer 3: Deep Search    (unlimited)      — Full semantic search via backend abstraction.
 
 Wake-up cost: ~600-900 tokens (L0+L1). Leaves 95%+ of context free.
 
-Reads directly from ChromaDB (mempalace_drawers)
-and ~/.mempalace/identity.txt.
+Uses canonical backend: LanceDB primary, ChromaDB legacy compat.
+Reads from ~/.mempalace/identity.txt.
 """
 
 import os
@@ -21,9 +21,8 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
-import chromadb
-
 from .config import MempalaceConfig
+from .backends import get_backend
 
 
 # ---------------------------------------------------------------------------
@@ -89,18 +88,26 @@ class Layer1:
         self.wing = wing
 
     def generate(self) -> str:
-        """Pull top drawers from ChromaDB and format as compact L1 text."""
+        """Pull top drawers and format as compact L1 text.
+
+        Uses canonical backend — Lance primary, Chroma legacy compat.
+        """
+        cfg = MempalaceConfig()
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            backend = get_backend(cfg.backend)
+            col = backend.get_collection(self.palace_path, cfg.collection_name, create=False)
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
-        # Fetch all drawers in batches to avoid SQLite variable limit (~999)
+        # Fetch drawers in batches — but cap total to prevent RAM spike.
+        # 10,000 docs × ~2KB avg ≈ 20MB RAM, safe for M1 8GB.
+        # Importance is in metadata, so we must load candidates to sort.
+        # This is a bounded, memory-safe approximation of "top 15 by importance".
         _BATCH = 500
+        _MAX_TOTAL = 10_000
         docs, metas = [], []
         offset = 0
-        while True:
+        while len(docs) < _MAX_TOTAL:
             kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
             if self.wing:
                 kwargs["where"] = {"wing": self.wing}
@@ -194,10 +201,14 @@ class Layer2:
         self.palace_path = palace_path or cfg.palace_path
 
     def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
-        """Retrieve drawers filtered by wing and/or room."""
+        """Retrieve drawers filtered by wing and/or room.
+
+        Uses canonical backend — Lance primary, Chroma legacy compat.
+        """
+        cfg = MempalaceConfig()
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            backend = get_backend(cfg.backend)
+            col = backend.get_collection(self.palace_path, cfg.collection_name, create=False)
         except Exception:
             return "No palace found."
 
@@ -258,10 +269,14 @@ class Layer3:
         self.palace_path = palace_path or cfg.palace_path
 
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
-        """Semantic search, returns compact result text."""
+        """Semantic search, returns compact result text.
+
+        Uses canonical backend — Lance primary, Chroma legacy compat.
+        """
+        cfg = MempalaceConfig()
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            backend = get_backend(cfg.backend)
+            col = backend.get_collection(self.palace_path, cfg.collection_name, create=False)
         except Exception:
             return "No palace found."
 
@@ -315,9 +330,10 @@ class Layer3:
         self, query: str, wing: str = None, room: str = None, n_results: int = 5
     ) -> list:
         """Return raw dicts instead of formatted text."""
+        cfg = MempalaceConfig()
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            backend = get_backend(cfg.backend)
+            col = backend.get_collection(self.palace_path, cfg.collection_name, create=False)
         except Exception:
             return []
 
@@ -435,10 +451,11 @@ class MemoryStack:
             },
         }
 
-        # Count drawers
+        # Count drawers — use canonical backend
+        cfg = MempalaceConfig()
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            backend = get_backend(cfg.backend)
+            col = backend.get_collection(self.palace_path, cfg.collection_name, create=False)
             count = col.count()
             result["total_drawers"] = count
         except Exception:

@@ -68,18 +68,34 @@ class ResponseCachingMiddleware(Middleware):
         if tool_name not in self.TOOL_TTL:
             return await call_next(context)
 
-        cache_key = self._make_key(tool_name, context.message if isinstance(context.message, dict) else {})
+        cache_key = self._make_key(
+            tool_name,
+            context.message if isinstance(context.message, dict) else {},
+        )
 
-        async with self._async_lock:
-            if cache_key in self._cache:
-                data, ts = self._cache[cache_key]
-                if time.monotonic() - ts < self.TOOL_TTL.get(tool_name, 30.0):
-                    logger.debug(f"cache hit: {tool_name}")
-                    return data
-            result = await call_next(context)
-            if isinstance(result, dict) and "error" not in result:
-                self._cache[cache_key] = (result, time.monotonic())
-            return result
+        # Fast path — check cache WITHOUT lock (Python dict reads are GIL-safe)
+        if cache_key in self._cache:
+            data, ts = self._cache[cache_key]
+            if time.monotonic() - ts < self.TOOL_TTL.get(tool_name, 30.0):
+                logger.debug(f"cache hit: {tool_name}")
+                return data
+            # expired — del without lock is safe for Python dict
+            try:
+                del self._cache[cache_key]
+            except KeyError:
+                pass
+
+        # Slow path — call backend (NO lock held during I/O)
+        result = await call_next(context)
+
+        # Store result — short critical section only for write
+        if isinstance(result, dict) and "error" not in result:
+            async with self._async_lock:
+                # Double-check: another request may have stored meanwhile
+                if cache_key not in self._cache:
+                    self._cache[cache_key] = (result, time.monotonic())
+
+        return result
 
     def invalidate(self, prefix: str = "") -> None:
         """Thread-safe invalidation for write tools."""
@@ -101,7 +117,8 @@ class CacheInvalidationMiddleware(Middleware):
     Listens for write operations and invalidates the response cache.
 
     Watches for: mempalace_add_drawer, mempalace_remember_code,
-    mempalace_consolidate (merge=True), mempalace_diary_write
+    mempalace_consolidate (merge=True), mempalace_diary_write,
+    mempalace_delete_drawer, mempalace_kg_add, mempalace_kg_invalidate
     """
 
     WRITE_TOOLS = {
@@ -109,6 +126,9 @@ class CacheInvalidationMiddleware(Middleware):
         "mempalace_remember_code",
         "mempalace_consolidate",
         "mempalace_diary_write",
+        "mempalace_delete_drawer",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
     }
 
     def __init__(self, cache: ResponseCachingMiddleware):
@@ -124,14 +144,20 @@ class CacheInvalidationMiddleware(Middleware):
         result = await call_next(context)
 
         if tool_name in self.WRITE_TOOLS:
-            # Invalidate on success
-            if isinstance(result, dict) and result.get("success", False):
+            # Invalidate on success for direct-write tools
+            should_invalidate = False
+            if tool_name in ("mempalace_add_drawer", "mempalace_remember_code",
+                             "mempalace_diary_write", "mempalace_delete_drawer",
+                             "mempalace_kg_add", "mempalace_kg_invalidate"):
+                should_invalidate = isinstance(result, dict) and result.get("success", False)
+            elif tool_name == "mempalace_consolidate":
+                # consolidate invalidates on success OR when merges happened
+                if isinstance(result, dict):
+                    should_invalidate = result.get("success", False) or result.get("merged", 0) > 0
+
+            if should_invalidate:
                 logger.debug(f"write succeeded, invalidating cache: {tool_name}")
                 self._cache.invalidate()
-            # Also invalidate on mempalace_consolidate with merge
-            elif tool_name == "mempalace_consolidate" and isinstance(result, dict):
-                if result.get("merged", 0) > 0:
-                    self._cache.invalidate()
 
         return result
 
@@ -263,6 +289,9 @@ class SessionTrackingMiddleware(Middleware):
 # SINGLETON INSTANCES
 # ═══════════════════════════════════════════════════════════════════
 
+# NOTE: These singletons are legacy — create_server() creates fresh instances
+# via build_middleware_stack(). Kept for backward compatibility (get_*_middleware() getters).
+# TODO: deprecate in a future sprint
 _caching_middleware = ResponseCachingMiddleware()
 _cache_invalidation_middleware = CacheInvalidationMiddleware(_caching_middleware)
 _embed_circuit_middleware = EmbedCircuitBreakerMiddleware(
@@ -287,6 +316,8 @@ def build_middleware_stack(settings) -> list:
         ),
     )
     invalidation = CacheInvalidationMiddleware(caching)
+    # NOTE: EmbedCircuitBreakerMiddleware is ready but deactivated.
+    # Activation requires should_try_socket() to be wired into backends/lance.py F184.
     embed_cb = EmbedCircuitBreakerMiddleware(
         failure_threshold=settings.cb_failure_threshold,
         recovery_timeout=settings.cb_recovery_timeout,
@@ -296,7 +327,7 @@ def build_middleware_stack(settings) -> list:
         SessionTrackingMiddleware(),
         caching,
         invalidation,
-        embed_cb,
+        # embed_cb,  # TODO F184: EmbedCB napojení do backends/lance.py
     ]
 
 

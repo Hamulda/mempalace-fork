@@ -193,16 +193,111 @@ def cmd_split(args):
 
 
 def cmd_status(args):
-    from .miner import status
+    """Show full MemPalace status including memory pressure.
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    status(palace_path=palace_path)
+    Respects canonical backend configuration:
+    - LanceDB is the canonical storage backend
+    - ChromaDB is legacy compatibility only
+    - Default backend is Lance (unless explicitly overridden to chroma in config)
+    """
+    from .memory_guard import MemoryGuard, MemoryPressure
+    from .config import MempalaceConfig
+    from .backends import get_backend
+    import psutil
+
+    config = MempalaceConfig()
+    palace_path = os.path.expanduser(args.palace) if args.palace else config.palace_path
+
+    # ── Memory ───────────────────────────────────────────────────────────
+    vm = psutil.virtual_memory()
+    total_gib = vm.total / (1024**3)
+
+    pressure = MemoryPressure.NOMINAL
+    if hasattr(MemoryGuard, '_instance') and MemoryGuard._instance:
+        guard = MemoryGuard.get()
+        pressure = guard.pressure
+        used_ratio = guard.used_ratio
+    else:
+        used_ratio = vm.percent / 100.0
+
+    used_gib = used_ratio * total_gib
+    used_pct = used_ratio * 100
+
+    pressure_icon = {"nominal": "✅", "warn": "⚠️", "critical": "🚨"}
+    icon = pressure_icon.get(pressure.value, "?")
+
+    print("🏰 MemPalace Status")
+    print()
+    print(f"Memory: {used_pct:.0f}% used ({used_gib:.1f}GB / {total_gib:.0f}GB) {icon} {pressure.value.upper()}")
+
+    # psutil uses 'swapped' (bytes) not 'swap' — fix wrong attribute/missing units
+    swap_bytes = getattr(vm, 'swapped', 0)
+    swap_mb = swap_bytes / (1024**2)
+    print(f"Swap: {swap_mb:.1f} MB")
+
+    # ── Embedding Daemon ────────────────────────────────────────────────
+    from .embed_daemon import get_socket_path
+    import socket as _socket, json
+    sock_path = get_socket_path()
+    _daemon_running = False
+    if os.path.exists(sock_path):
+        try:
+            s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(sock_path)
+            payload = json.dumps({"texts": []}).encode("utf-8")
+            s.sendall(len(payload).to_bytes(4, "big") + payload)
+            resp = b""
+            while len(resp) < 4:
+                chunk = s.recv(4 - len(resp))
+                if not chunk:
+                    break
+                resp += chunk
+            _daemon_running = len(resp) == 4
+            s.close()
+        except Exception:
+            pass
+    if _daemon_running:
+        pid_path = sock_path.replace(".sock", ".pid")
+        try:
+            pid = int(Path(pid_path).read_text())
+            print(f"Embedding daemon: ✅ running (PID {pid})")
+        except Exception:
+            print("Embedding daemon: ✅ running")
+    else:
+        print("Embedding daemon: ❌ not running")
+
+    # ── Palace ──────────────────────────────────────────────────────────
+    # Canonical backend: Lance is primary storage, Chroma is legacy compat.
+    # Read from config unless --palace is explicitly passed.
+    backend_type = config.backend  # from config.json / env
+    if backend_type not in ("lance", "chroma"):
+        backend_type = "lance"  # canonical default if config is weird
+
+    if os.path.isdir(palace_path):
+        try:
+            backend = get_backend(backend_type)
+            col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
+            count = col.count()
+            backend_label = "lance" if backend_type == "lance" else "chroma"
+            print(f"Backend: {backend_label}")
+            print(f"Memories: {count:,}")
+            print(f"Last optimize: check logs")
+        except FileNotFoundError:
+            print(f"Palace not initialized at {palace_path}")
+        except Exception as e:
+            print(f"Backend: {backend_type} (error reading: {e})")
+    else:
+        print(f"Palace: not initialized at {palace_path}")
 
 
 def cmd_repair(args):
-    """Rebuild palace vector index from SQLite metadata."""
-    import chromadb
+    """Rebuild palace vector index from stored data.
+
+    Uses LanceDB (canonical backend). ChromaDB palaces must be migrated first.
+    """
     import shutil
+    from .backends import get_backend
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
@@ -210,17 +305,33 @@ def cmd_repair(args):
         print(f"\n  No palace found at {palace_path}")
         return
 
+    cfg = MempalaceConfig()
+    backend_type = cfg.backend
+    if backend_type not in ("lance", "chroma"):
+        backend_type = "lance"
+
+    # ChromaDB palaces must migrate first — repair is Lance-only canonical
+    if backend_type == "chroma":
+        print(f"\n  ⚠️  Palace at {palace_path} uses ChromaDB (legacy).")
+        print("  Run 'mempalace migrate chroma-to-lance' first, then retry.")
+        print("  ChromaDB repair is not supported — migration is the only path.")
+        return
+
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair")
+    print("  MemPalace Repair (LanceDB)")
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
+    print(f"  Backend: lance")
 
-    # Try to read existing drawers
+    # Try to read existing drawers via Lance backend
     try:
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
+        backend = get_backend("lance")
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
         total = col.count()
         print(f"  Drawers found: {total}")
+    except FileNotFoundError:
+        print(f"  Palace not found at {palace_path} — may need to be re-mined.")
+        return
     except Exception as e:
         print(f"  Error reading palace: {e}")
         print("  Cannot recover — palace may need to be re-mined from source files.")
@@ -230,22 +341,27 @@ def cmd_repair(args):
         print("  Nothing to repair.")
         return
 
-    # Extract all drawers in batches
+    # Extract all drawers in batches via Lance backend
     print("\n  Extracting drawers...")
     batch_size = 5000
     all_ids = []
     all_docs = []
     all_metas = []
     offset = 0
-    while offset < total:
+    while True:
         batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
-        all_ids.extend(batch["ids"])
-        all_docs.extend(batch["documents"])
-        all_metas.extend(batch["metadatas"])
-        offset += batch_size
+        batch_ids = batch.get("ids", [])
+        if not batch_ids:
+            break
+        all_ids.extend(batch_ids)
+        all_docs.extend(batch.get("documents", []) or [])
+        all_metas.extend(batch.get("metadatas", []) or [])
+        offset += len(batch_ids)
+        if len(batch_ids) < batch_size:
+            break
     print(f"  Extracted {len(all_ids)} drawers")
 
-    # Backup and rebuild
+    # Backup and rebuild via Lance backend
     palace_path = palace_path.rstrip(os.sep)
     backup_path = palace_path + ".backup"
     if os.path.exists(backup_path):
@@ -254,8 +370,7 @@ def cmd_repair(args):
     shutil.copytree(palace_path, backup_path)
 
     print("  Rebuilding collection...")
-    client.delete_collection("mempalace_drawers")
-    new_col = client.create_collection("mempalace_drawers")
+    new_col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
 
     filed = 0
     for i in range(0, len(all_ids), batch_size):
@@ -265,6 +380,12 @@ def cmd_repair(args):
         new_col.add(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
         filed += len(batch_ids)
         print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
+
+    # Force FTS rebuild after repair
+    try:
+        new_col.rebuild_fts_index()
+    except Exception:
+        pass
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
     print(f"  Backup saved at {backup_path}")
@@ -385,85 +506,6 @@ def _run_embed_benchmark():
     print(f"CPU usage during inference: {cpu_usage:.0f}%")
 
 
-def cmd_status(args):
-    """Show full MemPalace status including memory pressure."""
-    from .memory_guard import MemoryGuard, MemoryPressure
-    from .config import MempalaceConfig
-    import psutil
-
-    config = MempalaceConfig()
-    palace_path = os.path.expanduser(args.palace) if args.palace else config.palace_path
-
-    # Memory
-    vm = psutil.virtual_memory()
-    used_gib = vm.used / (1024**3)
-    total_gib = vm.total / (1024**3)
-    used_pct = vm.percent
-
-    pressure = MemoryPressure.NOMINAL
-    if hasattr(MemoryGuard, '_instance') and MemoryGuard._instance:
-        guard = MemoryGuard.get()
-        pressure = guard.pressure
-        used_pct = guard.used_ratio * 100
-        used_gib = guard.used_ratio * total_gib
-
-    pressure_icon = {"nominal": "✅", "warn": "⚠️", "critical": "🚨"}
-    icon = pressure_icon.get(pressure.value, "?")
-
-    print("🏰 MemPalace Status")
-    print()
-    print(f"Memory: {used_pct:.0f}% used ({used_gib:.1f}GB / {total_gib:.0f}GB) {icon} {pressure.value.upper()}")
-    swap_mb = getattr(vm, 'swapped', 0) / (1024**3)
-    print(f"Swap: {swap_mb:.1f} MB")
-
-    # Daemon
-    from .embed_daemon import get_socket_path
-    import socket, json
-    sock_path = get_socket_path()
-    _daemon_running = False
-    if os.path.exists(sock_path):
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(1.0)
-            s.connect(sock_path)
-            payload = json.dumps({"texts": []}).encode("utf-8")
-            s.sendall(len(payload).to_bytes(4, "big") + payload)
-            resp = b""
-            while len(resp) < 4:
-                chunk = s.recv(4 - len(resp))
-                if not chunk:
-                    break
-                resp += chunk
-            _daemon_running = len(resp) == 4
-            s.close()
-        except Exception:
-            pass
-    if _daemon_running:
-        pid_path = sock_path.replace(".sock", ".pid")
-        try:
-            pid = int(Path(pid_path).read_text())
-            print(f"Embedding daemon: ✅ running (PID {pid})")
-        except Exception:
-            print("Embedding daemon: ✅ running")
-    else:
-        print("Embedding daemon: ❌ not running")
-
-    # Palace
-    if os.path.isdir(palace_path):
-        try:
-            from .backends import get_backend
-            backend = get_backend("lance")
-            col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
-            count = col.count()
-            print(f"Backend: lance")
-            print(f"Memories: {count:,}")
-            print(f"Last optimize: check logs")
-        except Exception as e:
-            print(f"Backend: lance (error reading: {e})")
-    else:
-        print(f"Palace: not initialized at {palace_path}")
-
-
 def cmd_serve(args):
     """Run MemPalace MCP server over HTTP."""
     os.environ["MEMPALACE_TRANSPORT"] = "http"
@@ -502,27 +544,53 @@ def cmd_cleanup(args):
     cutoff = (datetime.utcnow() - timedelta(days=args.days)).isoformat() + "Z"
     kg_cutoff = (datetime.utcnow() - timedelta(days=args.kg_days)).isoformat()
 
-    print(f"Cleanup cutoff: {cutoff} (ChromaDB), {kg_cutoff} (KG)")
+    print(f"Cleanup cutoff: {cutoff} (drawers), {kg_cutoff} (KG)")
 
-    # ChromaDB cleanup — POUZE is_latest=False nebo is_latest chybí AND staré
+    # Memory-safe cleanup — process in batches of 5000 to prevent RAM spike.
+    # Only deletes old (timestamp < cutoff) AND is_latest=False drawers.
     try:
         backend = get_backend(cfg.backend)
         col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
-        all_data = col.get(include=["metadatas"], limit=100000)
-        to_delete = []
-        for i, meta in enumerate(all_data["metadatas"]):
-            ts = meta.get("timestamp", "")
-            is_latest = meta.get("is_latest", True)  # default True pro staré záznamy bez pole
-            if ts and ts < cutoff and not is_latest:
-                to_delete.append(all_data["ids"][i])
+        deleted = 0
+        BATCH = 5000
+        offset = 0
+        while True:
+            # Memory pressure check before each batch
+            try:
+                from .memory_guard import MemoryGuard, MemoryPressure
+                guard = MemoryGuard.get()
+                if guard.pressure == MemoryPressure.CRITICAL:
+                    sys.stderr.write(f"Cleanup paused: memory pressure CRITICAL\n")
+                    break
+            except Exception:
+                pass
 
-        print(f"ChromaDB: {len(to_delete)} drawers eligible for deletion")
-        if not args.dry_run and to_delete:
-            col.delete(ids=to_delete)
-            print(f"  Deleted {len(to_delete)} drawers")
+            batch_data = col.get(include=["metadatas"], limit=BATCH, offset=offset)
+            batch_ids = batch_data.get("ids", [])
+            if not batch_ids:
+                break
+
+            metas = batch_data.get("metadatas", [])
+            to_delete_batch = []
+            for i, meta in enumerate(metas):
+                ts = meta.get("timestamp", "")
+                is_latest = meta.get("is_latest", True)
+                if ts and ts < cutoff and not is_latest:
+                    to_delete_batch.append(batch_ids[i])
+
+            if to_delete_batch:
+                if not args.dry_run:
+                    col.delete(ids=to_delete_batch)
+                deleted += len(to_delete_batch)
+
+            if len(batch_ids) < BATCH:
+                break
+            offset += BATCH
+
+        print(f"Cleanup: {deleted} drawers eligible for deletion")
     except Exception as e:
         import sys
-        sys.stderr.write(f"ChromaDB cleanup error: {e}\n")
+        sys.stderr.write(f"Cleanup error: {e}\n")
 
     # KG cleanup — POUZE expired triples (valid_to IS NOT NULL) a staré
     try:
@@ -707,9 +775,12 @@ def cmd_mcp(args):
 
 
 def cmd_compress(args):
-    """Compress drawers in a wing using AAAK Dialect."""
-    import chromadb
+    """Compress drawers in a wing using AAAK Dialect.
+
+    Uses the configured backend (LanceDB canonical, ChromaDB legacy).
+    """
     from .dialect import Dialect
+    from .backends import get_backend
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
@@ -727,14 +798,23 @@ def cmd_compress(args):
     else:
         dialect = Dialect()
 
-    # Connect to palace
+    # Connect via backend abstraction (Lance canonical, Chroma legacy)
+    cfg = MempalaceConfig()
+    backend_type = cfg.backend
+    if backend_type not in ("lance", "chroma"):
+        backend_type = "lance"  # canonical default
+
     try:
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
+        backend = get_backend(backend_type)
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
+        count = col.count()
     except Exception:
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         sys.exit(1)
+
+    backend_label = "lance" if backend_type == "lance" else "chroma"
+    print(f"  Using backend: {backend_label}")
 
     # Query drawers in batches to avoid SQLite variable limit (~999)
     where = {"wing": args.wing} if args.wing else None
@@ -783,7 +863,7 @@ def cmd_compress(args):
         stats = dialect.compression_stats(doc, compressed)
 
         total_original += stats["original_chars"]
-        total_compressed += stats["compressed_chars"]
+        total_compressed += stats["summary_chars"]
 
         compressed_entries.append((doc_id, compressed, meta, stats))
 
@@ -792,20 +872,18 @@ def cmd_compress(args):
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "?")).name
             print(f"  [{wing_name}/{room_name}] {source}")
-            print(
-                f"    {stats['original_tokens']}t -> {stats['compressed_tokens']}t ({stats['ratio']:.1f}x)"
-            )
+            print(f"    {stats['original_tokens_est']}t -> {stats['summary_tokens_est']}t ({stats['size_ratio']:.1f}x)")
             print(f"    {compressed}")
             print()
 
-    # Store compressed versions (unless dry-run)
+    # Store compressed versions (unless dry-run) — uses same backend
     if not args.dry_run:
         try:
-            comp_col = client.get_or_create_collection("mempalace_compressed")
+            comp_col = backend.get_collection(palace_path, "mempalace_compressed", create=True)
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
-                comp_meta["compression_ratio"] = round(stats["ratio"], 1)
-                comp_meta["original_tokens"] = stats["original_tokens"]
+                comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
+                comp_meta["original_tokens"] = stats["original_tokens_est"]
                 comp_col.upsert(
                     ids=[doc_id],
                     documents=[compressed],
