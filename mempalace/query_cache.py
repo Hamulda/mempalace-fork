@@ -130,6 +130,13 @@ class QueryCache:
         except Exception:
             pass
 
+    def clear(self) -> None:
+        """Remove all cached entries."""
+        try:
+            self._cache.clear()
+        except Exception:
+            pass
+
     def stats(self) -> dict:
         with self._lock:
             total = self._hits + self._misses

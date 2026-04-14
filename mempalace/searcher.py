@@ -404,6 +404,33 @@ def _bm25_search(query: str, col, n_results: int = 10, wing: str = None, room: s
         return []
 
 
+def invalidate_bm25_cache() -> None:
+    """Call after any write operation to force BM25 index rebuild on next query."""
+    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
+    with _bm25_lock:
+        _bm25_index = None
+        _bm25_corpus = None
+        _bm25_ids = None
+        _bm25_metas = None
+    logger.debug("BM25 cache invalidated")
+
+
+def invalidate_query_cache() -> None:
+    """Clear all cached search results — call after any write."""
+    try:
+        cache = _get_query_cache()
+        cache.clear()
+    except Exception:
+        pass
+    logger.debug("Query cache cleared")
+
+
+def invalidate_all_caches() -> None:
+    """Convenience: invalidate both BM25 and query cache after writes."""
+    invalidate_bm25_cache()
+    invalidate_query_cache()
+
+
 def _rrf_merge(result_lists: list, k: int = 60) -> list:
     """Reciprocal Rank Fusion — combines results from multiple retrieval systems."""
     scores = {}

@@ -31,7 +31,7 @@ from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .middleware import build_middleware_stack
 from .settings import settings, MemPalaceSettings
 from .version import __version__
-from .searcher import search_memories, search_memories_async, hybrid_search_async
+from .searcher import search_memories, search_memories_async, hybrid_search_async, invalidate_all_caches
 from .palace_graph import traverse, find_tunnels, graph_stats
 from .knowledge_graph import KnowledgeGraph
 from .backends import get_backend
@@ -671,6 +671,21 @@ def _register_tools(server, backend, config, settings):
                 ],
             )
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+            invalidate_all_caches()
+
+            # KROK 4: Background BM25 warmup after write
+            def _rebuild_bm25_bg():
+                try:
+                    from .backends import get_backend
+                    backend2 = get_backend(settings.db_backend)
+                    col2 = backend2.get_collection(settings.db_path, settings.collection_name, create=False)
+                    # _get_bm25 is imported via searcher module
+                    from .searcher import _get_bm25
+                    _get_bm25(col2)
+                except Exception:
+                    pass
+            threading.Thread(target=_rebuild_bm25_bg, daemon=True, name="bm25_rebuild").start()
+
             return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -700,6 +715,7 @@ def _register_tools(server, backend, config, settings):
 
         try:
             col.delete(ids=[drawer_id])
+            invalidate_all_caches()
             logger.info(f"Deleted drawer: {drawer_id}")
             return {"success": True, "drawer_id": drawer_id}
         except Exception as e:
@@ -764,6 +780,7 @@ def _register_tools(server, backend, config, settings):
                 ],
             )
             logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
+            invalidate_all_caches()
             return {
                 "success": True,
                 "entry_id": entry_id,
@@ -932,6 +949,7 @@ def _register_tools(server, backend, config, settings):
                 }],
             )
             logger.info(f"Remembered code: {drawer_id} → {wing}/{room}")
+            invalidate_all_caches()
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -1017,6 +1035,7 @@ def _register_tools(server, backend, config, settings):
                         pass
 
                 logger.info(f"Consolidated {merged_count} duplicate memories for topic: {topic}")
+                invalidate_all_caches()
 
             return {
                 "topic": topic,

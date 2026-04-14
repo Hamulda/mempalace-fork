@@ -342,6 +342,97 @@ class TestSearcherBugfixes:
         cache.set_value("key1", {"result": "value"})
         assert cache.get_value("key1") == {"result": "value"}
 
+    def test_query_cache_clear_method(self):
+        """QueryCache.clear() removes all entries."""
+        from mempalace.query_cache import QueryCache
+        cache = QueryCache(maxsize=10, ttl_seconds=60)
+        cache.set_value("key1", {"a": 1})
+        cache.set_value("key2", {"b": 2})
+        assert cache.get_value("key1") is not None
+        cache.clear()
+        assert cache.get_value("key1") is None
+        assert cache.get_value("key2") is None
+
+    def test_invalidate_bm25_cache(self):
+        """invalidate_bm25_cache sets all BM25 globals to None."""
+        from mempalace.searcher import invalidate_bm25_cache, _bm25_index
+        import mempalace.searcher as searcher_module
+        # Set some globals first
+        searcher_module._bm25_index = "dummy"
+        searcher_module._bm25_corpus = ["doc"]
+        searcher_module._bm25_ids = ["id1"]
+        searcher_module._bm25_metas = [{"w": "meta"}]
+        invalidate_bm25_cache()
+        assert searcher_module._bm25_index is None
+        assert searcher_module._bm25_corpus is None
+        assert searcher_module._bm25_ids is None
+        assert searcher_module._bm25_metas is None
+
+    def test_invalidate_query_cache(self):
+        """invalidate_query_cache clears the query cache."""
+        from mempalace.searcher import invalidate_query_cache
+        from mempalace.searcher import _get_query_cache
+        cache = _get_query_cache()
+        cache.set_value("testkey", {"result": "value"})
+        assert cache.get_value("testkey") is not None
+        invalidate_query_cache()
+        assert cache.get_value("testkey") is None
+
+    def test_invalidate_all_caches_both(self):
+        """invalidate_all_caches clears both BM25 and query cache."""
+        from mempalace.searcher import invalidate_all_caches, _get_query_cache
+        import mempalace.searcher as searcher_module
+        # Set BM25 globals
+        searcher_module._bm25_index = "bm25dummy"
+        # Set query cache entry
+        cache = _get_query_cache()
+        cache.set_value("alltest", {"v": 1})
+        invalidate_all_caches()
+        assert searcher_module._bm25_index is None
+        assert cache.get_value("alltest") is None
+
+
+class TestCacheInvalidationAfterWrite:
+    """F176d: cache invalidation after write operations."""
+
+    async def test_bm25_invalidated_after_add_drawer(self, palace_path, collection):
+        """add_drawer invalidates BM25 cache (sets _bm25_index to None)."""
+        import mempalace.fastmcp_server as fm
+        import mempalace.searcher as searcher_module
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        # Set a dummy BM25 index
+        searcher_module._bm25_index = "dummy"
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_add_drawer",
+                {"wing": "test", "room": "room", "content": "new content here", "added_by": "test"},
+            )
+            data = _get_result_data(result)
+            assert data.get("success"), f"add_drawer failed: {data}"
+        # After add_drawer, BM25 cache should be invalidated
+        assert searcher_module._bm25_index is None, "BM25 cache should be invalidated after add_drawer"
+        del server
+
+    async def test_query_cache_cleared_after_add_drawer(self, palace_path, collection):
+        """add_drawer clears the query cache."""
+        from mempalace.searcher import _get_query_cache
+        import mempalace.searcher as searcher_module
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        cache = _get_query_cache()
+        cache.set_value("pretest", {"v": 1})
+        assert cache.get_value("pretest") is not None
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_add_drawer",
+                {"wing": "test", "room": "room", "content": "more content", "added_by": "test"},
+            )
+            data = _get_result_data(result)
+            assert data.get("success"), f"add_drawer failed: {data}"
+        assert cache.get_value("pretest") is None, "Query cache should be cleared after add_drawer"
+        del server
+
 
 def _get_result_data(result):
     """Extract JSON data from FastMCP CallToolResult."""
