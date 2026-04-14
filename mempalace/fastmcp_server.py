@@ -211,6 +211,14 @@ def _register_tools(server, backend, config, settings):
         _status_cache["data"] = None
         _status_cache["ts"] = 0.0
 
+    # MemoryGuard singleton — blocks writes when memory pressure is critical
+    _memory_guard = None
+    try:
+        from .memory_guard import MemoryGuard
+        _memory_guard = MemoryGuard.get()
+    except (ImportError, Exception) as e:
+        logger.debug("memory_guard unavailable: %s", e)
+
     # ── READ TOOLS ────────────────────────────────────────────────
 
     @server.tool(timeout=settings.timeout_read)
@@ -239,6 +247,16 @@ def _register_tools(server, backend, config, settings):
             pass
 
         ctx.debug(f"status returning {count} drawers")
+        guard_stats = {}
+        if _memory_guard is not None:
+            try:
+                guard_stats = {
+                    "pressure": _memory_guard.pressure.value,
+                    "used_ratio": round(_memory_guard.used_ratio, 3),
+                    "should_pause_writes": _memory_guard.should_pause_writes(),
+                }
+            except Exception:
+                pass
         result = {
             "total_drawers": count,
             "wings": wings,
@@ -246,6 +264,7 @@ def _register_tools(server, backend, config, settings):
             "palace_path": settings.db_path,
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
+            "memory_guard": guard_stats if guard_stats else "inactive",
         }
         _status_cache["data"] = result
         _status_cache["ts"] = now
@@ -646,6 +665,17 @@ def _register_tools(server, backend, config, settings):
                 return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
         except Exception:
             pass
+
+        # PART 3b: MemoryGuard — block writes when memory pressure is critical
+        if _memory_guard is not None:
+            try:
+                if _memory_guard.should_pause_writes():
+                    reason = f"memory pressure: {_memory_guard.pressure.value} ({_memory_guard.used_ratio:.0%} used)"
+                    logger.warning("memory_guard blocked add_drawer: %s", reason)
+                    return {"error": f"Write blocked: {reason}", "blocked_by": "memory_guard", "pressure": _memory_guard.pressure.value}
+            except Exception as e:
+                logger.debug("memory_guard check failed, allowing: %s", e)
+                # Fail open
 
         # PART 4: Auto entity extraction from content (max 20 most frequent)
         entities = []

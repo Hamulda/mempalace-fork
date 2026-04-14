@@ -6,6 +6,7 @@ import inspect
 import pytest
 import pytest_asyncio
 from fastmcp import Client
+from unittest.mock import MagicMock, patch
 
 from mempalace.fastmcp_server import create_server
 from mempalace.settings import MemPalaceSettings
@@ -571,6 +572,79 @@ class TestSearchMemoriesResultsHaveId:
                 assert len(hits) == 1
                 assert "id" in hits[0], f"Hit should have 'id' key, got: {hits[0].keys()}"
                 assert hits[0]["id"] == "doc_id_abc123"
+
+
+class TestMemoryGuardIntegration:
+    def test_memory_guard_import(self):
+        """MemoryGuard can be imported from memory_guard module."""
+        from mempalace.memory_guard import MemoryGuard, MemoryPressure
+        assert MemoryGuard is not None
+        assert MemoryPressure is not None
+
+    async def test_add_drawer_guard_blocks(self, palace_path, collection):
+        """When guard.should_pause_writes=True, add_drawer returns blocked error."""
+        from mempalace.memory_guard import MemoryGuard
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        mock_guard = MagicMock()
+        mock_guard.should_pause_writes.return_value = True
+        mock_guard.pressure.value = "critical"
+        mock_guard.used_ratio = 0.9
+        with patch.object(MemoryGuard, "get", return_value=mock_guard):
+            server = create_server(settings=settings)
+            async with Client(transport=server) as client:
+                result = await client.call_tool(
+                    "mempalace_add_drawer",
+                    {"wing": "test", "room": "room", "content": "test content", "added_by": "test"},
+                )
+                data = _get_result_data(result)
+                assert "error" in data, f"Expected error, got: {data}"
+                assert data.get("blocked_by") == "memory_guard", f"blocked_by should be memory_guard: {data}"
+                assert "Write blocked" in data.get("error", "")
+            del server
+
+    async def test_add_drawer_guard_allows(self, palace_path, collection):
+        """When guard.should_pause_writes=False, add_drawer proceeds normally."""
+        from mempalace.memory_guard import MemoryGuard
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        mock_guard = MagicMock()
+        mock_guard.should_pause_writes.return_value = False
+        with patch.object(MemoryGuard, "get", return_value=mock_guard):
+            server = create_server(settings=settings)
+            async with Client(transport=server) as client:
+                result = await client.call_tool(
+                    "mempalace_add_drawer",
+                    {"wing": "test", "room": "room", "content": "test content guard allows", "added_by": "test"},
+                )
+                data = _get_result_data(result)
+                assert data.get("success") is True, f"Expected success, got: {data}"
+            del server
+
+    async def test_add_drawer_guard_fail_open(self, palace_path, collection):
+        """When guard.should_pause_writes raises, add_drawer proceeds (fail open)."""
+        from mempalace.memory_guard import MemoryGuard
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        mock_guard = MagicMock()
+        mock_guard.should_pause_writes.side_effect = RuntimeError("guard error")
+        with patch.object(MemoryGuard, "get", return_value=mock_guard):
+            server = create_server(settings=settings)
+            async with Client(transport=server) as client:
+                result = await client.call_tool(
+                    "mempalace_add_drawer",
+                    {"wing": "test", "room": "room", "content": "test content fail open", "added_by": "test"},
+                )
+                data = _get_result_data(result)
+                assert data.get("success") is True, f"Expected success (fail open), got: {data}"
+            del server
+
+    async def test_status_includes_guard(self, palace_path, collection):
+        """mempalace_status response includes memory_guard key."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result = await client.call_tool("mempalace_status", {})
+            data = _get_result_data(result)
+            assert "memory_guard" in data, f"status should include memory_guard key, got: {data}"
+        del server
 
 
 def _get_result_data(result):
