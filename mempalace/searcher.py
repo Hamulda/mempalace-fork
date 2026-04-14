@@ -7,6 +7,7 @@ Returns verbatim text — the actual words, never summaries.
 """
 
 import functools
+import hashlib
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -236,11 +237,13 @@ def search_memories(
     docs = results["documents"][0]
     metas = results["metadatas"][0]
     dists = results["distances"][0]
+    ids = results["ids"][0]
 
     hits = []
-    for doc, meta, dist in zip(docs, metas, dists):
+    for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists)):
         hits.append(
             {
+                "id": ids[i],
                 "text": doc,
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -328,6 +331,39 @@ _bm25_ids = None
 _bm25_metas = None
 _bm25_lock = threading.Lock()
 
+# KG singleton — reused across hybrid_search calls, thread-safe
+_kg_instance = None
+_kg_path_cached: str | None = None
+_kg_lock = threading.Lock()
+
+
+def _get_kg(palace_path: str):
+    """Return cached KnowledgeGraph instance. Thread-safe, reuses connection."""
+    global _kg_instance, _kg_path_cached
+    from pathlib import Path
+    kg_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
+
+    if _kg_instance is not None and _kg_path_cached == kg_path:
+        return _kg_instance
+
+    with _kg_lock:
+        if _kg_instance is not None and _kg_path_cached == kg_path:
+            return _kg_instance
+        try:
+            from .knowledge_graph import KnowledgeGraph
+            if _kg_instance is not None:
+                try:
+                    _kg_instance.close()
+                except Exception:
+                    pass
+            _kg_instance = KnowledgeGraph(db_path=kg_path)
+            _kg_path_cached = kg_path
+            logger.debug("KG singleton created for %s", kg_path)
+        except Exception as e:
+            logger.warning("KG singleton init failed: %s", e)
+            return None
+    return _kg_instance
+
 
 def _get_bm25(col):
     """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids, metas) or (None, None, None, None)."""
@@ -390,6 +426,7 @@ def _bm25_search(query: str, col, n_results: int = 10, wing: str = None, room: s
             if room and meta.get("room") != room:
                 continue
             hits.append({
+                "id": ids[idx],
                 "text": docs[idx],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -436,13 +473,13 @@ def _rrf_merge(result_lists: list, k: int = 60) -> list:
     scores = {}
     for result_list in result_lists:
         for rank, hit in enumerate(result_list):
-            key = hit["text"][:80]
+            key = hit.get("id") or hashlib.md5(hit["text"].encode(), usedforsecurity=False).hexdigest()[:16]
             scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
 
     seen = {}
     for hit_list in result_lists:
         for hit in hit_list:
-            key = hit["text"][:80]
+            key = hit.get("id") or hashlib.md5(hit["text"].encode(), usedforsecurity=False).hexdigest()[:16]
             if key not in seen:
                 seen[key] = hit
                 seen[key]["rrf_score"] = round(scores.get(key, 0), 6)
@@ -460,6 +497,7 @@ def hybrid_search(
     use_kg: bool = True,
     rerank: bool = False,
     agent_id: str = None,
+    is_latest: bool | None = None,
 ) -> dict:
     from datetime import date
     from .config import MempalaceConfig
@@ -467,7 +505,7 @@ def hybrid_search(
     # Vrstva 1: ChromaDB semantic search
     chroma = search_memories(
         query=query, palace_path=palace_path, wing=wing, room=room,
-        n_results=n_results, is_latest=True, agent_id=agent_id, rerank=rerank
+        n_results=n_results, is_latest=is_latest, agent_id=agent_id, rerank=rerank
     )
     hits = chroma.get("results", [])
 
@@ -484,30 +522,29 @@ def hybrid_search(
     # Vrstva 2: KG entity search
     kg_hits = []
     if use_kg:
-        try:
-            from .knowledge_graph import KnowledgeGraph
-            from pathlib import Path
-            kg_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
-            kg = KnowledgeGraph(db_path=kg_path)
-            today = date.today().isoformat()
-            tokens = [t.lower() for t in query.split() if len(t) > 3]
-            seen = set()
-            for token in tokens[:5]:
-                for triple in kg.query_entity(token, as_of=today)[:3]:
-                    key = f"{triple['subject']}_{triple['predicate']}_{triple['object']}"
-                    if key not in seen:
-                        seen.add(key)
-                        kg_hits.append({
-                            "text": f"{triple['subject']} {triple['predicate']} {triple['object']}",
-                            "wing": "knowledge_graph",
-                            "room": triple["predicate"],
-                            "source_file": "knowledge_graph.sqlite3",
-                            "similarity": triple.get("confidence", 0.8),
-                            "source": "kg",
-                        })
-            kg.close()
-        except Exception as e:
-            logger.warning("KG layer failed in hybrid_search, ChromaDB only: %s", e)
+        kg = _get_kg(palace_path)
+        if kg is None:
+            logger.warning("KG unavailable, skipping KG layer in hybrid_search")
+        else:
+            try:
+                today = date.today().isoformat()
+                tokens = [t.lower() for t in query.split() if len(t) > 3]
+                seen = set()
+                for token in tokens[:5]:
+                    for triple in kg.query_entity(token, as_of=today)[:3]:
+                        key = f"{triple['subject']}_{triple['predicate']}_{triple['object']}"
+                        if key not in seen:
+                            seen.add(key)
+                            kg_hits.append({
+                                "text": f"{triple['subject']} {triple['predicate']} {triple['object']}",
+                                "wing": "knowledge_graph",
+                                "room": triple["predicate"],
+                                "source_file": "knowledge_graph.sqlite3",
+                                "similarity": triple.get("confidence", 0.8),
+                                "source": "kg",
+                            })
+            except Exception as e:
+                logger.warning("KG layer failed in hybrid_search, ChromaDB only: %s", e)
 
     # Reciprocal Rank Fusion — kombinuje vysledky ze vsech tri vrstev
     merged = _rrf_merge([hits, bm25_hits, kg_hits])[:n_results]
@@ -522,7 +559,8 @@ def hybrid_search(
 
 async def hybrid_search_async(
     query: str, palace_path: str, wing: str = None, room: str = None,
-    n_results: int = 10, use_kg: bool = True, rerank: bool = False, agent_id: str = None,
+    n_results: int = 10, use_kg: bool = True, rerank: bool = False,
+    agent_id: str = None, is_latest: bool | None = None,
 ) -> dict:
     import asyncio, functools
     loop = asyncio.get_event_loop()
@@ -530,5 +568,5 @@ async def hybrid_search_async(
         _search_executor,
         functools.partial(hybrid_search, query=query, palace_path=palace_path,
             wing=wing, room=room, n_results=n_results, use_kg=use_kg,
-            rerank=rerank, agent_id=agent_id)
+            rerank=rerank, agent_id=agent_id, is_latest=is_latest)
     )

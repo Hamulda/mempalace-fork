@@ -433,6 +433,145 @@ class TestCacheInvalidationAfterWrite:
         assert cache.get_value("pretest") is None, "Query cache should be cleared after add_drawer"
         del server
 
+    async def test_status_cache_invalidated_after_add_drawer(self, palace_path, collection):
+        """add_drawer invalidates status cache (_status_cache["data"] set to None)."""
+        import mempalace.fastmcp_server as fm
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        # Pre-populate status cache
+        fm._status_cache["data"] = {"total_drawers": 999}
+        fm._status_cache["ts"] = 9999999
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_add_drawer",
+                {"wing": "test", "room": "room", "content": "test content", "added_by": "test"},
+            )
+            data = _get_result_data(result)
+            assert data.get("success"), f"add_drawer failed: {data}"
+        # After write, status cache should be invalidated
+        assert fm._status_cache["data"] is None, "Status cache should be invalidated after add_drawer"
+        assert fm._status_cache["ts"] == 0.0, "Status cache ts should be reset"
+        del server
+        # Reset cache to not affect subsequent tests
+        fm._status_cache["data"] = None
+        fm._status_cache["ts"] = 0.0
+
+
+class TestKgSingleton:
+    def test_kg_singleton_reused(self):
+        """_get_kg called 2× with same palace_path returns the same instance."""
+        from mempalace.searcher import _get_kg
+        import mempalace.searcher as searcher_module
+        import tempfile
+
+        # Reset singleton state first
+        searcher_module._kg_instance = None
+        searcher_module._kg_path_cached = None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            kg1 = _get_kg(tmp)
+            kg2 = _get_kg(tmp)
+            assert kg1 is kg2, "KG singleton should return same instance on repeated calls"
+            assert searcher_module._kg_instance is kg1
+            assert searcher_module._kg_path_cached == str(__import__("pathlib").Path(tmp) / "knowledge_graph.sqlite3")
+
+    def test_kg_no_close_called(self):
+        """_get_kg does NOT call kg.close() on the returned instance."""
+        from mempalace.searcher import _get_kg
+        import mempalace.searcher as searcher_module
+        import tempfile
+        from unittest.mock import MagicMock
+
+        searcher_module._kg_instance = None
+        searcher_module._kg_path_cached = None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_kg = _get_kg(tmp)
+            # If we get a real KG, check it doesn't have close called by _get_kg
+            # The singleton should not auto-close
+            if hasattr(real_kg, "close"):
+                # Track that _get_kg itself does not call close
+                close_mock = MagicMock()
+                real_kg.close = close_mock
+                # Re-call _get_kg to trigger double-check path
+                _get_kg(tmp)
+                close_mock.assert_not_called()
+
+
+class TestHybridSearchIsLatest:
+    def test_hybrid_search_is_latest_none(self):
+        """hybrid_search(is_latest=None) passes None to search_memories, not True."""
+        from mempalace.searcher import hybrid_search
+        import tempfile
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("mempalace.searcher.search_memories") as mock_sm:
+                mock_sm.return_value = {"results": []}
+                result = hybrid_search(
+                    query="test query",
+                    palace_path=tmp,
+                    is_latest=None,
+                )
+                call_kwargs = mock_sm.call_args.kwargs
+                assert "is_latest" in call_kwargs
+                assert call_kwargs["is_latest"] is None, "is_latest should be None, not True"
+
+    async def test_hybrid_search_is_latest_param_mcp(self, palace_path, collection):
+        """mempalace_hybrid_search MCP tool accepts is_latest param."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_hybrid_search",
+                {"query": "test", "limit": 5, "is_latest": None},
+            )
+            data = _get_result_data(result)
+            assert "results" in data or "error" in data
+
+
+class TestRrfMergeIdKey:
+    def test_rrf_merge_id_key_different_ids(self):
+        """Two hits with same text prefix but different IDs are both in merged result."""
+        from mempalace.searcher import _rrf_merge
+        hits1 = [
+            {"id": "id1", "text": "The same text content here", "wing": "w1", "room": "r1"},
+            {"id": "id2", "text": "Different text entirely", "wing": "w2", "room": "r2"},
+        ]
+        hits2 = [
+            {"id": "id3", "text": "The same text content here", "wing": "w1", "room": "r1"},
+        ]
+        merged = _rrf_merge([hits1, hits2])
+        ids = [h["id"] for h in merged]
+        assert "id1" in ids
+        assert "id3" in ids
+        assert "id2" in ids
+
+
+class TestSearchMemoriesResultsHaveId:
+    def test_search_memories_results_have_id(self):
+        """search_memories returns hits that include the 'id' key."""
+        from mempalace.searcher import search_memories
+        import tempfile
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mock_col = MagicMock()
+            mock_col.query.return_value = {
+                "documents": [["test doc"]],
+                "metadatas": [[{"wing": "w", "room": "r", "source_file": "f.py"}]],
+                "distances": [[0.1]],
+                "ids": [["doc_id_abc123"]],
+            }
+            mock_backend = MagicMock()
+            mock_backend.get_collection.return_value = mock_col
+            with patch("mempalace.searcher.get_backend", return_value=mock_backend):
+                result = search_memories("test", palace_path=tmp, n_results=5)
+                hits = result.get("results", [])
+                assert len(hits) == 1
+                assert "id" in hits[0], f"Hit should have 'id' key, got: {hits[0].keys()}"
+                assert hits[0]["id"] == "doc_id_abc123"
+
 
 def _get_result_data(result):
     """Extract JSON data from FastMCP CallToolResult."""

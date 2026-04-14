@@ -207,6 +207,10 @@ def _register_tools(server, backend, config, settings):
             "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
         }
 
+    def _invalidate_status_cache():
+        _status_cache["data"] = None
+        _status_cache["ts"] = 0.0
+
     # ── READ TOOLS ────────────────────────────────────────────────
 
     @server.tool(timeout=settings.timeout_read)
@@ -402,13 +406,17 @@ def _register_tools(server, backend, config, settings):
         use_kg: bool = True,
         rerank: bool = False,
         agent_id: str | None = None,
+        is_latest: bool | None = None,
     ) -> dict:
-        """[MEMPALACE] Hybrid search: semantic (ChromaDB) + knowledge graph (SQLite) combined.
+        """[MEMPALACE] Hybrid search: semantic (ChromaDB) + keyword (BM25) + KG combined.
+        is_latest=True — pouze aktuální záznamy (default chování).
+        is_latest=None — vše včetně historických.
         use_kg=True adds entity relationship facts alongside vector matches.
-        rerank: bool — if True, apply cross-encoder reranking (slower, better precision)."""
+        rerank=True — cross-encoder reranking (pomalejší, přesnější)."""
         return await hybrid_search_async(
             query=query, palace_path=settings.db_path, wing=wing, room=room,
-            n_results=limit, use_kg=use_kg, rerank=rerank, agent_id=agent_id,
+            n_results=limit, use_kg=use_kg, rerank=rerank,
+            agent_id=agent_id, is_latest=is_latest,
         )
 
     @server.tool(timeout=settings.timeout_embed)
@@ -672,6 +680,7 @@ def _register_tools(server, backend, config, settings):
             )
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             invalidate_all_caches()
+            _invalidate_status_cache()
 
             # KROK 4: Background BM25 warmup after write
             def _rebuild_bm25_bg():
@@ -716,6 +725,7 @@ def _register_tools(server, backend, config, settings):
         try:
             col.delete(ids=[drawer_id])
             invalidate_all_caches()
+            _invalidate_status_cache()
             logger.info(f"Deleted drawer: {drawer_id}")
             return {"success": True, "drawer_id": drawer_id}
         except Exception as e:
@@ -781,6 +791,7 @@ def _register_tools(server, backend, config, settings):
             )
             logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
             invalidate_all_caches()
+            _invalidate_status_cache()
             return {
                 "success": True,
                 "entry_id": entry_id,
@@ -950,6 +961,7 @@ def _register_tools(server, backend, config, settings):
             )
             logger.info(f"Remembered code: {drawer_id} → {wing}/{room}")
             invalidate_all_caches()
+            _invalidate_status_cache()
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -1036,6 +1048,7 @@ def _register_tools(server, backend, config, settings):
 
                 logger.info(f"Consolidated {merged_count} duplicate memories for topic: {topic}")
                 invalidate_all_caches()
+                _invalidate_status_cache()
 
             return {
                 "topic": topic,
