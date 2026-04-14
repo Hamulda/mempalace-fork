@@ -17,6 +17,8 @@ import sys
 import json
 import logging
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -33,14 +35,26 @@ from .searcher import search_memories, search_memories_async, hybrid_search_asyn
 from .palace_graph import traverse, find_tunnels, graph_stats
 from .knowledge_graph import KnowledgeGraph
 from .backends import get_backend
+from .entity_detector import extract_candidates
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
 
+# WAL async executor — offloads file I/O from async tool handlers
+_wal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mp_wal")
+
+# Status cache — wings/rooms aggregation cached for 60s
+_status_cache: dict = {"data": None, "ts": 0.0}
+_STATUS_CACHE_TTL: float = 60.0
+
+
+def _wal_log_async(operation: str, params: dict, result: dict = None, wal_file: Path | None = None):
+    """Non-blocking WAL write — offloads file I/O from async tool handlers."""
+    _wal_executor.submit(_wal_log, operation, params, result, wal_file)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # WRITE-AHEAD LOG
-# ═══════════════════════════════════════════════════════════════════
 
 def _get_wal_path(wal_dir: str | None = None) -> Path:
     """Return WAL file path, creating directory if needed."""
@@ -198,6 +212,11 @@ def _register_tools(server, backend, config, settings):
     @server.tool(timeout=settings.timeout_read)
     def mempalace_status(ctx: Context) -> dict:
         """[MEMPALACE] Palace overview — total drawers, wing and room counts."""
+        import time
+        now = time.time()
+        if _status_cache["data"] and (now - _status_cache["ts"]) < _STATUS_CACHE_TTL:
+            return _status_cache["data"]
+
         col = _get_collection()
         if not col:
             return _no_palace()
@@ -216,7 +235,7 @@ def _register_tools(server, backend, config, settings):
             pass
 
         ctx.debug(f"status returning {count} drawers")
-        return {
+        result = {
             "total_drawers": count,
             "wings": wings,
             "rooms": rooms,
@@ -224,6 +243,9 @@ def _register_tools(server, backend, config, settings):
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
         }
+        _status_cache["data"] = result
+        _status_cache["ts"] = now
+        return result
 
     @server.tool(timeout=settings.timeout_read)
     def mempalace_list_wings(ctx: Context) -> dict:
@@ -617,6 +639,16 @@ def _register_tools(server, backend, config, settings):
         except Exception:
             pass
 
+        # PART 4: Auto entity extraction from content (max 20 most frequent)
+        entities = []
+        try:
+            candidates = extract_candidates(content)
+            if candidates:
+                sorted_entities = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
+                entities = [name for name, _ in sorted_entities[:20]]
+        except Exception:
+            pass  # Entity extraction is best-effort
+
         try:
             col.upsert(
                 ids=[drawer_id],
@@ -628,6 +660,7 @@ def _register_tools(server, backend, config, settings):
                         "source_file": source_file or "",
                         "chunk_index": 0,
                         "added_by": added_by,
+                        "entities": json.dumps(entities) if entities else "",
                         "filed_at": datetime.now().isoformat(),
                         "agent_id": added_by,
                         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -672,6 +705,8 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    # TODO F176: diary entries could benefit from WriteCoalescer batch coalescing
+    # similar to LanceDB backend — coalesce multiple diary writes in time window
     @server.tool(timeout=settings.timeout_write)
     def mempalace_diary_write(
         ctx: Context,
@@ -863,15 +898,30 @@ def _register_tools(server, backend, config, settings):
             if existing and existing["ids"]:
                 return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
 
+            # Auto entity extraction from code+description (max 20 most frequent)
+            entities = []
+            try:
+                combined_text = f"{description} {code}"
+                candidates = extract_candidates(combined_text)
+                if candidates:
+                    sorted_entities = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
+                    entities = [name for name, _ in sorted_entities[:20]]
+            except Exception:
+                pass  # Entity extraction is best-effort
+
+            code_stored = code[:2000]
+            was_truncated = len(code) > 2000
+
             col.upsert(
                 ids=[drawer_id],
-                documents=[f"{description}\n\n```\n{code[:2000]}\n```"],
+                documents=[f"{description}\n\n```\n{code_stored}\n```"],
                 metadatas=[{
                     "wing": wing,
                     "room": room,
                     "source_file": source_file or "",
                     "type": "code_memory",
                     "description": description,
+                    "entities": json.dumps(entities) if entities else "",
                     "added_by": added_by,
                     "filed_at": datetime.now().isoformat(),
                     "agent_id": added_by,
@@ -882,7 +932,15 @@ def _register_tools(server, backend, config, settings):
                 }],
             )
             logger.info(f"Remembered code: {drawer_id} → {wing}/{room}")
-            return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+            return {
+                "success": True,
+                "drawer_id": drawer_id,
+                "wing": wing,
+                "room": room,
+                "code_truncated": was_truncated,
+                "original_length": len(code),
+                "stored_length": len(code_stored),
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
 

@@ -103,6 +103,212 @@ class TestConsolidateKeeperIsNewest:
             assert len(duplicates) == 2, "Should have 2 duplicates before merge"
 
 
+class TestEntityExtraction:
+    async def test_add_drawer_entity_extraction(self, palace_path, collection):
+        """add_drawer extracts entities from content and stores in metadata."""
+        import chromadb
+        client = chromadb.PersistentClient(path=palace_path)
+        # Use the default collection (mempalace_drawers)
+        col = client.get_or_create_collection("mempalace_drawers")
+
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            # Content with repeated capitalized names (3+ mentions = entity candidate)
+            content = (
+                "Alice worked on the backend. Alice implemented the API. Alice deployed it. "
+                "Bob helped with testing. Bob reviewed the code. Bob approved the merge."
+            )
+            result = await client.call_tool(
+                "mempalace_add_drawer",
+                {"wing": "test_wing", "room": "test_room", "content": content, "added_by": "test"},
+            )
+            data = _get_result_data(result)
+            assert data.get("success"), f"add_drawer failed: {data}"
+
+            # Verify entities metadata was stored
+            drawer_id = data.get("drawer_id")
+            stored = col.get(ids=[drawer_id])
+            assert stored["ids"], "Drawer should exist"
+            meta = stored["metadatas"][0]
+            entities_json = meta.get("entities", "")
+            assert entities_json, "entities metadata should be populated"
+            import json
+            entities = json.loads(entities_json)
+            # Alice and Bob appear 3+ times each
+            assert "Alice" in entities, "Alice should be extracted as entity"
+            assert "Bob" in entities, "Bob should be extracted as entity"
+            del client
+
+    async def test_remember_code_entity_extraction(self, palace_path, collection):
+        """remember_code extracts entities from code+description and stores in metadata."""
+        import chromadb
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            code = "def authenticate(user):\n    return user.check_auth()"
+            description = (
+                "Max implemented the authentication module. Max wrote the tests. Max reviewed. "
+                "Sarah deployed the service. Sarah configured the database."
+            )
+            result = await client.call_tool(
+                "mempalace_remember_code",
+                {
+                    "code": code,
+                    "description": description,
+                    "wing": "test_wing",
+                    "room": "test_room",
+                    "added_by": "test",
+                },
+            )
+            data = _get_result_data(result)
+            assert data.get("success"), f"remember_code failed: {data}"
+
+            # Verify entities metadata was stored
+            drawer_id = data.get("drawer_id")
+            stored = col.get(ids=[drawer_id])
+            assert stored["ids"], "Drawer should exist"
+            meta = stored["metadatas"][0]
+            entities_json = meta.get("entities", "")
+            assert entities_json, "entities metadata should be populated"
+            import json
+            entities = json.loads(entities_json)
+            # Max appears 3+ times, Sarah appears 2+ times
+            assert "Max" in entities, "Max should be extracted as entity"
+            del client
+
+
+class TestDiaryWriteWriteCoalescerTodo:
+    def test_diary_write_write_coalescer_todo(self):
+        """diary_write has TODO F176 comment about WriteCoalescer."""
+        import mempalace.fastmcp_server as module
+        import inspect
+        source = inspect.getsource(module)
+        # The TODO comment is 2 lines above mempalace_diary_write definition
+        # (blank line between comment block and @server.tool decorator)
+        lines = source.split('\n')
+        for i, line in enumerate(lines):
+            if 'def mempalace_diary_write' in line:
+                # Check 3 lines back (blank line + @server.tool decorator + continuation comment)
+                prev = lines[i - 3].strip() if i >= 3 else ""
+                assert "TODO F176" in prev, f"TODO F176 should be 2 lines above diary_write, got: {prev!r}"
+                assert "WriteCoalescer" in prev, f"WriteCoalescer mention should be in TODO comment"
+                break
+        else:
+            pytest.fail("mempalace_diary_write function not found in module source")
+
+
+class TestStatusCache:
+    async def test_status_cache_hit(self, palace_path, collection):
+        """Second status call within TTL returns cached result (same dict object)."""
+        import mempalace.fastmcp_server as fm
+
+        # Reset cache to ensure cold start
+        fm._status_cache["data"] = None
+        fm._status_cache["ts"] = 0.0
+
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+
+        async with Client(transport=server) as client:
+            r1 = await client.call_tool("mempalace_status", {})
+            d1 = _get_result_data(r1)
+            r2 = await client.call_tool("mempalace_status", {})
+            d2 = _get_result_data(r2)
+            # Same total_drawers confirms cache hit
+            assert d1.get("total_drawers") == d2.get("total_drawers")
+
+        del server
+
+    async def test_status_cache_expires(self, palace_path, collection):
+        """After TTL, status call recomputes."""
+        import mempalace.fastmcp_server as fm
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+
+        async with Client(transport=server) as client:
+            r1 = await client.call_tool("mempalace_status", {})
+            data1 = _get_result_data(r1)
+            # Manually expire the cache by setting ts to 0
+            fm._status_cache["ts"] = 0.0
+            r2 = await client.call_tool("mempalace_status", {})
+            data2 = _get_result_data(r2)
+            assert data2.get("total_drawers") is not None
+        del server
+
+    async def test_status_cache_expires(self, palace_path, collection):
+        """After TTL, status call recomputes."""
+        import mempalace.fastmcp_server as fm
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+
+        async with Client(transport=server) as client:
+            r1 = await client.call_tool("mempalace_status", {})
+            data1 = _get_result_data(r1)
+            # Manually expire the cache by setting ts to 0
+            fm._status_cache["ts"] = 0.0
+            r2 = await client.call_tool("mempalace_status", {})
+            data2 = _get_result_data(r2)
+            assert data2.get("total_drawers") is not None
+        del server
+
+
+class TestRememberCodeTruncation:
+    async def test_remember_code_truncation_warning(self, palace_path, collection):
+        """Code > 2000 chars returns code_truncated=True and original/stored lengths."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            long_code = "x" * 3000  # 3000 chars > 2000 limit
+            result = await client.call_tool(
+                "mempalace_remember_code",
+                {
+                    "code": long_code,
+                    "description": "Test truncation",
+                    "wing": "test_wing",
+                    "room": "test_room",
+                    "added_by": "test",
+                },
+            )
+            data = _get_result_data(result)
+            assert data.get("success"), f"Expected success, got: {data}"
+            assert data.get("code_truncated") is True, "code_truncated should be True"
+            assert data.get("original_length") == 3000, "original_length should be 3000"
+            assert data.get("stored_length") == 2000, "stored_length should be 2000"
+        del server
+
+
+class TestKgThreadSafety:
+    async def test_kg_thread_safety(self):
+        """10 concurrent threads calling kg.add_triple — no sqlite3.ProgrammingError."""
+        import threading
+        from mempalace.knowledge_graph import KnowledgeGraph
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = f"{tmp}/kg_test.sqlite3"
+            kg = KnowledgeGraph(db_path=db_path)
+            errors = []
+
+            def worker(i):
+                try:
+                    kg.add_triple(f"Entity{i}", "relates_to", f"Entity{i+100}", valid_from="2026-01-01")
+                except Exception as e:
+                    errors.append(str(e))
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert not errors, f"Thread safety errors: {errors}"
+            del kg
+
+
 def _get_result_data(result):
     """Extract JSON data from FastMCP CallToolResult."""
     if hasattr(result, 'structured_content') and result.structured_content:
