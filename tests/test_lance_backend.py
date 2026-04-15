@@ -297,6 +297,43 @@ class TestMigration:
         assert col.count() == 20
 
 
+# ── get_collection(create=True) idempotency ─────────────────────────────────
+
+class TestGetCollectionIdempotency:
+    def test_get_collection_create_true_idempotent(self, tmp_palace):
+        """Repeated get_collection(create=True) must be safe — open existing table."""
+        backend = LanceBackend()
+
+        col1 = backend.get_collection(tmp_palace, "idempotent_test", create=True)
+        col1.add(documents=["first write"], ids=["id1"], metadatas=[{}])
+        assert col1.count() == 1
+
+        # Same call again — must NOT raise TableAlreadyExistsError
+        col2 = backend.get_collection(tmp_palace, "idempotent_test", create=True)
+        assert col2.count() == 1  # existing data still there
+        col2.add(documents=["second write"], ids=["id2"], metadatas=[{}])
+        assert col2.count() == 2
+
+        # Third call — same
+        col3 = backend.get_collection(tmp_palace, "idempotent_test", create=True)
+        assert col3.count() == 2
+
+    def test_get_collection_create_false_nonexistent_raises(self, tmp_palace):
+        """get_collection(create=False) on non-existent table must raise FileNotFoundError."""
+        backend = LanceBackend()
+        with pytest.raises(FileNotFoundError, match="Palace not found"):
+            backend.get_collection(tmp_palace, "does_not_exist", create=False)
+
+    def test_get_collection_create_true_then_false_same_table(self, tmp_palace):
+        """create=True then create=False on same table — both succeed (idempotent open)."""
+        backend = LanceBackend()
+        col1 = backend.get_collection(tmp_palace, "flip_test", create=True)
+        col1.add(documents=["data"], ids=["d1"], metadatas=[{}])
+
+        col2 = backend.get_collection(tmp_palace, "flip_test", create=False)
+        assert col2.count() == 1
+
+
 # ── get_by_id ────────────────────────────────────────────────────────────────
 
 class TestGetById:

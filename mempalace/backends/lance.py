@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import select
 import shutil
 import socket
 import subprocess
@@ -108,10 +109,14 @@ def _start_daemon_if_needed() -> bool:
             deadline = time.monotonic() + _SOCK_TIMEOUT
             ready = False
             while time.monotonic() < deadline:
-                line = proc.stdout.readline().decode("utf-8", errors="ignore").strip()
-                if line == "READY":
-                    ready = True
-                    break
+                # Use select with timeout — guarantees we don't block past deadline
+                remaining = max(0.05, deadline - time.monotonic())
+                r, _, _ = select.select([proc.stdout], [], [], remaining)
+                if r:
+                    line = proc.stdout.readline().decode("utf-8", errors="ignore").strip()
+                    if line == "READY":
+                        ready = True
+                        break
                 if proc.poll() is not None:
                     err = proc.stderr.read().decode("utf-8", errors="ignore")
                     logger.error("Embedding daemon failed to start: %s", err)
@@ -1285,37 +1290,38 @@ class LanceCollection(BaseCollection):
             self._write_with_retry(do_delete)
         elif where:
             # LanceDB's json_extract SQL cannot filter UTF-8 metadata_json strings.
-            # Use pandas to find matching ids, then delete them one by one.
+            # Collect ALL matching ids in one full-table scan, then delete in batches.
+            # Offset-based pagination is NOT safe here because deleting shifts row positions.
             try:
                 batch_size = 500
-                offset = 0
-                while True:
-                    # Pull a batch — LanceDB's limit works fine for pagination
-                    all_batch = (
+                MAX_SCAN = 50000  # hard cap to prevent unbounded scan
+                matching_ids = []
+
+                # Scan in fixed-size pages from offset 0 until table is exhausted
+                page_start = 0
+                while len(matching_ids) < MAX_SCAN:
+                    page = (
                         self._table.search()
                         .limit(batch_size)
-                        .offset(offset)
+                        .offset(page_start)
                         .to_pandas()
                     )
-                    if all_batch.empty:
+                    if page.empty:
                         break
-                    # Filter to matching rows via pandas (handles JSON metadata)
-                    match_batch = _apply_where_filter(all_batch, where)
-                    if match_batch.empty:
-                        if len(all_batch) < batch_size:
-                            break
-                        offset += batch_size
-                        continue
-                    matching_ids = match_batch["id"].tolist()
-                    for mid in matching_ids:
+                    filtered = _apply_where_filter(page, where)
+                    if not filtered.empty:
+                        matching_ids.extend(filtered["id"].tolist())
+                    # Advance even if empty — table may have grown or rows shifted
+                    page_start += batch_size
+
+                # Delete matching ids in batches (single-id deletes preserve MVCC safety)
+                for i in range(0, len(matching_ids), batch_size):
+                    for mid in matching_ids[i:i + batch_size]:
                         self._write_with_retry(
                             lambda i=mid: self._table.delete(f"id = '{i}'")
                         )
-                    if len(all_batch) < batch_size:
-                        break
-                    offset += batch_size
             except Exception:
-                pass  # If we can't check, skip delete rather than risk RAM spike
+                pass  # If we can't scan, skip delete rather than risk RAM spike
 
     def count(self) -> int:
         try:
@@ -1382,10 +1388,9 @@ class LanceBackend:
         except Exception:
             table_names = []
 
+        # create=True means "create if not exists" — not "always create".
+        # If the table already exists, open it regardless of the create flag.
         if collection_name not in table_names:
-            create = True
-
-        if create:
             table = _create_lance_table(db, collection_name)
             return LanceCollection(table, palace_path=palace_path, collection_name=collection_name)
 

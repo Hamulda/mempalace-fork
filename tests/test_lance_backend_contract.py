@@ -218,3 +218,37 @@ class TestDeleteWhereAllRows:
         })
         # Only mix0 should be deleted (wing=shared AND room=room0)
         assert lance_collection.count() == 4
+
+    def test_delete_where_many_rows_across_batches(self, lance_collection):
+        """delete(where=...) must not skip rows when matches span multiple scan pages.
+
+        Regression: the old offset-based loop would advance offset+=batch_size after
+        each delete batch, skipping rows when deletes shifted positions.
+        """
+        # Add 1200 records (exceeds batch_size=500, spans multiple pages)
+        for i in range(1200):
+            lance_collection.add(
+                documents=[f"target doc {i}"],
+                ids=[f"tdel_{i}"],
+                metadatas=[{"scope": "delete_all", "idx": i}],
+            )
+        # Add 100 non-matching records
+        for i in range(100):
+            lance_collection.add(
+                documents=[f"keep doc {i}"],
+                ids=[f"keep_{i}"],
+                metadatas=[{"scope": "other"}],
+            )
+
+        assert lance_collection.count() == 1300
+
+        # Delete all 1200 matching records
+        lance_collection.delete(where={"scope": "delete_all"})
+
+        # Must remove ALL 1200, not just first batch
+        assert lance_collection.count() == 100
+        remaining = lance_collection.get(where={"scope": "delete_all"})
+        assert remaining["ids"] == []
+
+        # Non-matching records must be untouched
+        assert lance_collection.count() == 100
