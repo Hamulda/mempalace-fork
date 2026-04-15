@@ -663,20 +663,27 @@ def status(palace_path: str):
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         return
 
-    # Count by wing and room
-    try:
-        r = col.get(limit=10000, include=["metadatas"])
-    except Exception as e:
-        print(f"\n  Error reading palace: {e}")
-        return
-    metas = r.get("metadatas", [])
-
+    # Iterative aggregation — no fixed limit, processes ALL records
     wing_rooms = defaultdict(lambda: defaultdict(int))
-    for m in metas:
-        wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+    _BATCH = 500
+    offset = 0
+    while True:
+        try:
+            r = col.get(limit=_BATCH, offset=offset, include=["metadatas"])
+        except Exception as e:
+            print(f"\n  Error reading palace: {e}")
+            return
+        metas = r.get("metadatas", [])
+        if not metas:
+            break
+        for m in metas:
+            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+        if len(metas) < _BATCH:
+            break
+        offset += len(metas)
 
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {len(metas)} drawers")
+    print(f"  MemPalace Status — {sum(sum(rooms.values()) for rooms in wing_rooms.values())} drawers")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")

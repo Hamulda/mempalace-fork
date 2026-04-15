@@ -6,6 +6,9 @@ from pathlib import Path
 import chromadb
 import yaml
 
+# Force chromadb backend for these tests (they use chromadb.PersistentClient directly)
+os.environ["MEMPALACE_BACKEND"] = "chroma"
+
 from mempalace.miner import mine, scan_project
 from mempalace.palace import file_already_mined
 
@@ -45,7 +48,7 @@ def test_project_mining():
         mine(str(project_root), str(palace_path))
 
         client = chromadb.PersistentClient(path=str(palace_path))
-        col = client.get_collection("mempalace_drawers")
+        col = client.get_or_create_collection("mempalace_drawers")
         assert col.count() > 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

@@ -130,7 +130,7 @@ Restart Claude Code, then type `/skills` to verify "mempalace" appears.
 claude mcp add mempalace -- python -m mempalace.fastmcp_server
 ```
 
-Now your AI has 19 tools available through MCP. Ask it anything:
+Now your AI has 27 tools available through MCP. Ask it anything:
 
 > *"What did we decide about auth last month?"*
 

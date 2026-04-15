@@ -2,6 +2,10 @@ import os
 import tempfile
 import shutil
 import chromadb
+
+# Force chromadb backend for this test (it uses chromadb.PersistentClient directly)
+os.environ["MEMPALACE_BACKEND"] = "chroma"
+
 from mempalace.convo_miner import mine_convos
 
 
@@ -16,7 +20,7 @@ def test_convo_mining():
     mine_convos(tmpdir, palace_path, wing="test_convos")
 
     client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_collection("mempalace_drawers")
+    col = client.get_or_create_collection("mempalace_drawers")
     assert col.count() >= 2
 
     # Verify search works

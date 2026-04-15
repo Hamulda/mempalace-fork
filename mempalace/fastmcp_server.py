@@ -474,7 +474,7 @@ def _register_tools(server, backend, config, settings):
         agent_id: str | None = None,
         is_latest: bool | None = None,
     ) -> dict:
-        """[MEMPALACE] Hybrid search: semantic (ChromaDB) + keyword (BM25) + KG combined.
+        """[MEMPALACE] Hybrid search: semantic (LanceDB) + keyword (BM25) + KG combined.
         is_latest=True — pouze aktuální záznamy (default chování).
         is_latest=None — vše včetně historických.
         use_kg=True adds entity relationship facts alongside vector matches.
