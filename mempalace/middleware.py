@@ -303,18 +303,16 @@ _session_tracking_middleware = SessionTrackingMiddleware()
 
 def build_middleware_stack(settings) -> list:
     """Vytvoří čerstvý middleware stack — volej z create_server()."""
-    from fastmcp.server.middleware.caching import ResponseCachingMiddleware, CallToolSettings, ListToolsSettings
-    from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
-    from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
-    from fastmcp.server.middleware.timing import TimingMiddleware
-
-    caching = ResponseCachingMiddleware(
-        list_tools_settings=ListToolsSettings(ttl=float(settings.cache_ttl_metadata)),
-        call_tool_settings=CallToolSettings(
-            ttl=float(settings.cache_ttl_status),
-            included_tools=["mempalace_status", "mempalace_list_wings", "mempalace_get_taxonomy", "mempalace_list_rooms"],
-        ),
-    )
+    # Use our custom ResponseCachingMiddleware (has invalidate() method).
+    # FastMCP built-in ResponseCachingMiddleware has no invalidate() — would break
+    # CacheInvalidationMiddleware which calls cache.invalidate() on write success.
+    caching = ResponseCachingMiddleware()
+    caching.TOOL_TTL = {
+        "mempalace_status": float(settings.cache_ttl_status),
+        "mempalace_list_wings": float(settings.cache_ttl_metadata),
+        "mempalace_list_rooms": float(settings.cache_ttl_metadata),
+        "mempalace_get_taxonomy": float(settings.cache_ttl_metadata),
+    }
     invalidation = CacheInvalidationMiddleware(caching)
     # NOTE: EmbedCircuitBreakerMiddleware is ready but deactivated.
     # Activation requires should_try_socket() to be wired into backends/lance.py F184.
