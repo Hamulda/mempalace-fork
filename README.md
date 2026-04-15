@@ -14,7 +14,7 @@ Other memory systems try to fix this by letting AI decide what's worth rememberi
 
 **The Palace** — Ancient Greek orators memorized entire speeches by placing ideas in rooms of an imaginary building. Walk through the building, find the idea. MemPalace applies the same principle to AI memory: your conversations are organized into wings (people and projects), halls (types of memory), and rooms (specific ideas). No AI decides what matters — you keep every word, and the structure gives you a navigable map instead of a flat search index.
 
-**Raw verbatim storage** — MemPalace stores your actual exchanges in ChromaDB without summarization or extraction. The 96.6% LongMemEval result comes from this raw mode. We don't burn an LLM to decide what's "worth remembering" — we keep everything and let semantic search find it.
+**Raw verbatim storage** — MemPalace stores your actual exchanges in LanceDB without summarization or extraction. The 96.6% LongMemEval result comes from this raw mode. We don't burn an LLM to decide what's "worth remembering" — we keep everything and let semantic search find it.
 
 **AAAK (experimental)** — A lossy abbreviation dialect for packing repeated entities into fewer tokens at scale. Readable by any LLM that reads text — Claude, GPT, Gemini, Llama, Mistral — no decoder needed. **AAAK is a separate compression layer, not the storage default**, and on the LongMemEval benchmark it currently regresses vs raw mode (84.2% vs 96.6%). We're iterating. See the [note above](#a-note-from-milla--ben--april-7-2026) for the honest status.
 
@@ -59,7 +59,7 @@ Other memory systems try to fix this by letting AI decide what's worth rememberi
 >
 > - **"30x lossless compression" was overstated.** AAAK is a lossy abbreviation system (entity codes, sentence truncation). Independent benchmarks show AAAK mode scores **84.2% R@5 vs raw mode's 96.6%** on LongMemEval — a 12.4 point regression. The honest framing is: AAAK is an experimental compression layer that trades fidelity for token density, and **the 96.6% headline number is from RAW mode, not AAAK**.
 >
-> - **"+34% palace boost" was misleading.** That number compares unfiltered search to wing+room metadata filtering. Metadata filtering is a standard ChromaDB feature, not a novel retrieval mechanism. Real and useful, but not a moat.
+> - **"+34% palace boost" was misleading.** That number compares unfiltered search to wing+room metadata filtering. Metadata filtering is a standard LanceDB feature, not a novel retrieval mechanism. Real and useful, but not a moat.
 >
 > - **"Contradiction detection"** exists as a separate utility (`fact_checker.py`) but is not currently wired into the knowledge graph operations as the README implied.
 >
@@ -76,7 +76,7 @@ Other memory systems try to fix this by letting AI decide what's worth rememberi
 > 1. Rewriting the AAAK example with real tokenizer counts and a scenario where AAAK actually demonstrates compression
 > 2. Adding `mode raw / aaak / rooms` clearly to the benchmark documentation so the trade-offs are visible
 > 3. Wiring `fact_checker.py` into the KG ops so the contradiction detection claim becomes true
-> 4. Pinning ChromaDB to a tested range (Issue #100), fixing the shell injection in hooks (#110), and addressing the macOS ARM64 segfault (#74)
+> 4. Pinning LanceDB as primary storage, fixing the shell injection in hooks (#110), and addressing the macOS ARM64 segfault (#74)
 >
 > **Thank you to everyone who poked holes in this.** Brutal honest criticism is exactly what makes open source work, and it's what we asked for. Special thanks to [@panuhorsmalahti](https://github.com/milla-jovovich/mempalace/issues/43), [@lhl](https://github.com/milla-jovovich/mempalace/issues/27), [@gizmax](https://github.com/milla-jovovich/mempalace/issues/39), and everyone who filed an issue or a PR in the first 48 hours. We're listening, we're fixing, and we'd rather be right than impressive.
 >
@@ -166,7 +166,7 @@ results = search_memories("auth decisions", palace_path="~/.mempalace/palace")
 # Inject into your local model's context
 ```
 
-Either way — your entire memory stack runs offline. ChromaDB on your machine, Llama on your machine, AAAK for compression, zero cloud calls.
+Either way — your entire memory stack runs offline. LanceDB on your machine, Llama on your machine, AAAK for compression, zero cloud calls.
 
 ---
 
@@ -293,7 +293,7 @@ AAAK is a lossy abbreviation system — entity codes, structural markers, and se
 - **It does not save tokens at small scales.** Short text already tokenizes efficiently. AAAK overhead (codes, separators) costs more than it saves on a few sentences.
 - **It can save tokens at scale** — in scenarios with many repeated entities (a team mentioned hundreds of times, the same project across thousands of sessions), the entity codes amortize.
 - **AAAK currently regresses LongMemEval** vs raw verbatim retrieval (84.2% R@5 vs 96.6%). The 96.6% headline number is from **raw mode**, not AAAK mode.
-- **The MemPalace storage default is raw verbatim text in ChromaDB** — that's where the benchmark wins come from. AAAK is a separate compression layer for context loading, not the storage format.
+- **The MemPalace storage default is raw verbatim text in LanceDB** — that's where the benchmark wins come from. AAAK is a separate compression layer for context loading, not the storage format.
 
 We're iterating on the dialect spec, adding a real tokenizer for stats, and exploring better break points for when to use it. Track progress in [Issue #43](https://github.com/milla-jovovich/mempalace/issues/43) and [#27](https://github.com/milla-jovovich/mempalace/issues/27).
 
@@ -458,7 +458,7 @@ claude plugin install --scope user mempalace
 claude mcp add mempalace -- python -m mempalace.fastmcp_server
 ```
 
-### 19 Tools
+### 27 Tools
 
 **Palace (read)**
 
@@ -535,7 +535,7 @@ Tested on standard academic benchmarks — reproducible, published datasets.
 
 | Benchmark | Mode | Score | API Calls |
 |-----------|------|-------|-----------|
-| **LongMemEval R@5** | Raw (ChromaDB only) | **96.6%** | Zero |
+| **LongMemEval R@5** | Raw (LanceDB only) | **96.6%** | Zero |
 | **LongMemEval R@5** | Hybrid + Haiku rerank | **100%** (500/500) | ~500 |
 | **LoCoMo R@10** | Raw, session level | **60.3%** | Zero |
 | **Personal palace R@10** | Heuristic bench | **85%** | Zero |
@@ -633,12 +633,12 @@ Plain text. Becomes Layer 0 — loaded every session.
 | `cli.py` | CLI entry point |
 | `config.py` | Configuration loading and defaults |
 | `normalize.py` | Converts 5 chat formats to standard transcript |
-| `mcp_server.py` | MCP server — 19 tools, AAAK auto-teach, memory protocol |
+| `fastmcp_server.py` | MCP server — 27 tools, AAAK auto-teach, memory protocol |
 | `miner.py` | Project file ingest |
 | `convo_miner.py` | Conversation ingest — chunks by exchange pair |
-| `searcher.py` | Semantic search via ChromaDB |
+| `searcher.py` | Semantic search via LanceDB |
 | `layers.py` | 4-layer memory stack |
-| `dialect.py` | AAAK compression — 30x lossless |
+| `dialect.py` | AAAK dialect — lossy abbreviation for context loading |
 | `knowledge_graph.py` | Temporal entity-relationship graph (SQLite) |
 | `palace_graph.py` | Room-based navigation graph |
 | `onboarding.py` | Guided setup — generates AAAK bootstrap + wing config |
@@ -657,7 +657,7 @@ mempalace/
 ├── README.md                  ← you are here
 ├── mempalace/                 ← core package (README)
 │   ├── cli.py                 ← CLI entry point
-│   ├── mcp_server.py          ← MCP server (19 tools)
+│   ├── fastmcp_server.py          ← MCP server (27 tools)
 │   ├── knowledge_graph.py     ← temporal entity graph
 │   ├── palace_graph.py        ← room navigation graph
 │   ├── dialect.py             ← AAAK compression
@@ -690,7 +690,8 @@ mempalace/
 ## Requirements
 
 - Python 3.9+
-- `chromadb>=0.4.0`
+- `lancedb>=0.20.0`
+- `fastembed>=0.4.0`
 - `pyyaml>=6.0`
 
 No API key. No internet after install. Everything local.
