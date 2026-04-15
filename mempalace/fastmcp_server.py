@@ -584,7 +584,7 @@ def _register_tools(server, backend, config, settings):
         except ValueError as e:
             return {"success": False, "error": str(e)}
 
-        _wal_log(
+        _wal_log_async(
             "kg_add",
             {
                 "subject": subject,
@@ -609,7 +609,7 @@ def _register_tools(server, backend, config, settings):
         ended: str | None = None,
     ) -> dict:
         """[MEMPALACE] Mark a fact as no longer true."""
-        _wal_log(
+        _wal_log_async(
             "kg_invalidate",
             {"subject": subject, "predicate": predicate, "object": object, "ended": ended},
             wal_file=_get_wal_path(settings.wal_dir),
@@ -637,7 +637,7 @@ def _register_tools(server, backend, config, settings):
             predicate = sanitize_name(predicate, "predicate")
         except ValueError as e:
             return {"success": False, "error": str(e)}
-        _wal_log(
+        _wal_log_async(
             "kg_supersede",
             {"subject": subject, "predicate": predicate, "old_value": old_value, "new_value": new_value, "agent_id": agent_id},
             wal_file=_get_wal_path(settings.wal_dir),
@@ -693,7 +693,7 @@ def _register_tools(server, backend, config, settings):
 
         drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content[:100]).encode()).hexdigest()[:24]}"
 
-        _wal_log(
+        _wal_log_async(
             "add_drawer",
             {
                 "drawer_id": drawer_id,
@@ -772,10 +772,9 @@ def _register_tools(server, backend, config, settings):
             invalidate_all_caches()
             _invalidate_status_cache()
 
-            # KROK 4: Coalesced BM25 rebuild — debounce window prevents thread-per-write storm
+            # Coalesced BM25 rebuild — debounce window prevents thread-per-write storm
             def _schedule_bm25_rebuild():
                 if _bm25_pending_event.is_set():
-                    # Not currently pending — arm debounce timer
                     _bm25_pending_event.clear()
 
                     def _debounced_rebuild():
@@ -788,14 +787,15 @@ def _register_tools(server, backend, config, settings):
                         except Exception:
                             pass
                         finally:
-                            _bm25_pending_event.set()  # allow next debounce window
+                            _bm25_pending_event.set()
 
                     def _defer():
                         time.sleep(_BM25_COALESCE_MS / 1000.0)
                         _bg_executor.submit(_debounced_rebuild)
 
                     threading.Thread(target=_defer, daemon=True, name="bm25_debounce").start()
-                # else: rebuild already pending within window — skip, next write re-arms
+
+            _schedule_bm25_rebuild()
 
             return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
         except Exception as e:
@@ -814,7 +814,7 @@ def _register_tools(server, backend, config, settings):
 
         deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
         deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-        _wal_log(
+        _wal_log_async(
             "delete_drawer",
             {
                 "drawer_id": drawer_id,
@@ -858,7 +858,7 @@ def _register_tools(server, backend, config, settings):
         now = datetime.now()
         entry_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}_{hashlib.sha256(entry[:50].encode()).hexdigest()[:12]}"
 
-        _wal_log(
+        _wal_log_async(
             "diary_write",
             {
                 "agent_name": agent_name,
@@ -911,25 +911,37 @@ def _register_tools(server, backend, config, settings):
             return _no_palace()
 
         try:
-            results = col.get(
-                where={"$and": [{"wing": wing}, {"room": "diary"}]},
-                include=["documents", "metadatas"],
-                limit=10000,
-            )
-
-            if not results["ids"]:
-                return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
-
+            # Iterative fetch — no hard 10k cap, processes ALL diary entries
             entries = []
-            for doc, meta in zip(results["documents"], results["metadatas"]):
-                entries.append(
-                    {
-                        "date": meta.get("date", ""),
-                        "timestamp": meta.get("timestamp", ""),
-                        "topic": meta.get("topic", ""),
-                        "content": doc,
-                    }
-                )
+            try:
+                _BATCH = 500
+                offset = 0
+                while True:
+                    batch = col.get(
+                        where={"$and": [{"wing": wing}, {"room": "diary"}]},
+                        include=["documents", "metadatas"],
+                        limit=_BATCH,
+                        offset=offset,
+                    )
+                    docs = batch.get("documents", [])
+                    metas = batch.get("metadatas", [])
+                    if not docs:
+                        break
+                    for doc, meta in zip(docs, metas):
+                        entries.append({
+                            "date": meta.get("date", ""),
+                            "timestamp": meta.get("timestamp", ""),
+                            "topic": meta.get("topic", ""),
+                            "content": doc,
+                        })
+                    if len(docs) < _BATCH:
+                        break
+                    offset += len(docs)
+            except Exception:
+                pass
+
+            if not entries:
+                return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
 
             entries.sort(key=lambda x: x["timestamp"], reverse=True)
             entries = entries[:last_n]
@@ -937,7 +949,7 @@ def _register_tools(server, backend, config, settings):
             return {
                 "agent": agent_name,
                 "entries": entries,
-                "total": len(results["ids"]),
+                "total": len(entries),
                 "showing": len(entries),
             }
         except Exception as e:
@@ -1008,7 +1020,7 @@ def _register_tools(server, backend, config, settings):
 
         drawer_id = f"code_{wing}_{room}_{hashlib.sha256((wing + room + description[:100]).encode()).hexdigest()[:24]}"
 
-        _wal_log(
+        _wal_log_async(
             "remember_code",
             {
                 "drawer_id": drawer_id,
@@ -1135,7 +1147,7 @@ def _register_tools(server, backend, config, settings):
 
                 for dup in to_remove:
                     try:
-                        _wal_log(
+                        _wal_log_async(
                             "consolidate_delete",
                             {"deleted_id": dup["id"], "topic": topic, "keeper_id": keeper["id"]},
                             wal_file=_get_wal_path(settings.wal_dir),
@@ -1177,27 +1189,36 @@ def _register_tools(server, backend, config, settings):
             if room:
                 where["room"] = room
 
-            kwargs = {"include": ["documents", "metadatas"], "limit": 10000}
-            if where:
-                kwargs["where"] = where
+            # Iterative fetch — no hard 10k cap, processes ALL matching records
+            memories = []
+            _BATCH = 500
+            offset = 0
+            while True:
+                kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
+                if where:
+                    kwargs["where"] = where
+                batch = col.get(**kwargs)
+                docs = batch.get("documents", [])
+                metas = batch.get("metadatas", [])
+                if not docs:
+                    break
+                for doc, meta in zip(docs, metas):
+                    memories.append({
+                        "wing": meta.get("wing", "unknown"),
+                        "room": meta.get("room", "unknown"),
+                        "content": doc,
+                        "source_file": meta.get("source_file", ""),
+                    })
+                if len(docs) < _BATCH:
+                    break
+                offset += len(docs)
 
-            results = col.get(**kwargs)
-
-            if not results["ids"]:
+            if not memories:
                 return {
                     "export": "",
                     "count": 0,
                     "message": "No memories found for the specified criteria.",
                 }
-
-            memories = []
-            for doc, meta in zip(results["documents"], results["metadatas"]):
-                memories.append({
-                    "wing": meta.get("wing", "unknown"),
-                    "room": meta.get("room", "unknown"),
-                    "content": doc,
-                    "source_file": meta.get("source_file", ""),
-                })
 
             if format == "json":
                 return {

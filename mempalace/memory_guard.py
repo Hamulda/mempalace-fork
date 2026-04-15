@@ -68,6 +68,7 @@ class MemoryGuard:
 
     _instance = None
     _lock = threading.Lock()
+    _started = threading.Event()
 
     def __init__(self, check_interval: float = 10.0):
         self._pressure = MemoryPressure.NOMINAL
@@ -78,6 +79,7 @@ class MemoryGuard:
             target=self._monitor_loop, daemon=True
         )
         self._thread.start()
+        self._started.wait(timeout=5.0)  # wait for first measurement before returning
         logger.info("MemoryGuard started (check interval: %ss)", check_interval)
 
     @classmethod
@@ -114,6 +116,12 @@ class MemoryGuard:
         return False
 
     def _monitor_loop(self):
+        # První měření hned — nečekej na interval
+        pressure, ratio = _get_memory_pressure_macos()
+        self._pressure = pressure
+        self._used_ratio = ratio
+        self._started.set()
+
         while not self._stop.wait(self._interval):
             pressure, ratio = _get_memory_pressure_macos()
 
