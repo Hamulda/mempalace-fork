@@ -280,6 +280,33 @@ def test_cleanup_no_gaps_when_every_other_item_deleted(tmp_path):
         assert idx % 2 == 0, f"Deleted a protected id: {did}"
 
 
+# ── Fix 4: custom socket path → PID path is derived from socket, not hardcoded ───────
+
+
+def test_get_pid_path_derived_from_custom_socket(monkeypatch):
+    """
+    get_pid_path() must derive PID from the socket path, so custom
+    MEMPALACE_EMBED_SOCK=/tmp/my-daemon.sock → PID=/tmp/my-daemon.pid.
+    Previously the daemon wrote PID to ~/.mempalace/embed.pid (hardcoded)
+    while CLI computed it as sock_path.replace(".sock",".pid") — mismatch.
+    """
+    from mempalace.embed_daemon import get_pid_path
+
+    monkeypatch.setenv("MEMPALACE_EMBED_SOCK", "/tmp/my-custom-daemon.sock")
+    assert get_pid_path() == "/tmp/my-custom-daemon.pid"
+
+    monkeypatch.setenv("MEMPALACE_EMBED_SOCK", "/var/run/embed.sock")
+    assert get_pid_path() == "/var/run/embed.pid"
+
+
+def test_pid_path_default_without_env(monkeypatch):
+    """Without MEMPALACE_EMBED_SOCK, get_pid_path falls back to SOCKET_PATH."""
+    from mempalace.embed_daemon import get_pid_path, SOCKET_PATH
+
+    monkeypatch.delenv("MEMPALACE_EMBED_SOCK", raising=False)
+    assert get_pid_path() == SOCKET_PATH.replace(".sock", ".pid")
+
+
 # ── Smoke: imports work with new select import ──────────────────────────
 
 

@@ -458,7 +458,8 @@ def cmd_embed_daemon(args):
             print(f"Error starting daemon: {e}")
 
     elif args.action == "stop":
-        pid_path = sock_path.replace(".sock", ".pid")
+        from .embed_daemon import get_pid_path
+        pid_path = get_pid_path()
         try:
             pid = int(Path(pid_path).read_text())
             os.kill(pid, signal.SIGTERM)
@@ -472,7 +473,8 @@ def cmd_embed_daemon(args):
 
     elif args.action == "status":
         if _daemon_is_running():
-            pid_path = sock_path.replace(".sock", ".pid")
+            from .embed_daemon import get_pid_path
+            pid_path = get_pid_path()
             try:
                 pid = int(Path(pid_path).read_text())
                 print(f"Embedding daemon is running (PID {pid}) at {sock_path}")
@@ -605,7 +607,8 @@ def cmd_cleanup(args):
 
     # KG cleanup — POUZE expired triples (valid_to IS NOT NULL) a staré
     try:
-        kg = KnowledgeGraph()
+        kg_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+        kg = KnowledgeGraph(db_path=kg_path)
         conn = kg._conn()
         rows = conn.execute(
             "SELECT id FROM triples WHERE valid_to IS NOT NULL AND valid_to < ? AND extracted_at < ?",
@@ -1131,7 +1134,7 @@ def main():
         "--days",
         type=int,
         default=90,
-        help="Delete ChromaDB drawers older than N days (only non-latest)",
+        help="Delete drawers older than N days (only non-latest)",
     )
     p_cleanup.add_argument(
         "--kg-days",

@@ -139,6 +139,100 @@ class TestInvalidation:
         assert active_facts[0]["current"] is True
 
 
+class TestSupersedeCorrectness:
+    """Verify supersede_triple() respects old object / value semantics."""
+
+    def test_supersede_does_not_touch_sibling_triple(self, kg):
+        """With two concurrent triples on same predicate, superseding one must not
+        corrupt old_id or invalidate the sibling."""
+        kg.add_triple("Bob", "works_at", "Acme", valid_from="2020-01-01")
+        kg.add_triple("Bob", "works_at", "Freelance", valid_from="2022-01-01")
+
+        result = kg.supersede_triple("Bob", "works_at", "Acme", "BigCorp")
+
+        # old_id must point to the Acme triple, not Freelance
+        assert result["old_value"] == "Acme"
+        assert result["new_value"] == "BigCorp"
+        assert result["old_id"] is not None
+
+        all_triples = kg.query_entity("Bob", direction="outgoing")
+        works_at = [r for r in all_triples if r["predicate"] == "works_at"]
+
+        acme = [r for r in works_at if r["object"] == "Acme"]
+        freelance = [r for r in works_at if r["object"] == "Freelance"]
+        bigcorp = [r for r in works_at if r["object"] == "BigCorp"]
+
+        # Acme must be invalidated
+        assert len(acme) == 1
+        assert acme[0]["current"] is False, "Acme should be expired after supersede"
+
+        # Freelance must remain untouched — sibling on same predicate
+        assert len(freelance) == 1
+        assert freelance[0]["current"] is True, "Freelance sibling must NOT be invalidated"
+
+        # BigCorp must be current
+        assert len(bigcorp) == 1
+        assert bigcorp[0]["current"] is True
+
+    def test_supersede_stale_object_no_side_effect(self, kg):
+        """Superseding an already-expired object must not invalidate a different
+        current triple on the same predicate."""
+        # Alice worked at Acme (now expired), currently at NewCo
+        kg.add_triple("Alice", "works_at", "Acme", valid_from="2019-01-01")
+        kg.invalidate("Alice", "works_at", "Acme", ended="2023-12-31")
+        kg.add_triple("Alice", "works_at", "NewCo", valid_from="2024-01-01")
+
+        # Superseding the already-expired Acme should not touch NewCo
+        result = kg.supersede_triple("Alice", "works_at", "Acme", "OtherCo")
+
+        # old_id must be None — no current "Acme" triple exists
+        assert result["old_id"] is None, "No current Acme triple → old_id must be None"
+
+        newco = [
+            r for r in kg.query_entity("Alice", direction="outgoing")
+            if r["object"] == "NewCo"
+        ]
+        assert len(newco) == 1
+        assert newco[0]["current"] is True, "NewCo must not be invalidated"
+
+    def test_history_old_id_matches_expired_triple(self, kg):
+        """old_id returned by supersede must match the triple_id in history."""
+        kg.add_triple("Carol", "role", "engineer", valid_from="2025-01-01")
+        result = kg.supersede_triple("Carol", "role", "engineer", "lead")
+
+        history = kg.get_triple_history("Carol", "role")
+        assert len(history) == 2
+        expired_in_history = [h for h in history if h["object"] == "engineer"]
+        current_in_history = [h for h in history if h["object"] == "lead"]
+
+        assert len(expired_in_history) == 1
+        assert len(current_in_history) == 1
+
+        # old_id from supersede must match the expired triple's id in history
+        assert expired_in_history[0]["triple_id"] == result["old_id"], (
+            "old_id must point to the engineer triple, not another triple"
+        )
+        assert expired_in_history[0]["current"] is False
+        assert current_in_history[0]["current"] is True
+
+    def test_timeline_consistent_after_supersede(self, kg):
+        """Timeline shows both old and new triple; old has valid_to, new is current."""
+        kg.add_triple("Dan", "location", "Prague", valid_from="2024-01-01")
+        kg.supersede_triple("Dan", "location", "Prague", "Brno")
+
+        tl = kg.timeline("Dan")
+        locations = [t for t in tl if t["predicate"] == "location"]
+        assert len(locations) == 2
+
+        prague = next((t for t in locations if t["object"] == "Prague"), None)
+        brno = next((t for t in locations if t["object"] == "Brno"), None)
+
+        assert prague is not None and brno is not None
+        assert prague["current"] is False
+        assert prague["valid_to"] is not None
+        assert brno["current"] is True
+
+
 class TestTimeline:
     def test_timeline_all(self, seeded_kg):
         tl = seeded_kg.timeline()

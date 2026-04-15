@@ -280,8 +280,8 @@ def mine_convos(
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
 
-        # Skip if already filed
-        if not dry_run and file_already_mined(collection, source_file):
+        # Skip if already filed (check mtime so modified files are re-mined)
+        if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
             files_skipped += 1
             continue
 
@@ -336,6 +336,10 @@ def mine_convos(
         # Batch: collect all drawer data then fire one upsert per file.
         documents, ids, metadatas = [], [], []
         timestamp = datetime.utcnow().isoformat() + "Z"
+        try:
+            source_mtime = filepath.stat().st_mtime
+        except OSError:
+            source_mtime = None
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
@@ -355,6 +359,8 @@ def mine_convos(
                 "ingest_mode": "convos",
                 "extract_mode": extract_mode,
             }
+            if source_mtime is not None:
+                metadata["source_mtime"] = source_mtime
             documents.append(chunk["content"])
             ids.append(drawer_id)
             metadatas.append(metadata)

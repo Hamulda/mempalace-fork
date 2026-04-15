@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 _bg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed_client")
 
 SOCKET_PATH = os.path.expanduser("~/.mempalace/embed.sock")
-PID_PATH = os.path.expanduser("~/.mempalace/embed.pid")
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 CACHE_DIR = os.path.expanduser("~/.cache/fastembed")
 
@@ -143,6 +142,11 @@ def get_socket_path() -> str:
     return os.environ.get("MEMPALACE_EMBED_SOCK", SOCKET_PATH)
 
 
+def get_pid_path() -> str:
+    """PID file lives next to the socket, not at a hardcoded path."""
+    return get_socket_path().replace(".sock", ".pid")
+
+
 def _handle_client(conn: socket.socket, model) -> None:
     """Handle a single client request in a dedicated thread."""
     from mempalace.memory_guard import MemoryGuard
@@ -223,8 +227,9 @@ def run_daemon() -> None:
     os.chmod(sock_path, 0o600)
     server.listen(32)
 
-    # Write PID file
-    Path(PID_PATH).write_text(str(os.getpid()))
+    # Write PID file next to socket so stop/status can find it regardless of custom sock path
+    pid_path = get_pid_path()
+    Path(pid_path).write_text(str(os.getpid()))
 
     logger.info("Embedding daemon ready at %s (PID %d)", sock_path, os.getpid())
     print("READY", flush=True)
@@ -237,7 +242,7 @@ def run_daemon() -> None:
         except FileNotFoundError:
             pass
         try:
-            os.unlink(PID_PATH)
+            os.unlink(pid_path)
         except FileNotFoundError:
             pass
         sys.exit(0)
@@ -256,6 +261,10 @@ def run_daemon() -> None:
         _bg_executor.shutdown(wait=True)
         try:
             os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(pid_path)
         except FileNotFoundError:
             pass
 

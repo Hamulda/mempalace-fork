@@ -228,8 +228,8 @@ class KnowledgeGraph:
 
         conn = self._conn()
         old = conn.execute(
-            "SELECT id FROM triples WHERE subject=? AND predicate=? AND valid_to IS NULL",
-            (sub_id, pred),
+            "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+            (sub_id, pred, obj_id),
         ).fetchone()
         old_id = old["id"] if old else None
 

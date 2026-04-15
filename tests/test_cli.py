@@ -818,3 +818,42 @@ def test_cmd_cleanup_kg_preserves_active_triples(tmp_path):
     # Active triple (valid_to=None) must stay
     assert final["triples"] == 1
     assert final["current_facts"] == 1
+
+
+def test_cmd_cleanup_uses_palace_local_kg_path(tmp_path):
+    """cmd_cleanup must open knowledge_graph.sqlite3 inside palace_path, not the global default.
+
+    KnowledgeGraph is a local import inside cmd_cleanup, so it must be patched
+    at its source module (mempalace.knowledge_graph.KnowledgeGraph), matching
+    the pattern used in test_cmd_cleanup_kg_preserves_active_triples.
+    """
+    import os
+
+    palace_dir = str(tmp_path / "my_palace")
+    expected_kg_path = os.path.join(palace_dir, "knowledge_graph.sqlite3")
+
+    args = argparse.Namespace(
+        palace=palace_dir,
+        days=90,
+        kg_days=30,
+        dry_run=True,
+    )
+
+    captured_paths = []
+
+    def capture_kg(db_path=None):
+        captured_paths.append(db_path)
+        m = MagicMock()
+        m._conn.return_value.execute.return_value.fetchall.return_value = []
+        return m
+
+    # Patch at the source module — cmd_cleanup does `from .knowledge_graph import KnowledgeGraph`
+    # so the class must be intercepted where it lives, not at mempalace.cli.
+    # Drawer cleanup will fail silently (no palace dir exists); that's fine.
+    with patch("mempalace.knowledge_graph.KnowledgeGraph", side_effect=capture_kg):
+        cmd_cleanup(args)
+
+    assert len(captured_paths) == 1, "KnowledgeGraph must be instantiated exactly once"
+    assert captured_paths[0] == expected_kg_path, (
+        f"Expected palace-local KG path {expected_kg_path!r}, got {captured_paths[0]!r}"
+    )

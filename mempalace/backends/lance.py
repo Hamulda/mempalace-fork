@@ -1032,7 +1032,7 @@ class LanceCollection(BaseCollection):
 
         # Invalidate query cache na této collection
         from ..query_cache import get_query_cache
-        get_query_cache().invalidate_collection(self._collection_name)
+        get_query_cache().invalidate_collection(self._palace_path, self._collection_name)
 
     def upsert(
         self,
@@ -1106,7 +1106,7 @@ class LanceCollection(BaseCollection):
 
         # Invalidate query cache
         from ..query_cache import get_query_cache
-        get_query_cache().invalidate_collection(self._collection_name)
+        get_query_cache().invalidate_collection(self._palace_path, self._collection_name)
 
     # ── Read operations ───────────────────────────────────────────────────
 
@@ -1127,7 +1127,7 @@ class LanceCollection(BaseCollection):
         from ..query_cache import get_query_cache
         cache = get_query_cache()
         if where is None:
-            cached = cache.get(self._collection_name, [query_text], n_results)
+            cached = cache.get(self._palace_path, self._collection_name, [query_text], n_results)
             if cached is not None:
                 return cached
 
@@ -1201,7 +1201,7 @@ class LanceCollection(BaseCollection):
 
         # Cache set (pouze pro requesty bez where filtru)
         if where is None:
-            cache.set(self._collection_name, [query_text], n_results, result)
+            cache.set(self._palace_path, self._collection_name, [query_text], n_results, result)
 
         return result
 

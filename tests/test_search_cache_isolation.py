@@ -96,30 +96,45 @@ class TestQueryCacheInvalidation:
         # Expired
         assert cache.get_value(key) is None
 
-    def test_invalidate_collection_works_for_raw_key_interface(self):
-        """invalidate_collection should also invalidate get_value/set_value entries.
+    def test_invalidate_collection_works_for_get_set_interface(self):
+        """invalidate_collection(palace_path, collection) zneplatní get/set entries pro ten palace+collection."""
+        cache = QueryCache(ttl_seconds=60)
 
-        Note: This is the CURRENT BEHAVIOR GAP — get_value/set_value bypass
-        collection-aware invalidation. After fix, search_memories uses
-        palace_path+collection_name in keys, so invalidate_query_cache (clear)
-        is the only needed invalidation path for search_memories entries.
+        # Classic get/set pair uses _last_write timestamp
+        cache.set("/palace/a", "default", ["query"], 5, {"data": "test"})
+        cache.invalidate_collection("/palace/a", "default")
+        time.sleep(0.001)
+
+        # get/set interface is invalidated for this palace+collection
+        assert cache.get("/palace/a", "default", ["query"], 5) is None
+
+        # Different palace is NOT affected
+        cache.set("/palace/b", "default", ["query"], 5, {"data": "other"})
+        assert cache.get("/palace/b", "default", ["query"], 5) == {"data": "other"}
+
+    def test_raw_key_interface_not_affected_by_invalidate_collection(self):
+        """get_value/set_value (search_memories cache) není ovlivněn invalidate_collection.
+
+        To je správné chování — search_memories používá palace_path v klíči,
+        takže cross-palace izolace je zajištěna na úrovni klíče.
+        Pro hromadnou invalidaci search cache (všechny palace najednou)
+        se používá invalidate_query_cache() → clear().
         """
         cache = QueryCache(ttl_seconds=60)
 
         key = "/palace/a|default|query|None|None|None|None|5|False|None|None"
         cache.set_value(key, {"data": "test"})
 
-        # Classic get/set pair uses _last_write timestamp
-        cache.invalidate_collection("default")
+        cache.invalidate_collection("/palace/a", "default")
         time.sleep(0.001)
 
-        # Classic get/set is invalidated
-        assert cache.get("default", ["query"], 5) is None
-
-        # But raw get_value/set_value is NOT invalidated by invalidate_collection
-        # This is why search_memories now uses palace_path-aware keys + clear()
-        # For cross-palace safety, invalidate_query_cache() calls clear()
+        # get_value/set_value entries are NOT invalidated by invalidate_collection
+        # because they use raw string keys (no palace_path/collection in _last_write lookup)
         assert cache.get_value(key) == {"data": "test"}
+
+        # But clear() does invalidate them (used by invalidate_query_cache in searcher)
+        cache.clear()
+        assert cache.get_value(key) is None
 
 
 class TestQueryCacheThreadSafety:

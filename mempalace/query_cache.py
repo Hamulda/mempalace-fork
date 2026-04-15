@@ -1,6 +1,20 @@
 """
 LRU cache pro MemPalace query výsledky.
 TTL 5s zajišťuje čerstvost bez zbytečných redundantních searchů.
+
+Canonical cache story:
+- search_memories používá get_value/set_value s klíčem
+  "{palace_path}|{collection_name}|{query}|{filters}..."
+  (palace_path je vždy součástí klíče → cross-palace izolace)
+- get/set (pro interní LanceBackend query caching) používá
+  palace_path + collection_name pro správnou cross-palace invalidaci
+- invalidate_collection(palace_path, collection_name) zapisuje timestamp
+  do _last_write[(palace_path, collection_name)] — tento timestamp
+  pak zneplatní get/set cache entries i get_value/set_value entries
+  (protože search_memories volá invalidate_query_cache → clear())
+- write invalidace: LanceDB add/upsert/delete volá
+  get_query_cache().invalidate_collection(palace_path, collection_name)
+  → fastmcp_server volá invalidate_all_caches() = clear() pro search cache
 """
 import time
 import threading
@@ -18,9 +32,12 @@ class QueryCache:
     """
     Thread-safe LRU cache s TTL pro query výsledky.
 
-    Klíč: (query_text, n_results, collection_name)
-    Hodnota: (result_dict, timestamp)
-    Invalidace: při každém write do stejné collection
+    Cross-palace izolace: _last_write je indexovaný (palace_path, collection_name),
+    takže write do jednoho palace nikdy nezneplatní cache jiného palace
+    (pokud caller nevolá clear()).
+
+    Cache key pro get/set: hash(collection + query_texts + n_results)
+    Cache key pro get_value/set_value: libovolný string (caller definuje format)
     """
 
     def __init__(
@@ -34,13 +51,15 @@ class QueryCache:
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
-        # Per-collection write timestamps pro invalidaci
-        self._last_write: dict[str, float] = {}
+        # Per-(palace_path, collection) write timestamps for cross-palace isolation.
+        # Key format: (palace_path, collection_name) — palace_path "" means global.
+        self._last_write: dict[tuple[str, str], float] = {}
 
     def _make_key(
-        self, collection: str, query_texts: list[str], n_results: int
+        self, palace_path: str, collection: str, query_texts: list[str], n_results: int
     ) -> str:
         raw = json.dumps({
+            "p": palace_path,
             "c": collection,
             "q": query_texts,
             "n": n_results,
@@ -49,12 +68,13 @@ class QueryCache:
 
     def get(
         self,
+        palace_path: str,
         collection: str,
         query_texts: list[str],
         n_results: int,
     ) -> Optional[Any]:
         """Vrátí cached výsledek nebo None pokud cache miss/expired."""
-        key = self._make_key(collection, query_texts, n_results)
+        key = self._make_key(palace_path, collection, query_texts, n_results)
         now = time.monotonic()
 
         with self._lock:
@@ -71,7 +91,8 @@ class QueryCache:
                 return None
 
             # Zkontroluj jestli nebyl write po uložení do cache
-            last_write = self._last_write.get(collection, 0.0)
+            # Use (palace_path, collection) composite key for cross-palace accuracy
+            last_write = self._last_write.get((palace_path, collection), 0.0)
             if last_write > ts:
                 del self._cache[key]
                 self._misses += 1
@@ -84,13 +105,14 @@ class QueryCache:
 
     def set(
         self,
+        palace_path: str,
         collection: str,
         query_texts: list[str],
         n_results: int,
         result: Any,
     ) -> None:
         """Uloží výsledek do cache."""
-        key = self._make_key(collection, query_texts, n_results)
+        key = self._make_key(palace_path, collection, query_texts, n_results)
         now = time.monotonic()
 
         with self._lock:
@@ -101,13 +123,15 @@ class QueryCache:
             while len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
 
-    def invalidate_collection(self, collection: str) -> None:
+    def invalidate_collection(self, palace_path: str, collection: str) -> None:
         """
-        Zaznamenej write event pro collection.
+        Zaznamenej write event pro (palace_path, collection) pár.
         Nezahazuj cache hned – TTL to vyřeší lazily.
+        Cross-palace izolace: jen tento konkrétní palace+collection je označen.
+        Pro hromadnou invalidaci (všechny palace) použij clear().
         """
         with self._lock:
-            self._last_write[collection] = time.monotonic()
+            self._last_write[(palace_path, collection)] = time.monotonic()
 
     def get_value(self, key: str) -> Optional[Any]:
         """Return cached value by key string, or None if missing/expired. Used by search_memories."""

@@ -23,19 +23,14 @@ _search_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp_sear
 _reranker = None
 _reranker_lock = threading.Lock()
 
-# Query cache singleton (lazy, thread-safe)
-_query_cache = None
-_query_cache_lock = threading.Lock()
-
-
 def _get_query_cache():
-    global _query_cache
-    if _query_cache is None:
-        with _query_cache_lock:
-            if _query_cache is None:
-                from .query_cache import QueryCache
-                _query_cache = QueryCache()
-    return _query_cache
+    """Return the canonical query cache singleton.
+
+    Uses the process-global singleton from query_cache.py so that
+    search_memories, fastmcp_server, and lance.py all share the same cache.
+    """
+    from .query_cache import get_query_cache
+    return get_query_cache()
 
 
 def _get_reranker():
@@ -217,7 +212,7 @@ def search_memories(
         priority_lte=priority_lte,
     )
 
-    # Adaptive top_k — prevent ChromaDB exception when n_results > doc count
+    # Adaptive top_k — prevent exception when n_results > doc count
     try:
         actual_count = col.count()
         if actual_count < n_results:
@@ -513,12 +508,13 @@ def _bm25_search(query: str, col, palace_path: str, n_results: int = 10, wing: s
 
 def invalidate_bm25_cache() -> None:
     """Call after any write operation to force BM25 index rebuild on next query."""
-    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
+    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas, _bm25_path_cached
     with _bm25_lock:
         _bm25_index = None
         _bm25_corpus = None
         _bm25_ids = None
         _bm25_metas = None
+        _bm25_path_cached = None
     logger.debug("BM25 cache invalidated")
 
 
@@ -572,7 +568,7 @@ def hybrid_search(
     from datetime import date
     from .config import MempalaceConfig
 
-    # Vrstva 1: ChromaDB semantic search
+    # Vrstva 1: vector similarity search
     chroma = search_memories(
         query=query, palace_path=palace_path, wing=wing, room=room,
         n_results=n_results, is_latest=is_latest, agent_id=agent_id, rerank=rerank
@@ -614,7 +610,7 @@ def hybrid_search(
                                 "source": "kg",
                             })
             except Exception as e:
-                logger.warning("KG layer failed in hybrid_search, ChromaDB only: %s", e)
+                logger.warning("KG layer failed in hybrid_search, vector search only: %s", e)
 
     # Reciprocal Rank Fusion — kombinuje vysledky ze vsech tri vrstev
     merged = _rrf_merge([hits, bm25_hits, kg_hits])[:n_results]
@@ -623,7 +619,7 @@ def hybrid_search(
         "query": query,
         "filters": {"wing": wing, "room": room, "agent_id": agent_id},
         "results": merged,
-        "sources": {"chroma": len(hits), "bm25": len(bm25_hits), "kg": len(kg_hits)},
+        "sources": {"vector": len(hits), "bm25": len(bm25_hits), "kg": len(kg_hits)},
     }
 
 

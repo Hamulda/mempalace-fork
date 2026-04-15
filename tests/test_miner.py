@@ -209,6 +209,45 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         shutil.rmtree(tmpdir)
 
 
+def test_file_already_mined_mtime_tolerance():
+    """Float drift < 1ms (LanceDB JSON precision loss) must not trigger re-mining."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        os.makedirs(palace_path)
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+
+        test_file = os.path.join(tmpdir, "tol.txt")
+        with open(test_file, "w") as f:
+            f.write("tolerance test content")
+
+        mtime = os.path.getmtime(test_file)
+
+        # Store with sub-millisecond float drift (simulates LanceDB JSON precision loss)
+        drifted_mtime = mtime + 0.0005  # 0.5 ms
+        col.add(
+            ids=["d_tol"],
+            documents=["tolerance test content"],
+            metadatas=[{"source_file": test_file, "source_mtime": str(drifted_mtime)}],
+        )
+
+        # Within tolerance → still considered mined
+        assert file_already_mined(col, test_file, check_mtime=True) is True
+
+        # Replace with clearly stale mtime (10 s in past) → needs re-mining
+        col.delete(ids=["d_tol"])
+        col.add(
+            ids=["d_old"],
+            documents=["old content"],
+            metadatas=[{"source_file": test_file, "source_mtime": str(mtime - 10)}],
+        )
+        assert file_already_mined(col, test_file, check_mtime=True) is False
+    finally:
+        del col, client
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_file_already_mined_check_mtime():
     tmpdir = tempfile.mkdtemp()
     try:

@@ -54,7 +54,9 @@ def file_already_mined(collection, source_file: str, check_mtime: bool = False) 
             if stored_mtime is None:
                 return False
             current_mtime = os.path.getmtime(source_file)
-            return float(stored_mtime) == current_mtime
+            # Use 1ms tolerance to absorb float precision loss in LanceDB JSON storage
+            # (real modifications differ by ≥1 s; float drift is < 0.001 s)
+            return abs(float(stored_mtime) - current_mtime) < 1e-3
         return True
     except Exception:
         return False
