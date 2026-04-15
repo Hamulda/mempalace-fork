@@ -44,7 +44,7 @@ def build_graph(col=None, config=None):
         return {}, []
 
     total = col.count()
-    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
 
     offset = 0
     while offset < total:
@@ -52,14 +52,11 @@ def build_graph(col=None, config=None):
         for meta in batch["metadatas"]:
             room = meta.get("room", "")
             wing = meta.get("wing", "")
-            hall = meta.get("hall", "")
-            date = meta.get("date", "")
+            hall = meta.get("hall", "")  # hall not written by canonical writers; may be absent
             if room and room != "general" and wing:
                 room_data[room]["wings"].add(wing)
                 if hall:
                     room_data[room]["halls"].add(hall)
-                if date:
-                    room_data[room]["dates"].add(date)
                 room_data[room]["count"] += 1
         if not batch["ids"]:
             break
@@ -90,7 +87,6 @@ def build_graph(col=None, config=None):
             "wings": sorted(data["wings"]),
             "halls": sorted(data["halls"]),
             "count": data["count"],
-            "dates": sorted(data["dates"])[-5:] if data["dates"] else [],
         }
 
     return nodes, edges
@@ -182,7 +178,6 @@ def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
                 "wings": wings,
                 "halls": data["halls"],
                 "count": data["count"],
-                "recent": data["dates"][-1] if data["dates"] else "",
             }
         )
 

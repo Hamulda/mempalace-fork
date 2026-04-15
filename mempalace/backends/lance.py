@@ -579,6 +579,33 @@ def _create_lance_table(db, collection_name: str) -> "lancedb.table.Table":
 
 # ── Where-filter translation ──────────────────────────────────────────────────
 
+def _sql_val(v: Any) -> str:
+    if isinstance(v, str):
+        escaped = v.replace("'", "''")
+        return f"'{escaped}'"
+    if v is None:
+        return "NULL"
+    return str(v)
+
+
+def _json_col(col: str) -> str:
+    """Cast metadata_json to VARBINARY for LanceDB 4.x json_extract compatibility."""
+    return f"CAST({col} AS VARBINARY)"
+
+
+def _json_eq(k: str, v: Any) -> str:
+    return f"json_extract({_json_col('metadata_json')}, '$.{k}') = {_sql_val(v)}"
+
+
+def _json_in(k: str, v: List[Any]) -> str:
+    vals = ", ".join(_sql_val(x) for x in v)
+    return f"json_extract({_json_col('metadata_json')}, '$.{k}') IN ({vals})"
+
+
+def _json_cmp(k: str, op_: str, v: Any) -> str:
+    return f"json_extract({_json_col('metadata_json')}, '$.{k}') {op_} {_sql_val(v)}"
+
+
 def _where_to_sql(where: Optional[Dict[str, Any]]) -> Optional[str]:
     """
     Convert ChromaDB-style where dict to SQL WHERE clause.
@@ -594,6 +621,11 @@ def _where_to_sql(where: Optional[Dict[str, Any]]) -> Optional[str]:
         {"key": {"$lte": 5}}                      → key <= 5
         {"$and": [{"key1": {"$eq": "a"}}, ...]}   → key1 = 'a' AND ...
         {"$or": [{"key1": {"$eq": "a"}}, ...]}    → key1 = 'a' OR ...
+
+    Scalar syntax (metadata equality, NOT id filter):
+        {"wing": "x"}                             → metadata_json.wing = 'x'
+        {"room": "y"}                            → metadata_json.room = 'y'
+        {"wing": "x", "room": "y"}               → wing='x' AND room='y'
     """
     if not where:
         return None
@@ -608,75 +640,73 @@ def _where_to_sql(where: Optional[Dict[str, Any]]) -> Optional[str]:
         parts = [p for p in parts if p]
         return "(" + " OR ".join(parts) + ")" if parts else None
 
+    parts = []
     for key, cond in where.items():
+        # Scalar value — metadata equality, NOT id filter
         if not isinstance(cond, dict):
-            val = str(cond).replace("'", "''")
-            return f"id = '{val}'"
+            parts.append(_json_eq(key, cond))
+            continue
 
         op = list(cond.keys())[0]
         val = cond[op]
 
-        def _sql_val(v: Any) -> str:
-            if isinstance(v, str):
-                escaped = v.replace("'", "''")
-                return f"'{escaped}'"
-            if v is None:
-                return "NULL"
-            return str(v)
-
-        def _json_col(col: str) -> str:
-            """Cast metadata_json to VARBINARY for LanceDB 4.x json_extract compatibility."""
-            return f"CAST({col} AS VARBINARY)"
-
-        def _json_eq(k: str, v: Any) -> str:
-            return f"json_extract({_json_col('metadata_json')}, '$.{k}') = {_sql_val(v)}"
-
-        def _json_in(k: str, v: List[Any]) -> str:
-            vals = ", ".join(_sql_val(x) for x in v)
-            return f"json_extract({_json_col('metadata_json')}, '$.{k}') IN ({vals})"
-
-        def _json_cmp(k: str, op_: str, v: Any) -> str:
-            return f"json_extract({_json_col('metadata_json')}, '$.{k}') {op_} {_sql_val(v)}"
-
         if op == "$eq":
-            return _json_eq(key, val)
-        if op == "$ne":
-            return f"NOT {_json_eq(key, val)}"
-        if op == "$in":
-            return _json_in(key, val)
-        if op == "$nin":
-            return f"NOT {_json_in(key, val)}"
-        if op == "$gt":
-            return _json_cmp(key, ">", val)
-        if op == "$gte":
-            return _json_cmp(key, ">=", val)
-        if op == "$lt":
-            return _json_cmp(key, "<", val)
-        if op == "$lte":
-            return _json_cmp(key, "<=", val)
+            parts.append(_json_eq(key, val))
+        elif op == "$ne":
+            parts.append(f"NOT {_json_eq(key, val)}")
+        elif op == "$in":
+            parts.append(_json_in(key, val))
+        elif op == "$nin":
+            parts.append(f"NOT {_json_in(key, val)}")
+        elif op == "$gt":
+            parts.append(_json_cmp(key, ">", val))
+        elif op == "$gte":
+            parts.append(_json_cmp(key, ">=", val))
+        elif op == "$lt":
+            parts.append(_json_cmp(key, "<", val))
+        elif op == "$lte":
+            parts.append(_json_cmp(key, "<=", val))
 
-    return None
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " AND ".join(parts) + ")"
+
+
+def _meta_val(row: "pandas.Series", key: str) -> Any:
+    """Extract metadata field value from a DataFrame row."""
+    try:
+        m = json.loads(row.get("metadata_json") or "{}")
+        return m.get(key)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]]) -> "pandas.DataFrame":
-    """Apply a ChromaDB-style where filter to a pandas DataFrame."""
+    """Apply a ChromaDB-style where filter to a pandas DataFrame.
+
+    Handles:
+      - Scalar metadata equality: {"wing": "x"} → metadata.wing == 'x'
+      - Explicit operators: {"wing": {"$eq": "x"}} → same
+      - $and / $or logical combinators
+      - id filter: {"id": "..."} or {"id": {"$eq": "..."}}
+    """
     if not where:
         return df
 
-    flat_conditions = {}
-    meta_conditions = []
+    if "$and" in where:
+        for sub in where["$and"]:
+            df = _apply_where_filter(df, sub)
+        return df
+
+    if "$or" in where:
+        mask = pandas.Series([False] * len(df), index=df.index)
+        for sub in where["$or"]:
+            mask = mask | _apply_where_filter(df, sub)["id"].isin(df["id"])
+        return df[mask]
 
     for key, cond in where.items():
-        if key in ("$and", "$or"):
-            continue
-        if key == "id":
-            flat_conditions[key] = cond
-        elif not isinstance(cond, dict):
-            flat_conditions[key] = cond
-        else:
-            meta_conditions.append((key, cond))
-
-    for key, cond in flat_conditions.items():
         if key == "id":
             if isinstance(cond, dict):
                 op = list(cond.keys())[0]
@@ -687,34 +717,28 @@ def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]])
                     df = df[df["id"].isin(val)]
             else:
                 df = df[df["id"] == cond]
-
-    for key, cond in meta_conditions:
-        op = list(cond.keys())[0]
-        val = cond[op]
-
-        def _meta_val(row: Dict[str, Any]) -> Any:
-            try:
-                m = json.loads(row.get("metadata_json") or "{}")
-                return m.get(key)
-            except (json.JSONDecodeError, TypeError):
-                return None
-
-        if op == "$eq":
-            df = df[df.apply(lambda r: _meta_val(r) == val, axis=1)]
-        elif op == "$ne":
-            df = df[df.apply(lambda r: _meta_val(r) != val, axis=1)]
-        elif op == "$in":
-            df = df[df.apply(lambda r: _meta_val(r) in val, axis=1)]
-        elif op == "$nin":
-            df = df[df.apply(lambda r: _meta_val(r) not in val, axis=1)]
-        elif op == "$gt":
-            df = df[df.apply(lambda r: _meta_val(r) is not None and _meta_val(r) > val, axis=1)]
-        elif op == "$gte":
-            df = df[df.apply(lambda r: _meta_val(r) is not None and _meta_val(r) >= val, axis=1)]
-        elif op == "$lt":
-            df = df[df.apply(lambda r: _meta_val(r) is not None and _meta_val(r) < val, axis=1)]
-        elif op == "$lte":
-            df = df[df.apply(lambda r: _meta_val(r) is not None and _meta_val(r) <= val, axis=1)]
+        elif isinstance(cond, dict):
+            op = list(cond.keys())[0]
+            val = cond[op]
+            if op == "$eq":
+                df = df[df.apply(lambda r: _meta_val(r, key) == val, axis=1)]
+            elif op == "$ne":
+                df = df[df.apply(lambda r: _meta_val(r, key) != val, axis=1)]
+            elif op == "$in":
+                df = df[df.apply(lambda r: _meta_val(r, key) in val, axis=1)]
+            elif op == "$nin":
+                df = df[df.apply(lambda r: _meta_val(r, key) not in val, axis=1)]
+            elif op == "$gt":
+                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) > val, axis=1)]
+            elif op == "$gte":
+                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) >= val, axis=1)]
+            elif op == "$lt":
+                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) < val, axis=1)]
+            elif op == "$lte":
+                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) <= val, axis=1)]
+        else:
+            # Scalar metadata equality: {"wing": "x"} → metadata.wing == 'x'
+            df = df[df.apply(lambda r: _meta_val(r, key) == cond, axis=1)]
 
     return df
 
@@ -1186,6 +1210,7 @@ class LanceCollection(BaseCollection):
         ids: Optional[List[str]] = None,
         where: Optional[Dict[str, Any]] = None,
         limit: Optional[int] = None,
+        offset: Optional[int] = None,
         include: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, List[Any]]:
@@ -1205,25 +1230,25 @@ class LanceCollection(BaseCollection):
                         .to_pandas()
                     )
             elif where:
-                # Use SQL WHERE for filtering — but also enforce a hard limit
-                # to prevent full-table materialization when no limit is specified.
-                # 5000 is a safe default that fits comfortably in 8GB RAM.
+                # LanceDB's json_extract SQL function cannot operate on the UTF-8
+                # metadata_json string column (requires LargeBinary). Fall back to
+                # pandas filtering for metadata conditions.
                 effective_limit = min(limit or 5000, 5000)
-                sql_filter = _where_to_sql(where)
-                if sql_filter:
-                    results = (
-                        self._table.search()
-                        .where(sql_filter, prefilter=True)
-                        .limit(effective_limit)
-                        .to_pandas()
-                    )
-                else:
-                    results = self._table.search().limit(effective_limit).to_pandas()
+                search = self._table.search()
+                if offset is not None and offset > 0:
+                    search = search.offset(offset)
+                results = search.limit(effective_limit).to_pandas()
+                # Apply metadata filter via pandas (safe — works on JSON strings)
+                if not results.empty:
+                    results = _apply_where_filter(results, where)
             else:
                 # No filter — enforce hard limit to prevent full-table RAM spike.
                 # 5000 is a safe default that fits comfortably in 8GB RAM.
                 effective_limit = min(limit or 5000, 5000)
-                results = self._table.search().limit(effective_limit).to_pandas()
+                search = self._table.search()
+                if offset is not None and offset > 0:
+                    search = search.offset(offset)
+                results = search.limit(effective_limit).to_pandas()
         except Exception:
             return {"ids": [], "documents": [], "metadatas": []}
 
@@ -1259,26 +1284,38 @@ class LanceCollection(BaseCollection):
 
             self._write_with_retry(do_delete)
         elif where:
-            # Use SQL WHERE for deletion — avoids full table materialization.
-            sql_filter = _where_to_sql(where)
-            if sql_filter:
-                # First check how many rows match to avoid unbounded delete
-                try:
-                    count_match = (
+            # LanceDB's json_extract SQL cannot filter UTF-8 metadata_json strings.
+            # Use pandas to find matching ids, then delete them one by one.
+            try:
+                batch_size = 500
+                offset = 0
+                while True:
+                    # Pull a batch — LanceDB's limit works fine for pagination
+                    all_batch = (
                         self._table.search()
-                        .where(sql_filter, prefilter=True)
-                        .limit(1000)
+                        .limit(batch_size)
+                        .offset(offset)
                         .to_pandas()
                     )
-                    if count_match.empty:
-                        return
-                    matching_ids = count_match["id"].tolist()
+                    if all_batch.empty:
+                        break
+                    # Filter to matching rows via pandas (handles JSON metadata)
+                    match_batch = _apply_where_filter(all_batch, where)
+                    if match_batch.empty:
+                        if len(all_batch) < batch_size:
+                            break
+                        offset += batch_size
+                        continue
+                    matching_ids = match_batch["id"].tolist()
                     for mid in matching_ids:
                         self._write_with_retry(
                             lambda i=mid: self._table.delete(f"id = '{i}'")
                         )
-                except Exception:
-                    pass  # If we can't check, skip delete rather than risk RAM spike
+                    if len(all_batch) < batch_size:
+                        break
+                    offset += batch_size
+            except Exception:
+                pass  # If we can't check, skip delete rather than risk RAM spike
 
     def count(self) -> int:
         try:

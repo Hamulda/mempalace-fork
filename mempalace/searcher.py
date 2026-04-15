@@ -182,11 +182,16 @@ def search_memories(
     if not query:
         return {"query": "", "filters": {}, "results": [], "error": "Query was empty after sanitization"}
 
-    # Cache lookup before backend call
     try:
-        import time
+        cfg = MempalaceConfig()
+    except Exception as e:
+        logger.error("Failed to load config: %s", e)
+        return {"error": "Config unavailable"}
+
+    # Cache lookup before backend call — key includes palace_path + collection_name
+    try:
         cache = _get_query_cache()
-        cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
+        cache_key = f"{palace_path}|{cfg.collection_name}|{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
         cached_result = cache.get_value(cache_key)
         if cached_result is not None:
             return cached_result
@@ -194,7 +199,6 @@ def search_memories(
         pass
 
     try:
-        cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
         col = backend.get_collection(palace_path, cfg.collection_name, create=False)
     except Exception as e:
@@ -281,7 +285,7 @@ def search_memories(
     if "error" not in result_dict:
         try:
             cache = _get_query_cache()
-            cache_key = f"{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
+            cache_key = f"{palace_path}|{cfg.collection_name}|{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
             cache.set_value(cache_key, result_dict)
         except Exception:
             pass

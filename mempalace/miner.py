@@ -443,21 +443,47 @@ def process_file(
         print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
         return len(chunks), room
 
-    drawers_added = 0
-    for chunk in chunks:
-        added = add_drawer(
-            collection=collection,
-            wing=wing,
-            room=room,
-            content=chunk["content"],
-            source_file=source_file,
-            chunk_index=chunk["chunk_index"],
-            agent=agent,
-        )
-        if added:
-            drawers_added += 1
+    # Batch: collect all drawer data then fire one upsert per file.
+    documents, ids, metadatas = [], [], []
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    try:
+        source_mtime = os.path.getmtime(source_file)
+    except OSError:
+        source_mtime = None
 
-    return drawers_added, room
+    for chunk in chunks:
+        drawer_id = (
+            f"drawer_{wing}_{room}_"
+            f"{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+        )
+        metadata = {
+            "wing": wing,
+            "room": room,
+            "source_file": source_file,
+            "chunk_index": chunk["chunk_index"],
+            "added_by": agent,
+            "agent_id": agent,
+            "timestamp": timestamp,
+            "origin_type": "observation",
+            "is_latest": True,
+            "supersedes_id": "",
+        }
+        if source_mtime is not None:
+            metadata["source_mtime"] = source_mtime
+
+        documents.append(chunk["content"])
+        ids.append(drawer_id)
+        metadatas.append(metadata)
+
+    try:
+        collection.upsert(
+            documents=documents,
+            ids=ids,
+            metadatas=metadatas,
+        )
+        return len(documents), room
+    except Exception:
+        raise
 
 
 # =============================================================================

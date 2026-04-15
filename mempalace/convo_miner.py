@@ -333,38 +333,43 @@ def mine_convos(
         if extract_mode != "general":
             room_counts[room] += 1
 
-        # File each chunk
-        drawers_added = 0
+        # Batch: collect all drawer data then fire one upsert per file.
+        documents, ids, metadatas = [], [], []
+        timestamp = datetime.utcnow().isoformat() + "Z"
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts[chunk_room] += 1
             drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-            try:
-                collection.add(
-                    documents=[chunk["content"]],
-                    ids=[drawer_id],
-                    metadatas=[
-                        {
-                            "wing": wing,
-                            "room": chunk_room,
-                            "source_file": source_file,
-                            "chunk_index": chunk["chunk_index"],
-                            "added_by": agent,
-                            "agent_id": agent,
-                            "timestamp": datetime.utcnow().isoformat() + "Z",
-                            "origin_type": "convo",
-                            "is_latest": True,
-                            "supersedes_id": "",
-                            "ingest_mode": "convos",
-                            "extract_mode": extract_mode,
-                        }
-                    ],
-                )
-                drawers_added += 1
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    raise
+            metadata = {
+                "wing": wing,
+                "room": chunk_room,
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "agent_id": agent,
+                "timestamp": timestamp,
+                "origin_type": "convo",
+                "is_latest": True,
+                "supersedes_id": "",
+                "ingest_mode": "convos",
+                "extract_mode": extract_mode,
+            }
+            documents.append(chunk["content"])
+            ids.append(drawer_id)
+            metadatas.append(metadata)
+
+        drawers_added = 0
+        try:
+            collection.upsert(
+                documents=documents,
+                ids=ids,
+                metadatas=metadatas,
+            )
+            drawers_added = len(documents)
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                raise
 
         total_drawers += drawers_added
         print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")

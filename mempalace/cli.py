@@ -28,6 +28,7 @@ Examples:
 """
 
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -230,9 +231,9 @@ def cmd_status(args):
     print()
     print(f"Memory: {used_pct:.0f}% used ({used_gib:.1f}GB / {total_gib:.0f}GB) {icon} {pressure.value.upper()}")
 
-    # psutil uses 'swapped' (bytes) not 'swap' — fix wrong attribute/missing units
-    swap_bytes = getattr(vm, 'swapped', 0)
-    swap_mb = swap_bytes / (1024**2)
+    # psutil: vm.swapped doesn't exist — use swap_memory() (sin=swap-in bytes, sout=swap-out bytes)
+    swap = psutil.swap_memory()
+    swap_mb = (swap.sin + swap.sout) / (1024**2)
     print(f"Swap: {swap_mb:.1f} MB")
 
     # ── Embedding Daemon ────────────────────────────────────────────────
@@ -435,10 +436,14 @@ def cmd_embed_daemon(args):
             deadline = time.monotonic() + 30
             ready = False
             while time.monotonic() < deadline:
-                line = proc.stdout.readline().decode("utf-8", errors="ignore").strip()
-                if line == "READY":
-                    ready = True
-                    break
+                # use select so the readline loop cannot hang indefinitely
+                # if the daemon emits nothing (pipe fills up and blocks writes)
+                rready, _, _ = select.select([proc.stdout], [], [], 0.5)
+                if rready:
+                    line = proc.stdout.readline().decode("utf-8", errors="ignore").strip()
+                    if line == "READY":
+                        ready = True
+                        break
                 if proc.poll() is not None:
                     err = proc.stderr.read().decode("utf-8", errors="ignore")
                     print(f"Failed to start daemon: {err}")
@@ -582,10 +587,16 @@ def cmd_cleanup(args):
                 if not args.dry_run:
                     col.delete(ids=to_delete_batch)
                 deleted += len(to_delete_batch)
+                # advance offset only by the number of DELETED items so the next
+                # batch starts after the surviving records that followed them;
+                # using a fixed BATCH here would cause later batches to be re-read
+                # at the wrong position after deletions shift indices
+                offset += len(to_delete_batch)
+            else:
+                offset += BATCH
 
             if len(batch_ids) < BATCH:
                 break
-            offset += BATCH
 
         print(f"Cleanup: {deleted} drawers eligible for deletion")
     except Exception as e:

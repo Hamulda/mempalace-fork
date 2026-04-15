@@ -18,6 +18,7 @@ import json
 import logging
 import hashlib
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,15 @@ logger = logging.getLogger("mempalace_mcp")
 
 # WAL async executor — offloads file I/O from async tool handlers
 _wal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mp_wal")
+
+# Background work executor — bounded, prevents thread storm on M1/8GB
+# max_workers=2: one for general_extractor, one for BM25 rebuild
+_bg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mp_bg")
+
+# BM25 rebuild coalescing — dedup rebuild requests within a time window
+_bm25_pending_event: threading.Event = threading.Event()
+_bm25_pending_event.set()  # initially not pending
+_BM25_COALESCE_MS = 500  # debounce window
 
 # Status cache — wings/rooms aggregation cached for 60s
 _status_cache: dict = {"data": None, "ts": 0.0}
@@ -736,12 +746,7 @@ def _register_tools(server, backend, config, settings):
             except (ImportError, Exception) as e:
                 logger.debug("general_extractor skipped: %s", e)
 
-        threading.Thread(
-            target=_extract_general_facts,
-            args=(content, drawer_id),
-            daemon=True,
-            name=f"gen_extract_{drawer_id[:12]}"
-        ).start()
+        _bg_executor.submit(_extract_general_facts, content, drawer_id)
 
         try:
             col.upsert(
@@ -767,18 +772,30 @@ def _register_tools(server, backend, config, settings):
             invalidate_all_caches()
             _invalidate_status_cache()
 
-            # KROK 4: Background BM25 warmup after write
-            def _rebuild_bm25_bg():
-                try:
-                    from .backends import get_backend
-                    backend2 = get_backend(settings.db_backend)
-                    col2 = backend2.get_collection(settings.db_path, settings.collection_name, create=False)
-                    # _get_bm25 is imported via searcher module
-                    from .searcher import _get_bm25
-                    _get_bm25(col2)
-                except Exception:
-                    pass
-            threading.Thread(target=_rebuild_bm25_bg, daemon=True, name="bm25_rebuild").start()
+            # KROK 4: Coalesced BM25 rebuild — debounce window prevents thread-per-write storm
+            def _schedule_bm25_rebuild():
+                if _bm25_pending_event.is_set():
+                    # Not currently pending — arm debounce timer
+                    _bm25_pending_event.clear()
+
+                    def _debounced_rebuild():
+                        try:
+                            from .backends import get_backend
+                            backend2 = get_backend(settings.db_backend)
+                            col2 = backend2.get_collection(settings.db_path, settings.collection_name, create=False)
+                            from .searcher import _get_bm25
+                            _get_bm25(col2, settings.db_path)
+                        except Exception:
+                            pass
+                        finally:
+                            _bm25_pending_event.set()  # allow next debounce window
+
+                    def _defer():
+                        time.sleep(_BM25_COALESCE_MS / 1000.0)
+                        _bg_executor.submit(_debounced_rebuild)
+
+                    threading.Thread(target=_defer, daemon=True, name="bm25_debounce").start()
+                # else: rebuild already pending within window — skip, next write re-arms
 
             return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
         except Exception as e:
@@ -1237,7 +1254,7 @@ def serve_http(host: str = "127.0.0.1", port: int = 8765, server: FastMCP | None
         sys.exit(1)
 
     if server is None:
-        server = mcp
+        server = create_server()
 
     async def http_handle(request: Request) -> Response:
         content_type = request.headers.get("content-type", "")

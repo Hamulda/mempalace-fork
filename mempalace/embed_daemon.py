@@ -18,12 +18,15 @@ import os
 import signal
 import socket
 import sys
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List
 
 logger = logging.getLogger(__name__)
+
+# Bounded worker pool — prevents thread-per-connection storm on M1/8GB
+_bg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed_client")
 
 SOCKET_PATH = os.path.expanduser("~/.mempalace/embed.sock")
 PID_PATH = os.path.expanduser("~/.mempalace/embed.pid")
@@ -245,12 +248,12 @@ def run_daemon() -> None:
     try:
         while True:
             conn, _ = server.accept()
-            t = threading.Thread(target=_handle_client, args=(conn, model), daemon=True)
-            t.start()
+            _bg_executor.submit(_handle_client, conn, model)
     except KeyboardInterrupt:
         pass
     finally:
         server.close()
+        _bg_executor.shutdown(wait=True)
         try:
             os.unlink(sock_path)
         except FileNotFoundError:

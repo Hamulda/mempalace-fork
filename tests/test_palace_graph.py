@@ -104,7 +104,8 @@ class TestBuildGraph:
         nodes, edges = build_graph(col=col)
         assert "orphan" not in nodes
 
-    def test_dates_capped_at_five(self):
+    def test_dates_not_in_nodes(self):
+        """dates field was removed — canonical metadata contract has no date per room."""
         col = _make_fake_collection(
             [
                 {"room": "busy", "wing": "w", "hall": "h", "date": f"2026-01-{i:02d}"}
@@ -112,7 +113,7 @@ class TestBuildGraph:
             ]
         )
         nodes, _ = build_graph(col=col)
-        assert len(nodes["busy"]["dates"]) <= 5
+        assert "dates" not in nodes["busy"]
 
 
 # --- traverse ---
