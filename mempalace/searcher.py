@@ -568,12 +568,12 @@ def hybrid_search(
     from datetime import date
     from .config import MempalaceConfig
 
-    # Vrstva 1: vector similarity search
-    chroma = search_memories(
+    # Layer 1: vector similarity search
+    results = search_memories(
         query=query, palace_path=palace_path, wing=wing, room=room,
         n_results=n_results, is_latest=is_latest, agent_id=agent_id, rerank=rerank
     )
-    hits = chroma.get("results", [])
+    hits = results.get("results", [])
 
     # Vrstva 1b: BM25 keyword search (zachycuji presne vyrazy, verze, identifikatory)
     bm25_hits = []

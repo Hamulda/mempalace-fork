@@ -1,5 +1,5 @@
 """
-query_sanitizer.py — Sanitize semantic search queries before hitting ChromaDB.
+query_sanitizer.py — Sanitize semantic search queries before hitting the palace.
 
 Goals:
   - Strip null bytes and control characters

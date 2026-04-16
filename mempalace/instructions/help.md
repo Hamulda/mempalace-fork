@@ -94,7 +94,7 @@ Hooks read JSON from stdin and output JSON to stdout. They can be invoked via:
     Halls connect rooms within a wing.
     Tunnels connect rooms across wings.
 
-The palace is stored locally using ChromaDB for vector search and SQLite for
+The palace is stored locally using LanceDB for vector search and SQLite for
 metadata. No cloud services or API keys required.
 
 ---

@@ -52,7 +52,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ## New in this fork
 
-- **mempalace_hybrid_search** — combines semantic (ChromaDB) + keyword (BM25) + KG in one call
+- **mempalace_hybrid_search** — combines semantic (LanceDB) + keyword (BM25) + KG in one call
 - **mempalace_kg_supersede** — atomically replace a fact (invalidate old, add new)
 - **mempalace_kg_history** — audit trail for any fact (all versions over time)
 - **mempalace_eval** — evaluate retrieval quality: hit rates, avg similarity, wing precision

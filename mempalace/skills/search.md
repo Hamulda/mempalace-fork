@@ -23,7 +23,7 @@ If MCP tools are available, use them in this priority order:
 - mempalace_search(query, wing, room, rerank, is_latest, agent_id) -- Fast semantic search.
   Use for keyword/topic search. rerank=True for better precision on complex queries.
 - mempalace_hybrid_search(query, wing, room, use_kg, rerank) -- Hybrid search combining
-  semantic (ChromaDB) + knowledge graph entity matches. Use this as the DEFAULT search
+  semantic (LanceDB) + knowledge graph entity matches. Use this as the DEFAULT search
   tool when the user asks about people, projects, or factual relationships. Prefer over
   mempalace_search when context is rich or query involves entities.
   Parameters: use_kg=True (include KG triples), rerank=True (cross-encoder reranking,
