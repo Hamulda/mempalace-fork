@@ -124,6 +124,10 @@ def _start_daemon_if_needed() -> bool:
 
             if not ready:
                 logger.warning("Embedding daemon startup timeout after %ss", _SOCK_TIMEOUT)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
                 return False
 
             if _daemon_is_running():
@@ -688,6 +692,23 @@ def _meta_val(row: "pandas.Series", key: str) -> Any:
         return None
 
 
+def _parse_metadata(df: "pandas.DataFrame") -> "pandas.DataFrame":
+    """Parse metadata_json column once and cache parsed dicts as a column.
+
+    Mutates df in-place by adding a _meta parsed column.
+    Safe to call on any DataFrame — drops _meta if already present.
+    """
+    if "_meta" in df.columns:
+        return df
+    def _parse_one(val):
+        try:
+            return json.loads(val) if val else {}
+        except Exception:
+            return {}
+    df["_meta"] = df["metadata_json"].apply(_parse_one)
+    return df
+
+
 def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]]) -> "pandas.DataFrame":
     """Apply a ChromaDB-style where filter to a pandas DataFrame.
 
@@ -811,6 +832,7 @@ class LanceCollection(BaseCollection):
     """
 
     BATCH_SIZE = 500  # Records per add/upsert batch
+    _DELETE_MAX_SCAN = 50000  # hard cap on delete(where=...) scan
 
     def __init__(
         self,
@@ -1238,14 +1260,51 @@ class LanceCollection(BaseCollection):
                 # LanceDB's json_extract SQL function cannot operate on the UTF-8
                 # metadata_json string column (requires LargeBinary). Fall back to
                 # pandas filtering for metadata conditions.
+                #
+                # IMPORTANT: offset must apply to the FILTERED result set, not the
+                # raw table. LanceDB does not support server-side offset with pandas
+                # post-filtering, so we scan raw pages and accumulate filtered matches
+                # until we have offset+limit rows. This is memory-safe because we only
+                # hold one raw page (effective_limit rows) in RAM at a time.
                 effective_limit = min(limit or 5000, 5000)
-                search = self._table.search()
-                if offset is not None and offset > 0:
-                    search = search.offset(offset)
-                results = search.limit(effective_limit).to_pandas()
-                # Apply metadata filter via pandas (safe — works on JSON strings)
-                if not results.empty:
-                    results = _apply_where_filter(results, where)
+                target_offset = offset or 0
+                # How many filtered rows to collect before we can slice the result.
+                # We need up to (target_offset + effective_limit) filtered rows.
+                rows_to_collect = target_offset + effective_limit
+
+                all_filtered: list[dict] = []
+                page_start = 0
+                MAX_SCAN = 100_000  # hard cap per call to prevent unbounded scan
+
+                while len(all_filtered) < rows_to_collect and page_start < MAX_SCAN:
+                    page = (
+                        self._table.search()
+                        .limit(effective_limit)
+                        .offset(page_start)
+                        .to_pandas()
+                    )
+                    if page.empty:
+                        break
+                    filtered = _apply_where_filter(page, where)
+                    if not filtered.empty:
+                        for _, row in filtered.iterrows():
+                            all_filtered.append({
+                                "id": row["id"],
+                                "document": row["document"],
+                                "metadata_json": row["metadata_json"],
+                            })
+                    page_start += effective_limit
+
+                if page_start >= MAX_SCAN and len(all_filtered) < rows_to_collect:
+                    logger.warning(
+                        "get(where=...) hit MAX_SCAN=%d ceiling — "
+                        "result may be incomplete. Consider a more selective filter.",
+                        MAX_SCAN,
+                    )
+
+                # Slice to the requested offset+limit window
+                window = all_filtered[target_offset:target_offset + effective_limit]
+                results = pandas.DataFrame(window) if window else pandas.DataFrame()
             else:
                 # No filter — enforce hard limit to prevent full-table RAM spike.
                 # 5000 is a safe default that fits comfortably in 8GB RAM.
@@ -1294,12 +1353,12 @@ class LanceCollection(BaseCollection):
             # Offset-based pagination is NOT safe here because deleting shifts row positions.
             try:
                 batch_size = 500
-                MAX_SCAN = 50000  # hard cap to prevent unbounded scan
+                MAX_SCAN = self._DELETE_MAX_SCAN  # class-level configurable cap
                 matching_ids = []
+                total_scanned = 0
 
-                # Scan in fixed-size pages from offset 0 until table is exhausted
                 page_start = 0
-                while len(matching_ids) < MAX_SCAN:
+                while True:
                     page = (
                         self._table.search()
                         .limit(batch_size)
@@ -1307,12 +1366,28 @@ class LanceCollection(BaseCollection):
                         .to_pandas()
                     )
                     if page.empty:
+                        # Table exhausted. If we found fewer than MAX_SCAN matching rows,
+                        # the data is too sparse to confirm we have ALL matches —
+                        # raise instead of silently deleting a partial set.
+                        if len(matching_ids) < MAX_SCAN:
+                            matching_ids.clear()
+                            raise RuntimeError(
+                                f"delete(where=...) scanned {total_scanned} raw rows "
+                                f"but found only {len(matching_ids)} matches — table is too sparse "
+                                f"to confirm completeness within MAX_SCAN={MAX_SCAN}. "
+                                "Use a more selective filter or delete by id."
+                            )
                         break
+                    total_scanned += len(page)
                     filtered = _apply_where_filter(page, where)
                     if not filtered.empty:
                         matching_ids.extend(filtered["id"].tolist())
-                    # Advance even if empty — table may have grown or rows shifted
+                    if len(matching_ids) >= MAX_SCAN:
+                        break
                     page_start += batch_size
+
+                if not matching_ids:
+                    return
 
                 # Delete matching ids in batches (single-id deletes preserve MVCC safety)
                 for i in range(0, len(matching_ids), batch_size):
@@ -1320,8 +1395,16 @@ class LanceCollection(BaseCollection):
                         self._write_with_retry(
                             lambda i=mid: self._table.delete(f"id = '{i}'")
                         )
-            except Exception:
-                pass  # If we can't scan, skip delete rather than risk RAM spike
+            except RuntimeError:
+                raise  # re-raise our own RuntimeError
+            except Exception as e:
+                logger.warning("delete(where=...) skipped due to scan error: %s", e)
+                return
+                raise RuntimeError(
+                    f"delete(where=...) hit MAX_SCAN={MAX_SCAN} ceiling — "
+                    f"{len(matching_ids)} matching ids would be deleted but more rows exist. "
+                    "Use a more selective filter or delete by id to avoid data loss."
+                )
 
     def count(self) -> int:
         try:

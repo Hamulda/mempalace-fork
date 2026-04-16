@@ -452,7 +452,11 @@ def cmd_embed_daemon(args):
             if ready:
                 print(f"Embedding daemon started at {sock_path}")
             else:
-                print("Daemon did not emit READY within 30s — check process")
+                print("Daemon did not emit READY within 30s — killing child process")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
         except Exception as e:
             print(f"Error starting daemon: {e}")
@@ -990,7 +994,7 @@ def main():
 
     # compress
     p_compress = sub.add_parser(
-        "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
+        "compress", help="Compress drawers using AAAK Dialect (experimental, lossy)"
     )
     p_compress.add_argument("--wing", default=None, help="Wing to compress (default: all wings)")
     p_compress.add_argument(
@@ -1001,7 +1005,7 @@ def main():
     )
 
     # wake-up
-    p_wakeup = sub.add_parser("wake-up", help="Show L0 + L1 wake-up context (~600-900 tokens)")
+    p_wakeup = sub.add_parser("wake-up", help="Show L0 + L1 wake-up context (~170 tokens)")
     p_wakeup.add_argument("--wing", default=None, help="Wake-up for a specific project/wing")
 
     # split

@@ -109,3 +109,28 @@ class TestMemoryPressure:
 
                 assert pressure == MemoryPressure.WARN
                 assert ratio == 0.85
+
+    def test_get_blocks_until_first_measurement(self):
+        """
+        get() vrací až po prvním reálném měření — ne implicitní NOMINAL.
+        Tento test opravuje startup blind spot kde druhý thread mohl dostat
+        instanci s _pressure=NOMINAL před _monitor_loop nastavil _started.
+        """
+        # Reset singleton — začínáme s čistým stavem
+        MemoryGuard._instance = None
+        MemoryGuard._started.clear()
+
+        with mock.patch(
+            "mempalace.memory_guard._get_memory_pressure_macos",
+            return_value=(MemoryPressure.WARN, 0.75),
+        ):
+            guard = MemoryGuard.get()
+            # Po return z get() musí být known state (ne implicitní NOMINAL)
+            assert guard.pressure == MemoryPressure.WARN
+            assert guard.used_ratio == 0.75
+            # _started musí být set — další volání get() neblokuje
+            assert MemoryGuard._started.is_set()
+
+        # Úklid — obnov singleton pro ostatní testy
+        MemoryGuard._instance = None
+        MemoryGuard._started.clear()

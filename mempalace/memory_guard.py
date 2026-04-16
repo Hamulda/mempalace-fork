@@ -87,6 +87,9 @@ class MemoryGuard:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = cls()
+            # Hold the lock until first measurement completes so callers
+            # always see a fully initialized instance (not just NOMINAL default).
+            cls._started.wait(timeout=5.0)
         return cls._instance
 
     @property

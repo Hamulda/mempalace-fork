@@ -24,7 +24,21 @@ allowed-tools: Read
 - For important factual changes: also update KG via `mempalace_kg_supersede`
 
 ## Search Strategy (in order of preference)
-1. **mempalace_hybrid_search** — default, combines all sources (LanceDB + BM25 + KG)
+1. **mempalace_hybrid_search** — default, combines semantic (LanceDB) + keyword (BM25) + KG in one call
 2. **mempalace_search** — fast, semantic only, use for simple keyword queries
 3. **mempalace_kg_query** — structured facts only (relationships, attributes)
 4. **mempalace_traverse_graph** — graph exploration from a known room
+
+## Knowledge Graph Tools
+- `mempalace_kg_query` — entity relationships with time filtering
+- `mempalace_kg_add` — add facts
+- `mempalace_kg_invalidate` — mark facts as ended
+- `mempalace_kg_supersede` — atomically replace a fact (invalidate old, add new)
+- `mempalace_kg_history` — audit trail for any fact (all versions over time)
+- `mempalace_kg_timeline` — chronological story of an entity
+- `mempalace_kg_stats` — graph overview
+
+## Navigation Tools
+- `mempalace_traverse_graph` — walk the palace graph from a room
+- `mempalace_find_tunnels` — find rooms bridging two wings
+- `mempalace_graph_stats` — graph connectivity overview

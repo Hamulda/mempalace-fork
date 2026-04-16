@@ -43,7 +43,7 @@ async def test_settings(tmp_path):
     """Izolovaná test konfigurace — tmp_path je unikátní per test."""
     return MemPalaceSettings(
         db_path=str(tmp_path / "test_palace"),
-        db_backend="chromadb",
+        db_backend="chroma",
         cache_ttl_status=1,
         cache_ttl_metadata=1,
         log_sessions=False,
@@ -63,12 +63,12 @@ async def empty_palace_client(tmp_path):
     """Client with empty palace for write tests."""
     palace_path = tmp_path / "palace"
     palace_path.mkdir()
-    backend = get_backend("chromadb")
+    backend = get_backend("chroma")
     collection = backend.get_collection(str(palace_path), "mempalace_drawers", create=True)
     del collection
     test_settings = MemPalaceSettings(
         db_path=str(palace_path),
-        db_backend="chromadb",
+        db_backend="chroma",
     )
     server = create_server(settings=test_settings)
     async with Client(transport=server) as c:
@@ -109,7 +109,7 @@ async def seeded_palace_client(tmp_path):
     del client
     test_settings = MemPalaceSettings(
         db_path=str(palace_path),
-        db_backend="chromadb",
+        db_backend="chroma",
     )
     server = create_server(settings=test_settings)
     async with Client(transport=server) as c:
@@ -302,7 +302,7 @@ async def test_add_drawer_has_is_latest(empty_palace_client):
 
     # Verify metadata stored in ChromaDB
     from mempalace.backends import get_backend
-    backend = get_backend("chromadb")
+    backend = get_backend("chroma")
     col = backend.get_collection(palace_path, "mempalace_drawers")
     stored = col.get(ids=[drawer_id])
     meta = stored["metadatas"][0]
