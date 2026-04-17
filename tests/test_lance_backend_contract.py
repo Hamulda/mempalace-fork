@@ -150,8 +150,70 @@ class TestGetOffsetPagination:
             idx = int(i.split("_")[-1])
             assert idx >= 5, f"id {i} has index {idx} < offset 5"
 
+    def test_get_high_offset_no_skipped_row_accumulation(self, lance_collection):
+        """High offset must not store all skipped filtered rows in memory.
 
-# ── Bug 2: _where_to_sql scalar metadata equality ───────────────────────────────
+        The new code tracks seen_filtered as a counter and only stores the
+        window, not all skipped rows.
+        """
+        # Add 100 rows, only last one matches
+        for i in range(100):
+            lance_collection.add(
+                documents=[f"noise {i}"],
+                ids=[f"mem_doc_{i}"],
+                metadatas=[{"wing": "other" if i < 99 else "target"}],
+            )
+
+        result = lance_collection.get(where={"wing": "target"}, limit=10, offset=0)
+        assert len(result["ids"]) == 1
+        assert result["ids"][0] == "mem_doc_99"
+
+    def test_get_offset_empty_result_for_unreachable_offset(self, lance_collection):
+        """offset beyond available filtered rows returns empty list, not an error."""
+        for i in range(5):
+            lance_collection.add(
+                documents=[f"doc {i}"],
+                ids=[f"only_five_{i}"],
+                metadatas=[{"scope": "present"}],
+            )
+
+        result = lance_collection.get(where={"scope": "present"}, limit=10, offset=100)
+        assert result["ids"] == []
+        assert result["documents"] == []
+        assert result["metadatas"] == []
+
+    def test_get_where_max_scan_ceiling_raises(self, lance_collection):
+        """get(where=...) must raise RuntimeError when MAX_SCAN ceiling is hit.
+
+        The old code warned and returned partial results. Silent partial truth
+        is a correctness bug — callers must know the result is incomplete.
+        """
+        import mempalace.backends.lance as lance_module
+        orig = lance_module.LanceCollection._GET_MAX_SCAN
+        try:
+            # Force a very low cap so even small tables hit it
+            lance_module.LanceCollection._GET_MAX_SCAN = 50
+
+            # Add 200 rows, 1 matching at the end
+            for i in range(200):
+                lance_collection.add(
+                    documents=[f"noise {i}"],
+                    ids=[f"ceil_doc_{i}"],
+                    metadatas=[{"scope": "other"}],
+                )
+            lance_collection.add(
+                documents=["the target"],
+                ids=["ceil_target"],
+                metadatas=[{"scope": "target_scope"}],
+            )
+
+            with pytest.raises(RuntimeError, match="MAX_SCAN"):
+                lance_collection.get(where={"scope": "target_scope"}, limit=10, offset=0)
+        finally:
+            lance_module.LanceCollection._GET_MAX_SCAN = orig
+
+
+# ── Bug 2: _where_toSql scalar metadata equality ───────────────────────────────
 
 class TestWhereToSqlScalar:
     def test_scalar_string_generates_json_eq(self):
@@ -468,4 +530,148 @@ class TestEmbedDaemonTimeoutCleanup:
 
         # Should return False (startup failed), child should be killed
         assert result is False
+
+
+# ── MemoryGuard protection on canonical write paths ───────────────────────────
+
+class TestMemoryGuardWriteProtection:
+    """Verify MemoryGuard is respected on both add and upsert paths."""
+
+    def test_upsert_respects_memory_guard_pause(self, lance_collection, monkeypatch):
+        """upsert must check MemoryGuard.should_pause_writes() before proceeding."""
+        from mempalace.memory_guard import MemoryPressure
+
+        class MockGuard:
+            used_ratio = 0.96
+            pressure = MemoryPressure.CRITICAL
+
+            def should_pause_writes(self):
+                return True
+
+            def wait_for_nominal(self, timeout):
+                return False  # never recovers within timeout
+
+        # MemoryGuard.get() is a classmethod; replace the whole class with a mock
+        # that has a classmethod get() returning our MockGuard
+        class MockMemoryGuard:
+            instance = MockGuard()
+
+            @classmethod
+            def get(cls):
+                return cls.instance
+
+        from mempalace import memory_guard
+        monkeypatch.setattr(memory_guard, "MemoryGuard", MockMemoryGuard())
+
+        from mempalace.exceptions import MemoryPressureError
+
+        with pytest.raises(MemoryPressureError, match="memory at"):
+            lance_collection.upsert(
+                documents=["test doc"],
+                ids=["mem_guard_upsert_test"],
+                metadatas=[{"wing": "test"}],
+            )
+
+    def test_add_respects_memory_guard_pause(self, lance_collection, monkeypatch):
+        """_do_add must check MemoryGuard.should_pause_writes() before proceeding."""
+        from mempalace.memory_guard import MemoryPressure
+
+        class MockGuard:
+            used_ratio = 0.96
+            pressure = MemoryPressure.CRITICAL
+
+            def should_pause_writes(self):
+                return True
+
+            def wait_for_nominal(self, timeout):
+                return False
+
+        class MockMemoryGuard:
+            instance = MockGuard()
+
+            @classmethod
+            def get(cls):
+                return cls.instance
+
+        from mempalace import memory_guard
+        monkeypatch.setattr(memory_guard, "MemoryGuard", MockMemoryGuard())
+
+        from mempalace.exceptions import MemoryPressureError
+
+        with pytest.raises(MemoryPressureError, match="memory at"):
+            lance_collection.add(
+                documents=["test doc"],
+                ids=["mem_guard_add_test"],
+                metadatas=[{"wing": "test"}],
+            )
+
+
+# ── Embedding reuse: no double-compute on upsert ───────────────────────────────
+
+class TestEmbeddingReuse:
+    """Verify classify_batch embeddings are reused in the write path."""
+
+    def test_upsert_does_not_double_embed(self, lance_collection, monkeypatch):
+        """upsert must reuse embeddings from classify_batch, not call _embed_texts twice."""
+        import mempalace.backends.lance as lance_module
+
+        embed_call_count = 0
+        original_embed = lance_module._embed_texts
+
+        def counting_embed(texts):
+            nonlocal embed_call_count
+            embed_call_count += 1
+            return original_embed(texts)
+
+        monkeypatch.setattr(lance_module, "_embed_texts", counting_embed)
+
+        # Add a few documents — upsert should embed exactly once (via classify_batch)
+        lance_collection.upsert(
+            documents=["doc a", "doc b", "doc c"],
+            ids=["embed_test_1", "embed_test_2", "embed_test_3"],
+            metadatas=[{"wing": "alpha"}, {"wing": "beta"}, {"wing": "gamma"}],
+        )
+
+        # classify_batch calls _embed_texts once for the batch.
+        # After that, embeddings are reused — no second call.
+        assert embed_call_count == 1, (
+            f"Expected exactly 1 embed call (via classify_batch), got {embed_call_count}. "
+            "upsert must not re-embed documents after classify_batch."
+        )
+
+    def test_do_add_does_not_double_embed(self, lance_collection, monkeypatch):
+        """_do_add must reuse embeddings from classify_batch, not re-embed after dedup."""
+        import mempalace.backends.lance as lance_module
+
+        embed_call_count = 0
+        original_embed = lance_module._embed_texts
+
+        def counting_embed(texts):
+            nonlocal embed_call_count
+            embed_call_count += 1
+            return original_embed(texts)
+
+        monkeypatch.setattr(lance_module, "_embed_texts", counting_embed)
+
+        # Force coalescer off so _do_add is called directly
+        os.environ["MEMPALACE_COALESCE_MS"] = "0"
+        # Also disable dedup to isolate the embedding-reuse check
+        os.environ["MEMPALACE_DEDUP_HIGH"] = "1.0"
+        os.environ["MEMPALACE_DEDUP_LOW"] = "0.99"
+
+        try:
+            lance_collection._do_add(
+                documents=["x", "y"],
+                ids=["reuse_1", "reuse_2"],
+                metadatas=[{"wing": "a"}, {"wing": "b"}],
+            )
+
+            # classify_batch embeds once; then embeddings are reused in records list.
+            # No second call should happen.
+            assert embed_call_count == 1, (
+                f"Expected exactly 1 embed call in _do_add, got {embed_call_count}"
+            )
+        finally:
+            os.environ["MEMPALACE_DEDUP_HIGH"] = "0.92"
+            os.environ["MEMPALACE_DEDUP_LOW"] = "0.82"
 

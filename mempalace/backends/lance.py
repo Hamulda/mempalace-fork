@@ -346,15 +346,17 @@ class SemanticDeduplicator:
         metadatas: list[dict],
         collection: "LanceCollection",
         n_candidates: int = 5,
-    ) -> list[tuple[str, Optional[str]]]:
+    ) -> tuple[list[tuple[str, Optional[str]]], list[list[float]]]:
         """
         Klasifikuje celý batch dokumentů najednou.
+        Vrací (classifications, embeddings) — embeddingy jsou vypočítány
+        JEDNÍM voláním _embed_texts a caller je může reuseovat.
 
-        Klíčová optimalizace: embeddingy pro dedup check jsou vypočítány
-        JEDNÍM voláním _embed_texts(documents) místo N voláními po 1.
+        Caller si musí sám vyfiltrovat embeddingy podle toho,
+        které dokumenty mají akci "unique"/"conflict" (ne "duplicate").
         """
         if collection.count() == 0:
-            return [("unique", None)] * len(documents)
+            return [("unique", None)] * len(documents), _embed_texts(documents)
 
         # JEDEN batch embedding call pro všechny dokumenty
         batch_vectors = _embed_texts(documents)
@@ -388,7 +390,7 @@ class SemanticDeduplicator:
             else:
                 results.append(("unique", None))
 
-        return results
+        return results, batch_vectors
 
 
 # ── LanceDB Async Optimizer ───────────────────────────────────────────────────
@@ -833,6 +835,7 @@ class LanceCollection(BaseCollection):
 
     BATCH_SIZE = 500  # Records per add/upsert batch
     _DELETE_MAX_SCAN = 50000  # hard cap on delete(where=...) scan
+    _GET_MAX_SCAN = 100_000  # hard cap on get(where=...) raw-row scan
 
     def __init__(
         self,
@@ -997,17 +1000,17 @@ class LanceCollection(BaseCollection):
 
         # BATCH Semantic deduplication – jeden embedding call pro celý batch
         deduplicator = SemanticDeduplicator()
-        classifications = deduplicator.classify_batch(
+        classifications, all_embeddings = deduplicator.classify_batch(
             documents=documents,
             metadatas=metadatas,
             collection=self,
         )
 
-        final_docs, final_ids, final_metas = [], [], []
+        final_docs, final_ids, final_metas, final_embs = [], [], [], []
         skipped, conflicts = 0, 0
 
-        for doc, doc_id, meta, (action, existing_id) in zip(
-            documents, ids, metadatas, classifications
+        for doc, doc_id, meta, (action, existing_id), emb in zip(
+            documents, ids, metadatas, classifications, all_embeddings
         ):
             if action == "duplicate":
                 skipped += 1
@@ -1024,6 +1027,7 @@ class LanceCollection(BaseCollection):
             final_docs.append(doc)
             final_ids.append(doc_id)
             final_metas.append(meta)
+            final_embs.append(emb)
 
         if skipped > 0 or conflicts > 0:
             logger.info(
@@ -1034,8 +1038,7 @@ class LanceCollection(BaseCollection):
         if not final_docs:
             return
 
-        # Compute embeddings
-        embeddings = _embed_texts(final_docs)
+        # Embeddingy jsou už spočítané v classify_batch – reuse
         now = time.time()
 
         records = [
@@ -1046,7 +1049,7 @@ class LanceCollection(BaseCollection):
                 "metadata_json": json.dumps(meta, default=str),
                 "created_at": now,
             }
-            for did, doc, emb, meta in zip(final_ids, final_docs, embeddings, final_metas)
+            for did, doc, emb, meta in zip(final_ids, final_docs, final_embs, final_metas)
         ]
 
         for i in range(0, len(records), self.BATCH_SIZE):
@@ -1073,13 +1076,35 @@ class LanceCollection(BaseCollection):
 
         metadatas = metadatas or [{}] * len(documents)
 
-        # Semantic deduplication for upsert too
+        # Memory pressure check — canonical write path must respect MemoryGuard
+        from ..memory_guard import MemoryGuard
+        guard = MemoryGuard.get()
+        if guard.should_pause_writes():
+            logger.warning(
+                "Memory pressure CRITICAL (%.0f%% RAM used). "
+                "Pausing upsert for up to 30s...",
+                guard.used_ratio * 100
+            )
+            if not guard.wait_for_nominal(timeout=30.0):
+                raise MemoryPressureError(
+                    f"Cannot upsert to palace: system memory at "
+                    f"{guard.used_ratio:.0%}. Close some apps and retry."
+                )
+
+        # Semantic deduplication – používá classify_batch pro embedding reuse
         deduplicator = SemanticDeduplicator()
-        final_docs, final_ids, final_metas = [], [], []
+        classifications, all_embeddings = deduplicator.classify_batch(
+            documents=documents,
+            metadatas=metadatas,
+            collection=self,
+        )
+
+        final_docs, final_ids, final_metas, final_embs = [], [], [], []
         skipped = 0
 
-        for doc, doc_id, meta in zip(documents, ids, metadatas):
-            action, existing_id = deduplicator.classify(doc, meta, self)
+        for doc, doc_id, meta, (action, existing_id), emb in zip(
+            documents, ids, metadatas, classifications, all_embeddings
+        ):
             if action == "duplicate":
                 skipped += 1
                 logger.debug("Upsert skipping duplicate: %s", doc_id)
@@ -1087,6 +1112,7 @@ class LanceCollection(BaseCollection):
             final_docs.append(doc)
             final_ids.append(doc_id)
             final_metas.append(meta)
+            final_embs.append(emb)
 
         if skipped > 0:
             logger.info("Upsert semantic dedup: skipped %d duplicates", skipped)
@@ -1108,8 +1134,7 @@ class LanceCollection(BaseCollection):
 
             self._write_with_retry(do_delete)
 
-        # Compute embeddings
-        embeddings = _embed_texts(final_docs)
+        # Embeddingy jsou už spočítané v classify_batch – reuse
         now = time.time()
 
         records = [
@@ -1120,7 +1145,7 @@ class LanceCollection(BaseCollection):
                 "metadata_json": json.dumps(meta, default=str),
                 "created_at": now,
             }
-            for did, doc, emb, meta in zip(final_ids, final_docs, embeddings, final_metas)
+            for did, doc, emb, meta in zip(final_ids, final_docs, final_embs, final_metas)
         ]
 
         for i in range(0, len(records), self.BATCH_SIZE):
@@ -1263,47 +1288,65 @@ class LanceCollection(BaseCollection):
                 #
                 # IMPORTANT: offset must apply to the FILTERED result set, not the
                 # raw table. LanceDB does not support server-side offset with pandas
-                # post-filtering, so we scan raw pages and accumulate filtered matches
-                # until we have offset+limit rows. This is memory-safe because we only
-                # hold one raw page (effective_limit rows) in RAM at a time.
+                # post-filtering.
+                #
+                # Memory-efficient scan: we use a fixed large scan batch regardless
+                # of the user's limit, and only store rows that fall within the
+                # requested [offset, offset+limit] window. We track the running
+                # filtered count to know when to start/stop collecting.
                 effective_limit = min(limit or 5000, 5000)
                 target_offset = offset or 0
-                # How many filtered rows to collect before we can slice the result.
-                # We need up to (target_offset + effective_limit) filtered rows.
-                rows_to_collect = target_offset + effective_limit
 
-                all_filtered: list[dict] = []
-                page_start = 0
-                MAX_SCAN = 100_000  # hard cap per call to prevent unbounded scan
+                # Fixed scan batch — independent of limit. Large enough to avoid
+                # N-round-trips for sparse filters; small enough to keep one page
+                # in RAM safely.
+                SCAN_BATCH = 2000
+                MAX_SCAN = self._GET_MAX_SCAN  # class-level configurable cap
 
-                while len(all_filtered) < rows_to_collect and page_start < MAX_SCAN:
+                seen_filtered = 0  # total filtered rows encountered so far
+                total_scanned = 0  # total raw rows scanned
+                window: list[dict] = []  # only rows in [offset, offset+limit]
+
+                while total_scanned < MAX_SCAN:
+                    # Never request more rows than the remaining scan budget — this
+                    # ensures we don't skip over the ceiling in one large page.
+                    batch_limit = min(SCAN_BATCH, MAX_SCAN - total_scanned)
                     page = (
                         self._table.search()
-                        .limit(effective_limit)
-                        .offset(page_start)
+                        .limit(batch_limit)
+                        .offset(total_scanned)
                         .to_pandas()
                     )
                     if page.empty:
                         break
+                    total_scanned += len(page)
                     filtered = _apply_where_filter(page, where)
                     if not filtered.empty:
                         for _, row in filtered.iterrows():
-                            all_filtered.append({
-                                "id": row["id"],
-                                "document": row["document"],
-                                "metadata_json": row["metadata_json"],
-                            })
-                    page_start += effective_limit
+                            if seen_filtered >= target_offset:
+                                if len(window) < effective_limit:
+                                    window.append({
+                                        "id": row["id"],
+                                        "document": row["document"],
+                                        "metadata_json": row["metadata_json"],
+                                    })
+                            seen_filtered += 1
+                            if seen_filtered >= target_offset + effective_limit:
+                                break
+                    if seen_filtered >= target_offset + effective_limit:
+                        break
 
-                if page_start >= MAX_SCAN and len(all_filtered) < rows_to_collect:
-                    logger.warning(
-                        "get(where=...) hit MAX_SCAN=%d ceiling — "
-                        "result may be incomplete. Consider a more selective filter.",
-                        MAX_SCAN,
+                if total_scanned >= MAX_SCAN and seen_filtered < target_offset + effective_limit:
+                    # Safety ceiling hit — we cannot determine if more filtered rows
+                    # exist beyond the cap. Raise instead of returning a misleading
+                    # partial result.
+                    raise RuntimeError(
+                        f"get(where=...) scanned {total_scanned} raw rows but only "
+                        f"found {seen_filtered} filtered rows ({target_offset} offset + "
+                        f"{effective_limit} limit requested). The filter may be too broad "
+                        f"or the table is too large. Use a more selective filter."
                     )
 
-                # Slice to the requested offset+limit window
-                window = all_filtered[target_offset:target_offset + effective_limit]
                 results = pandas.DataFrame(window) if window else pandas.DataFrame()
             else:
                 # No filter — enforce hard limit to prevent full-table RAM spike.
@@ -1358,7 +1401,7 @@ class LanceCollection(BaseCollection):
                 total_scanned = 0
 
                 page_start = 0
-                while True:
+                while page_start < MAX_SCAN:
                     page = (
                         self._table.search()
                         .limit(batch_size)
@@ -1366,17 +1409,10 @@ class LanceCollection(BaseCollection):
                         .to_pandas()
                     )
                     if page.empty:
-                        # Table exhausted. If we found fewer than MAX_SCAN matching rows,
-                        # the data is too sparse to confirm we have ALL matches —
-                        # raise instead of silently deleting a partial set.
-                        if len(matching_ids) < MAX_SCAN:
-                            matching_ids.clear()
-                            raise RuntimeError(
-                                f"delete(where=...) scanned {total_scanned} raw rows "
-                                f"but found only {len(matching_ids)} matches — table is too sparse "
-                                f"to confirm completeness within MAX_SCAN={MAX_SCAN}. "
-                                "Use a more selective filter or delete by id."
-                            )
+                        # Empty page — table is genuinely exhausted. Proceed with what
+                        # we collected. A sparse table (matching rows buried in deleted
+                        # or ghost pages) is indistinguishable from a small table here;
+                        # the MAX_SCAN ceiling below guards against silent truncation.
                         break
                     total_scanned += len(page)
                     filtered = _apply_where_filter(page, where)
@@ -1385,6 +1421,18 @@ class LanceCollection(BaseCollection):
                     if len(matching_ids) >= MAX_SCAN:
                         break
                     page_start += batch_size
+
+                if page_start >= MAX_SCAN and len(matching_ids) < MAX_SCAN:
+                    # Safety ceiling reached before table was fully scanned.
+                    # Raising is the correct behaviour — silent partial delete would
+                    # cause data loss if more matching rows exist beyond the cap.
+                    raise RuntimeError(
+                        f"delete(where=...) scanned {total_scanned} raw rows "
+                        f"({len(matching_ids)} matches) but hit MAX_SCAN={MAX_SCAN} ceiling "
+                        f"before the table was fully scanned. Either a sparse table, a "
+                        f"LanceDB compaction in progress, or the filter is not selective "
+                        f"enough. Delete by id instead, or use a more selective filter."
+                    )
 
                 if not matching_ids:
                     return
@@ -1400,11 +1448,6 @@ class LanceCollection(BaseCollection):
             except Exception as e:
                 logger.warning("delete(where=...) skipped due to scan error: %s", e)
                 return
-                raise RuntimeError(
-                    f"delete(where=...) hit MAX_SCAN={MAX_SCAN} ceiling — "
-                    f"{len(matching_ids)} matching ids would be deleted but more rows exist. "
-                    "Use a more selective filter or delete by id to avoid data loss."
-                )
 
     def count(self) -> int:
         try:
