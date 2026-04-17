@@ -719,9 +719,15 @@ def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]])
       - Explicit operators: {"wing": {"$eq": "x"}} → same
       - $and / $or logical combinators
       - id filter: {"id": "..."} or {"id": {"$eq": "..."}}
+
+    Parse-once optimization: metadata_json is parsed exactly once per page
+    (into the `_meta` column) rather than once per filter condition per row.
     """
     if not where:
         return df
+
+    # Parse once per page — all conditions share the same parsed metadata column
+    df = _parse_metadata(df)
 
     if "$and" in where:
         for sub in where["$and"]:
@@ -748,25 +754,26 @@ def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]])
         elif isinstance(cond, dict):
             op = list(cond.keys())[0]
             val = cond[op]
+            # Use pre-parsed _meta column — O(1) dict.get instead of json.loads per call
             if op == "$eq":
-                df = df[df.apply(lambda r: _meta_val(r, key) == val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) == val)]
             elif op == "$ne":
-                df = df[df.apply(lambda r: _meta_val(r, key) != val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) != val)]
             elif op == "$in":
-                df = df[df.apply(lambda r: _meta_val(r, key) in val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) in val)]
             elif op == "$nin":
-                df = df[df.apply(lambda r: _meta_val(r, key) not in val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) not in val)]
             elif op == "$gt":
-                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) > val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) is not None and m.get(key) > val)]
             elif op == "$gte":
-                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) >= val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) is not None and m.get(key) >= val)]
             elif op == "$lt":
-                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) < val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) is not None and m.get(key) < val)]
             elif op == "$lte":
-                df = df[df.apply(lambda r: _meta_val(r, key) is not None and _meta_val(r, key) <= val, axis=1)]
+                df = df[df["_meta"].apply(lambda m: m.get(key) is not None and m.get(key) <= val)]
         else:
             # Scalar metadata equality: {"wing": "x"} → metadata.wing == 'x'
-            df = df[df.apply(lambda r: _meta_val(r, key) == cond, axis=1)]
+            df = df[df["_meta"].apply(lambda m: m.get(key) == cond)]
 
     return df
 
@@ -1356,6 +1363,8 @@ class LanceCollection(BaseCollection):
                 if offset is not None and offset > 0:
                     search = search.offset(offset)
                 results = search.limit(effective_limit).to_pandas()
+        except RuntimeError:
+            raise
         except Exception:
             return {"ids": [], "documents": [], "metadatas": []}
 
@@ -1394,26 +1403,50 @@ class LanceCollection(BaseCollection):
             # LanceDB's json_extract SQL cannot filter UTF-8 metadata_json strings.
             # Collect ALL matching ids in one full-table scan, then delete in batches.
             # Offset-based pagination is NOT safe here because deleting shifts row positions.
+            #
+            # IMPORTANT: page.empty is NOT a reliable exhaustion signal. During LanceDB
+            # compaction or with sparse row distributions, a raw page can be empty while
+            # matching rows remain at higher offsets. We distinguish three states:
+            #   A. Genuine exhaustion  — offset has moved past all data in table
+            #   B. Transient empty     — compaction/sparse layout produced empty page;
+            #                            more rows exist at higher offsets
+            #   C. Safety ceiling       — MAX_SCAN reached, cannot proceed
+            # We use consecutive empty pages as the exhaustion signal (transient anomaly
+            # resolves within 1-2 pages). The MAX_SCAN ceiling still guards silent partials.
             try:
                 batch_size = 500
                 MAX_SCAN = self._DELETE_MAX_SCAN  # class-level configurable cap
-                matching_ids = []
+                matching_ids: list[str] = []
                 total_scanned = 0
+                consecutive_empty_pages = 0
+                # A genuinely exhausted scan ends with consecutive empty pages after
+                # we've moved past all data. One empty page during compaction is common;
+                # two consecutive empty pages means the scan position is past all data.
+                EMPTY_PAGES_BEFORE_BREAK = 2
 
                 page_start = 0
-                while page_start < MAX_SCAN:
+                while total_scanned < MAX_SCAN:
+                    # Never request more rows than the remaining scan budget
+                    batch_limit = min(batch_size, MAX_SCAN - total_scanned)
                     page = (
                         self._table.search()
-                        .limit(batch_size)
+                        .limit(batch_limit)
                         .offset(page_start)
                         .to_pandas()
                     )
                     if page.empty:
-                        # Empty page — table is genuinely exhausted. Proceed with what
-                        # we collected. A sparse table (matching rows buried in deleted
-                        # or ghost pages) is indistinguishable from a small table here;
-                        # the MAX_SCAN ceiling below guards against silent truncation.
-                        break
+                        consecutive_empty_pages += 1
+                        total_scanned += batch_limit
+                        if consecutive_empty_pages >= EMPTY_PAGES_BEFORE_BREAK:
+                            # Two consecutive empty pages means we've scanned past all
+                            # data. Genuine exhaustion — stop scanning, proceed to delete.
+                            break
+                        # Transient empty page (compaction / sparse layout in progress).
+                        # Continue scanning to find rows that may exist beyond this gap.
+                        page_start += batch_size
+                        continue
+                    # Page had data — reset consecutive counter and scan this page
+                    consecutive_empty_pages = 0
                     total_scanned += len(page)
                     filtered = _apply_where_filter(page, where)
                     if not filtered.empty:
@@ -1422,7 +1455,7 @@ class LanceCollection(BaseCollection):
                         break
                     page_start += batch_size
 
-                if page_start >= MAX_SCAN and len(matching_ids) < MAX_SCAN:
+                if total_scanned >= MAX_SCAN and len(matching_ids) < MAX_SCAN:
                     # Safety ceiling reached before table was fully scanned.
                     # Raising is the correct behaviour — silent partial delete would
                     # cause data loss if more matching rows exist beyond the cap.
