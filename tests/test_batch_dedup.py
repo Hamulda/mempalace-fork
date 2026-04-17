@@ -4,8 +4,11 @@ Tests for batch semantic deduplication.
 Run: pytest tests/test_batch_dedup.py -v -s
 """
 
+import os
 import tempfile
 import pytest
+
+os.environ["MEMPALACE_COALESCE_MS"] = "0"
 
 pytest.importorskip("lancedb", reason="LanceDB not installed")
 
@@ -25,9 +28,10 @@ class TestBatchDedup:
             docs = ["doc one", "doc two", "doc three"]
             metas = [{"wing": "test"}] * 3
 
-            results = dedup.classify_batch(docs, metas, col)
+            results, vectors = dedup.classify_batch(docs, metas, col)
             assert len(results) == 3
             assert all(r[0] == "unique" for r in results)
+            assert len(vectors) == 3  # one embedding per document
 
     def test_batch_dedup_detects_duplicate(self):
         """Batch dedup správně detekuje duplikáty."""
@@ -45,7 +49,7 @@ class TestBatchDedup:
             dedup = SemanticDeduplicator()
 
             # Podobný dokument
-            results = dedup.classify_batch(
+            results, _ = dedup.classify_batch(
                 ["original document content slightly modified"],
                 [{"wing": "test", "room": "main"}],
                 col,
@@ -65,7 +69,7 @@ class TestBatchDedup:
             docs = ["a", "b", "c"]
             metas = [{"wing": "x"}] * 3
 
-            results = dedup.classify_batch(docs, metas, col)
+            results, _ = dedup.classify_batch(docs, metas, col)
             assert results == [("unique", None), ("unique", None), ("unique", None)]
 
     def test_batch_same_as_single(self):
@@ -88,6 +92,6 @@ class TestBatchDedup:
             single_result = dedup.classify(doc, meta, col)
 
             # Batch classify (batch of 1)
-            batch_result = dedup.classify_batch([doc], [meta], col)
+            batch_result, _ = dedup.classify_batch([doc], [meta], col)
 
             assert single_result[0] == batch_result[0][0]

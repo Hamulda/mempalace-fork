@@ -28,11 +28,21 @@ from fastmcp.resources import DirectoryResource
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .session_registry import SessionRegistry
+from .write_coordinator import WriteCoordinator
+from .claims_manager import ClaimsManager
+from .handoff_manager import HandoffManager
+from .decision_tracker import DecisionTracker
+from .wakeup_context import build_wakeup_context
 from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .middleware import build_middleware_stack
 from .settings import settings, MemPalaceSettings
 from .version import __version__
-from .searcher import search_memories, search_memories_async, hybrid_search_async, invalidate_all_caches
+from .searcher import (
+    search_memories, search_memories_async, hybrid_search_async,
+    invalidate_all_caches, code_search_async, auto_search,
+    is_code_query,
+)
 from .palace_graph import traverse, find_tunnels, graph_stats
 from .knowledge_graph import KnowledgeGraph
 from .backends import get_backend
@@ -134,7 +144,7 @@ When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 # SERVER FACTORY
 # ═══════════════════════════════════════════════════════════════════
 
-def create_server(settings: MemPalaceSettings | None = None) -> FastMCP:
+def create_server(settings: MemPalaceSettings | None = None, shared_server_mode: bool = False) -> FastMCP:
     """
     Factory funkce — vytvoří izolovanou FastMCP instanci.
 
@@ -159,6 +169,22 @@ def create_server(settings: MemPalaceSettings | None = None) -> FastMCP:
     server = FastMCP("MemPalace")
     for mw in middleware_stack:
         server.add_middleware(mw)
+
+    # Phase 1: Session Registry + Write Coordinator for multi-session
+    # Phase 3: ClaimsManager + HandoffManager + DecisionTracker for session coordination
+    if shared_server_mode or settings.transport == "http":
+        registry = SessionRegistry(config.palace_path)
+        coordinator = WriteCoordinator(config.palace_path)
+        claims_mgr = ClaimsManager(config.palace_path)
+        handoff_mgr = HandoffManager(config.palace_path)
+        decision_tracker = DecisionTracker(config.palace_path)
+
+        # Attach to server for tool access (setattr bypasses FastMCP's MemoryStore)
+        setattr(server, "_session_registry", registry)
+        setattr(server, "_write_coordinator", coordinator)
+        setattr(server, "_claims_manager", claims_mgr)
+        setattr(server, "_handoff_manager", handoff_mgr)
+        setattr(server, "_decision_tracker", decision_tracker)
 
     # Health check endpoint — lightweight, no MCP handshake needed
     @server.custom_route("/health", methods=["GET"], name="health")
@@ -1004,8 +1030,21 @@ def _register_tools(server, backend, config, settings):
         room: str,
         source_file: str | None = None,
         added_by: str = "mcp",
+        language: str | None = None,
+        line_start: int | None = None,
+        line_end: int | None = None,
+        symbol_name: str | None = None,
     ) -> dict:
-        """[MEMPALACE] Store code with description, separating embedding from storage for better semantic search."""
+        """[MEMPALACE] Store code with description, separating embedding from storage for better semantic search.
+
+        code: the source code to store
+        description: semantic description of what the code does
+        wing/room: namespace for this memory
+        source_file: optional path to source file
+        language: optional programming language (auto-detected from source_file if not provided)
+        line_start/line_end: optional line range in source file
+        symbol_name: optional function/class name this code represents
+        """
         try:
             wing = sanitize_name(wing, "wing")
             room = sanitize_name(room, "room")
@@ -1052,6 +1091,12 @@ def _register_tools(server, backend, config, settings):
             code_stored = code[:2000]
             was_truncated = len(code) > 2000
 
+            # Auto-detect language from source_file extension if not provided
+            if not language and source_file:
+                ext = Path(source_file).suffix.lower()
+                from .miner import LANGUAGE_MAP
+                language = LANGUAGE_MAP.get(ext, "Text")
+
             col.upsert(
                 ids=[drawer_id],
                 documents=[f"{description}\n\n```\n{code_stored}\n```"],
@@ -1068,6 +1113,12 @@ def _register_tools(server, backend, config, settings):
                     "origin_type": "code_memory",
                     "is_latest": True,
                     "supersedes_id": "",
+                    # Code-aware fields
+                    "language": language or "",
+                    "line_start": line_start or 0,
+                    "line_end": line_end or 0,
+                    "symbol_name": symbol_name or "",
+                    "chunk_kind": "code_block",
                 }],
             )
             logger.info(f"Remembered code: {drawer_id} → {wing}/{room}")
@@ -1081,6 +1132,7 @@ def _register_tools(server, backend, config, settings):
                 "code_truncated": was_truncated,
                 "original_length": len(code),
                 "stored_length": len(code_stored),
+                "language": language,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1170,6 +1222,196 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"error": str(e)}
 
+    # ── CODE SEARCH TOOLS ─────────────────────────────────────────
+
+    @server.tool(timeout=settings.timeout_read)
+    async def mempalace_search_code(
+        ctx: Context,
+        query: str,
+        language: str | None = None,
+        symbol_name: str | None = None,
+        file_path: str | None = None,
+        limit: int = 10,
+    ) -> dict:
+        """[MEMPALACE] Search code chunks with language/symbol/path filters. Use for code-aware retrieval.
+        Automatically detects code-like queries and routes to the code-optimized search path.
+        language: filter by language (e.g. "Python", "JavaScript", "Go")
+        symbol_name: filter by exact function/class name
+        file_path: filter by source file path substring
+        """
+        return await code_search_async(
+            query=query,
+            palace_path=settings.db_path,
+            n_results=limit,
+            language=language,
+            symbol_name=symbol_name,
+            file_path=file_path,
+        )
+
+    @server.tool(timeout=settings.timeout_read)
+    async def mempalace_auto_search(
+        ctx: Context,
+        query: str,
+        limit: int = 10,
+    ) -> dict:
+        """[MEMPALACE] Auto-detect query type and route to optimal search path.
+        Code queries → code_search (vector + FTS5)
+        Prose queries → hybrid_search (vector + BM25 + KG)
+
+        This is the recommended entry point for Claude Code — it handles routing automatically.
+        """
+        return await code_search_async(
+            query=query,
+            palace_path=settings.db_path,
+            n_results=limit,
+        ) if is_code_query(query) else await hybrid_search_async(
+            query=query,
+            palace_path=settings.db_path,
+            n_results=limit,
+        )
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_file_context(
+        ctx: Context,
+        file_path: str,
+        line_start: int | None = None,
+        line_end: int | None = None,
+        context_lines: int = 5,
+    ) -> dict:
+        """[MEMPALACE] Read a file slice directly from disk — no DB needed.
+        Returns lines in the specified range with context.
+
+        file_path: absolute path to the file
+        line_start: starting line (1-based), None = beginning
+        line_end: ending line (1-based), None = end of file
+        context_lines: number of extra lines to include around the range
+        """
+        p = Path(file_path).expanduser().resolve()
+        if not p.exists():
+            return {"error": f"File not found: {file_path}"}
+
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return {"error": str(e)}
+
+        lines = content.split("\n")
+        n = len(lines)
+
+        start = max(0, (line_start or 1) - 1 - context_lines)
+        end = min(n, (line_end or n) + context_lines)
+
+        slice_lines = lines[start:end]
+        has_more_before = line_start is not None and line_start > 1 + context_lines
+        has_more_after = line_end is not None and line_end < n - context_lines
+
+        return {
+            "file_path": str(p),
+            "total_lines": n,
+            "range_start": start + 1,
+            "range_end": end,
+            "has_more_before": has_more_before,
+            "has_more_after": has_more_after,
+            "lines": [
+                {"line_num": start + i + 1, "text": line}
+                for i, line in enumerate(slice_lines)
+            ],
+        }
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_project_context(
+        ctx: Context,
+        project_path: str,
+        query: str | None = None,
+        language: str | None = None,
+        limit: int = 20,
+    ) -> dict:
+        """[MEMPALACE] Get project-level code context: find all code chunks from files in a project directory.
+        Optionally filter by language or search query.
+
+        project_path: directory path to search within
+        language: optional language filter
+        query: optional semantic search query
+        """
+        col = _get_collection()
+        if not col:
+            return _no_palace()
+
+        matched = []
+        try:
+            # Use col.query() to retrieve docs. ChromaDB doesn't support substring
+            # matching in where filters, so we fetch results and filter in Python.
+            # Avoid is_latest filter since seeded fixtures don't set it (assume all are latest)
+            n_fetch = min(limit * 4, 200)
+            if query:
+                # Semantic search
+                where = {}
+                if language:
+                    where["language"] = language
+
+                q_result = col.query(
+                    query_texts=[query],
+                    n_results=n_fetch,
+                    where=where if where else None,
+                    include=["documents", "metadatas"],
+                )
+                docs = q_result.get("documents", [[]])[0] or []
+                metas = q_result.get("metadatas", [[]])[0] or []
+                for i, doc in enumerate(docs):
+                    meta = metas[i] if i < len(metas) else {}
+                    sf = meta.get("source_file", "")
+                    if sf and project_path in sf:
+                        matched.append({
+                            "source_file": sf,
+                            "language": meta.get("language", ""),
+                            "line_start": meta.get("line_start", 0),
+                            "line_end": meta.get("line_end", 0),
+                            "symbol_name": meta.get("symbol_name", ""),
+                            "chunk_kind": meta.get("chunk_kind", ""),
+                            "doc": doc,
+                        })
+                        if len(matched) >= limit:
+                            break
+            else:
+                # No query: use empty string query to get all, then filter
+                where = {}
+                if language:
+                    where["language"] = language
+
+                q_result = col.query(
+                    query_texts=[""],
+                    n_results=n_fetch,
+                    where=where if where else None,
+                    include=["documents", "metadatas"],
+                )
+                docs = q_result.get("documents", [[]])[0] or []
+                metas = q_result.get("metadatas", [[]])[0] or []
+                for i, doc in enumerate(docs):
+                    meta = metas[i] if i < len(metas) else {}
+                    sf = meta.get("source_file", "")
+                    if sf and project_path in sf:
+                        matched.append({
+                            "source_file": sf,
+                            "language": meta.get("language", ""),
+                            "line_start": meta.get("line_start", 0),
+                            "line_end": meta.get("line_end", 0),
+                            "symbol_name": meta.get("symbol_name", ""),
+                            "chunk_kind": meta.get("chunk_kind", ""),
+                            "doc": doc,
+                        })
+                        if len(matched) >= limit:
+                            break
+
+            return {
+                "project_path": project_path,
+                "language": language,
+                "query": query,
+                "chunks": matched,
+                "count": len(matched),
+            }
+        except Exception as e:
+            return {"error": str(e), "project_path": project_path}
+
     @server.tool(timeout=settings.timeout_read)
     def mempalace_export_claude_md(
         ctx: Context,
@@ -1257,6 +1499,207 @@ def _register_tools(server, backend, config, settings):
         except Exception as e:
             return {"error": str(e)}
 
+    # ── SESSION COORDINATION TOOLS ──────────────────────────────────
+
+    def _get_claims_manager():
+        mgr = getattr(server, "_claims_manager", None)
+        if mgr is None:
+            return None
+        return mgr
+
+    def _get_handoff_manager():
+        mgr = getattr(server, "_handoff_manager", None)
+        if mgr is None:
+            return None
+        return mgr
+
+    def _get_decision_tracker():
+        mgr = getattr(server, "_decision_tracker", None)
+        if mgr is None:
+            return None
+        return mgr
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_claim_path(
+        ctx: Context,
+        path: str,
+        session_id: str,
+        ttl_seconds: int = 600,
+        note: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Claim a file path with TTL for mutual exclusion."""
+        mgr = _get_claims_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        payload = {"note": note, "path": path} if note else {"path": path}
+        return mgr.claim("file", path, session_id, ttl_seconds=ttl_seconds, payload=payload)
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_release_claim(
+        ctx: Context,
+        path: str,
+        session_id: str,
+    ) -> dict:
+        """[MEMPALACE] Release a claim on a file path."""
+        mgr = _get_claims_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        return mgr.release_claim("file", path, session_id)
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_list_claims(
+        ctx: Context,
+        session_id: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] List active claims (all or for a session)."""
+        mgr = _get_claims_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        if session_id:
+            claims = mgr.get_session_claims(session_id)
+        else:
+            claims = mgr.list_active_claims()
+        return {"claims": claims, "count": len(claims)}
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_conflict_check(
+        ctx: Context,
+        path: str,
+        session_id: str,
+    ) -> dict:
+        """[MEMPALACE] Check for conflicts before editing a file."""
+        mgr = _get_claims_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        return mgr.check_conflicts("file", path, session_id)
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_push_handoff(
+        ctx: Context,
+        from_session_id: str,
+        summary: str,
+        touched_paths: list[str],
+        blockers: list[str],
+        next_steps: list[str],
+        confidence: int,
+        priority: str = "normal",
+        to_session_id: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Create a cross-session handoff."""
+        mgr = _get_handoff_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        return mgr.push_handoff(
+            from_session_id=from_session_id,
+            summary=summary,
+            touched_paths=touched_paths,
+            blockers=blockers,
+            next_steps=next_steps,
+            confidence=confidence,
+            priority=priority,
+            to_session_id=to_session_id,
+        )
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_pull_handoffs(
+        ctx: Context,
+        session_id: str,
+        status: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Get pending handoffs for a session."""
+        mgr = _get_handoff_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        handoffs = mgr.pull_handoffs(session_id=session_id, status=status)
+        return {"handoffs": handoffs, "count": len(handoffs)}
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_accept_handoff(
+        ctx: Context,
+        handoff_id: str,
+        session_id: str,
+    ) -> dict:
+        """[MEMPALACE] Accept a handoff."""
+        mgr = _get_handoff_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        return mgr.accept_handoff(handoff_id, session_id)
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_complete_handoff(
+        ctx: Context,
+        handoff_id: str,
+        session_id: str,
+    ) -> dict:
+        """[MEMPALACE] Mark a handoff as completed."""
+        mgr = _get_handoff_manager()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        return mgr.complete_handoff(handoff_id, session_id)
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_wakeup_context(
+        ctx: Context,
+        session_id: str,
+        project_root: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Get full wakeup bundle for session resume/takeover."""
+        try:
+            result = build_wakeup_context(
+                session_id=session_id,
+                project_root=project_root,
+                palace_path=config.palace_path,
+            )
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_capture_decision(
+        ctx: Context,
+        session_id: str,
+        decision: str,
+        rationale: str,
+        alternatives: list[str],
+        category: str,
+        confidence: int,
+    ) -> dict:
+        """[MEMPALACE] Store an architectural decision."""
+        mgr = _get_decision_tracker()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        return mgr.capture_decision(
+            session_id=session_id,
+            decision_text=decision,
+            rationale=rationale,
+            alternatives=alternatives,
+            category=category,
+            confidence=confidence,
+        )
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_list_decisions(
+        ctx: Context,
+        session_id: str | None = None,
+        category: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Query stored decisions."""
+        mgr = _get_decision_tracker()
+        if mgr is None:
+            return {"error": "session coordination not available"}
+
+        decisions = mgr.list_decisions(session_id=session_id, category=category)
+        return {"decisions": decisions, "count": len(decisions)}
+
 
 # ═══════════════════════════════════════════════════════════════════
 # HTTP TRANSPORT
@@ -1275,7 +1718,7 @@ def serve_http(host: str = "127.0.0.1", port: int = 8765, server: FastMCP | None
         sys.exit(1)
 
     if server is None:
-        server = create_server()
+        server = create_server(shared_server_mode=True)
 
     async def http_handle(request: Request) -> Response:
         content_type = request.headers.get("content-type", "")
