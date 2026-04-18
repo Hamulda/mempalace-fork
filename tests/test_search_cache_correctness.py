@@ -12,7 +12,7 @@ from unittest import mock
 
 from mempalace.query_cache import QueryCache
 from mempalace.searcher import (
-    invalidate_query_cache, invalidate_all_caches, invalidate_bm25_cache,
+    invalidate_query_cache,
     _get_query_cache,
 )
 
@@ -82,14 +82,14 @@ class TestWriteInvalidation:
         for k in keys:
             assert cache.get_value(k) is None, f"Key {k} should be invalidated"
 
-    def test_invalidate_all_caches_clears_query_cache(self):
-        """invalidate_all_caches() zneplatní query cache i BM25 cache."""
+    def test_invalidate_query_cache_clears_query_cache(self):
+        """invalidate_query_cache() zneplatní query cache."""
         cache = _get_query_cache()
 
         key = "/palace|default|query|None|None|None|None|5|False|None|None"
         cache.set_value(key, {"stale": True})
 
-        invalidate_all_caches()
+        invalidate_query_cache()
 
         assert cache.get_value(key) is None
 
@@ -201,28 +201,8 @@ class TestConcurrentAccess:
 class TestHybridSearchStaleness:
     """hybrid_search nepoužívá stale results po write."""
 
-    def test_bm25_cache_invalidation_clears_index(self):
-        """invalidate_bm25_cache() musí vynulovat BM25 globals."""
-        import mempalace.searcher as searcher_mod
-
-        # Setup: set BM25 state via module reference (not global keyword in test fn)
-        searcher_mod._bm25_index = "fake_index"
-        searcher_mod._bm25_corpus = ["doc1", "doc2"]
-        searcher_mod._bm25_ids = ["id1"]
-        searcher_mod._bm25_metas = [{"wing": "test"}]
-        searcher_mod._bm25_path_cached = "/palace/test"
-
-        invalidate_bm25_cache()
-
-        # After invalidation, all BM25 globals must be None
-        assert searcher_mod._bm25_index is None
-        assert searcher_mod._bm25_corpus is None
-        assert searcher_mod._bm25_ids is None
-        assert searcher_mod._bm25_metas is None
-        assert searcher_mod._bm25_path_cached is None
-
-    def test_invalidate_all_caches_clears_both(self):
-        """invalidate_all_caches() zneplatní query cache i BM25 cache současně."""
+    def test_query_cache_invalidation_clears_cache(self):
+        """invalidate_query_cache() musí vynulovat query cache."""
         import mempalace.searcher as searcher_mod
 
         # Setup query cache entry
@@ -230,18 +210,10 @@ class TestHybridSearchStaleness:
         key = "/palace|default|query|None|None|None|None|5|False|None|None"
         cache.set_value(key, {"results": "stale"})
 
-        # Setup BM25 cache via module reference
-        searcher_mod._bm25_index = "fake"
-        searcher_mod._bm25_path_cached = "/palace"
-
-        invalidate_all_caches()
+        invalidate_query_cache()
 
         # Query cache cleared
         assert cache.get_value(key) is None
-
-        # BM25 cache cleared
-        assert searcher_mod._bm25_index is None
-        assert searcher_mod._bm25_path_cached is None
 
 
 class TestCacheKeyCanonical:

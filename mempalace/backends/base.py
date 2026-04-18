@@ -37,6 +37,18 @@ from typing import Any, Dict, List, Optional
 #   ingest_mode   — str: "convos" | "general" | "exchange" (convo miner only)
 #   extract_mode  — str: "exchange" | "general" (convo miner only)
 #
+# CODE-AWARE FIELDS (populated by project miner for code files):
+#   language      — str: programming language detected from file extension
+#                    (e.g. "Python", "JavaScript", "TypeScript", "Go", "Rust", "Java")
+#   line_start    — int: 1-based start line of this chunk in the source file
+#   line_end      — int: 1-based end line of this chunk in the source file
+#   symbol_name   — str: name of nearest function/class definition (if applicable)
+#   symbol_scope  — str: dotted path of containing scope (e.g. "MyClass.my_method")
+#   chunk_kind    — str: kind of content in this chunk
+#                    Values: "code_block" | "prose" | "comment" | "docstring" | "mixed"
+#   revision_id   — str: revision identifier for the source file (SHA256 of first 4KB + mtime)
+#   content_hash  — str: SHA256 of the chunk content itself (used for tombstone detection)
+#
 # TIMESTAMP POLICY:
 #   Use timestamp (UTC ISO8601 with Z suffix) consistently everywhere.
 #   filed_at is DEPRECATED — use timestamp only. Both may coexist during

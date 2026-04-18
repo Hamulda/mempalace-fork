@@ -35,7 +35,7 @@ class TestRegisterToolsDocstring:
 class TestProjectContextNoProjectKey:
     async def test_project_context_source_file_matching(self, palace_path, seeded_collection):
         """mempalace_project_context uses source_file/wing matching, not 'project' metadata key."""
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             # Previously crashed because "project" metadata key didn't exist
@@ -52,7 +52,7 @@ class TestProjectContextNoProjectKey:
 
     async def test_project_context_finds_matching_source(self, palace_path, seeded_collection):
         """mempalace_project_context finds drawers when source_file matches."""
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             # seeded_collection has source_file="auth.py"
@@ -88,7 +88,7 @@ class TestConsolidateKeeperIsNewest:
         )
         del client
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             result = await client.call_tool(
@@ -112,7 +112,7 @@ class TestEntityExtraction:
         # Use the default collection (mempalace_drawers)
         col = client.get_or_create_collection("mempalace_drawers")
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             # Content with repeated capitalized names (3+ mentions = entity candidate)
@@ -147,7 +147,7 @@ class TestEntityExtraction:
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_or_create_collection("mempalace_drawers")
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             code = "def authenticate(user):\n    return user.check_auth()"
@@ -211,7 +211,7 @@ class TestStatusCache:
         fm._status_cache["data"] = None
         fm._status_cache["ts"] = 0.0
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
 
         async with Client(transport=server) as client:
@@ -227,7 +227,7 @@ class TestStatusCache:
     async def test_status_cache_expires(self, palace_path, collection):
         """After TTL, status call recomputes."""
         import mempalace.fastmcp_server as fm
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
 
         async with Client(transport=server) as client:
@@ -243,7 +243,7 @@ class TestStatusCache:
     async def test_status_cache_expires(self, palace_path, collection):
         """After TTL, status call recomputes."""
         import mempalace.fastmcp_server as fm
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
 
         async with Client(transport=server) as client:
@@ -260,7 +260,7 @@ class TestStatusCache:
 class TestRememberCodeTruncation:
     async def test_remember_code_truncation_warning(self, palace_path, collection):
         """Code > 2000 chars returns code_truncated=True and original/stored lengths."""
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             long_code = "x" * 3000  # 3000 chars > 2000 limit
@@ -311,16 +311,6 @@ class TestKgThreadSafety:
 
 
 class TestSearcherBugfixes:
-    def test_query_cache_no_duplicate_definition(self):
-        """searcher.py has exactly 1 _get_query_cache def and 1 _query_cache = None."""
-        import re
-        with open("/Users/vojtechhamada/.claude/plugins/marketplaces/mempalace/mempalace/searcher.py") as f:
-            content = f.read()
-        count_qc = len(re.findall(r'def _get_query_cache', content))
-        count_cache_none = len(re.findall(r'_query_cache = None', content))
-        assert count_qc == 1, f"Expected 1 _get_query_cache def, got {count_qc}"
-        assert count_cache_none == 1, f"Expected 1 _query_cache = None, got {count_cache_none}"
-
     def test_cache_key_includes_priority(self):
         """search_memories with different priority_gte produces different cache keys."""
         from mempalace.searcher import search_memories
@@ -354,21 +344,6 @@ class TestSearcherBugfixes:
         assert cache.get_value("key1") is None
         assert cache.get_value("key2") is None
 
-    def test_invalidate_bm25_cache(self):
-        """invalidate_bm25_cache sets all BM25 globals to None."""
-        from mempalace.searcher import invalidate_bm25_cache, _bm25_index
-        import mempalace.searcher as searcher_module
-        # Set some globals first
-        searcher_module._bm25_index = "dummy"
-        searcher_module._bm25_corpus = ["doc"]
-        searcher_module._bm25_ids = ["id1"]
-        searcher_module._bm25_metas = [{"w": "meta"}]
-        invalidate_bm25_cache()
-        assert searcher_module._bm25_index is None
-        assert searcher_module._bm25_corpus is None
-        assert searcher_module._bm25_ids is None
-        assert searcher_module._bm25_metas is None
-
     def test_invalidate_query_cache(self):
         """invalidate_query_cache clears the query cache."""
         from mempalace.searcher import invalidate_query_cache
@@ -379,47 +354,15 @@ class TestSearcherBugfixes:
         invalidate_query_cache()
         assert cache.get_value("testkey") is None
 
-    def test_invalidate_all_caches_both(self):
-        """invalidate_all_caches clears both BM25 and query cache."""
-        from mempalace.searcher import invalidate_all_caches, _get_query_cache
-        import mempalace.searcher as searcher_module
-        # Set BM25 globals
-        searcher_module._bm25_index = "bm25dummy"
-        # Set query cache entry
-        cache = _get_query_cache()
-        cache.set_value("alltest", {"v": 1})
-        invalidate_all_caches()
-        assert searcher_module._bm25_index is None
-        assert cache.get_value("alltest") is None
-
 
 class TestCacheInvalidationAfterWrite:
     """F176d: cache invalidation after write operations."""
-
-    async def test_bm25_invalidated_after_add_drawer(self, palace_path, collection):
-        """add_drawer invalidates BM25 cache (sets _bm25_index to None)."""
-        import mempalace.fastmcp_server as fm
-        import mempalace.searcher as searcher_module
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
-        server = create_server(settings=settings)
-        # Set a dummy BM25 index
-        searcher_module._bm25_index = "dummy"
-        async with Client(transport=server) as client:
-            result = await client.call_tool(
-                "mempalace_add_drawer",
-                {"wing": "test", "room": "room", "content": "new content here", "added_by": "test"},
-            )
-            data = _get_result_data(result)
-            assert data.get("success"), f"add_drawer failed: {data}"
-        # After add_drawer, BM25 cache should be invalidated
-        assert searcher_module._bm25_index is None, "BM25 cache should be invalidated after add_drawer"
-        del server
 
     async def test_query_cache_cleared_after_add_drawer(self, palace_path, collection):
         """add_drawer clears the query cache."""
         from mempalace.searcher import _get_query_cache
         import mempalace.searcher as searcher_module
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         cache = _get_query_cache()
         cache.set_value("pretest", {"v": 1})
@@ -437,7 +380,7 @@ class TestCacheInvalidationAfterWrite:
     async def test_status_cache_invalidated_after_add_drawer(self, palace_path, collection):
         """add_drawer invalidates status cache (_status_cache["data"] set to None)."""
         import mempalace.fastmcp_server as fm
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         # Pre-populate status cache
         fm._status_cache["data"] = {"total_drawers": 999}
@@ -520,7 +463,7 @@ class TestHybridSearchIsLatest:
 
     async def test_hybrid_search_is_latest_param_mcp(self, palace_path, collection):
         """mempalace_hybrid_search MCP tool accepts is_latest param."""
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             result = await client.call_tool(
@@ -564,7 +507,7 @@ class TestGeneralExtractorIntegration:
 
     async def test_add_drawer_general_extraction_no_crash(self, palace_path, collection):
         """add_drawer with content that triggers general_extractor does not crash."""
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             result = await client.call_tool(
@@ -673,7 +616,7 @@ class TestMemoryGuardIntegration:
     async def test_add_drawer_guard_blocks(self, palace_path, collection):
         """When guard.should_pause_writes=True, add_drawer returns blocked error."""
         from mempalace.memory_guard import MemoryGuard
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         mock_guard = MagicMock()
         mock_guard.should_pause_writes.return_value = True
         mock_guard.pressure.value = "critical"
@@ -694,7 +637,7 @@ class TestMemoryGuardIntegration:
     async def test_add_drawer_guard_allows(self, palace_path, collection):
         """When guard.should_pause_writes=False, add_drawer proceeds normally."""
         from mempalace.memory_guard import MemoryGuard
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         mock_guard = MagicMock()
         mock_guard.should_pause_writes.return_value = False
         with patch.object(MemoryGuard, "get", return_value=mock_guard):
@@ -711,7 +654,7 @@ class TestMemoryGuardIntegration:
     async def test_add_drawer_guard_fail_open(self, palace_path, collection):
         """When guard.should_pause_writes raises, add_drawer proceeds (fail open)."""
         from mempalace.memory_guard import MemoryGuard
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         mock_guard = MagicMock()
         mock_guard.should_pause_writes.side_effect = RuntimeError("guard error")
         with patch.object(MemoryGuard, "get", return_value=mock_guard):
@@ -727,7 +670,7 @@ class TestMemoryGuardIntegration:
 
     async def test_status_includes_guard(self, palace_path, collection):
         """mempalace_status response includes memory_guard key."""
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             result = await client.call_tool("mempalace_status", {})

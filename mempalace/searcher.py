@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .backends import get_backend
+from .namespaces import get_collection_name_for_wing
 from .query_sanitizer import sanitize_query
 
 logger = logging.getLogger("mempalace_mcp")
@@ -97,7 +98,8 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     try:
         cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
-        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
+        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        col = backend.get_collection(palace_path, collection_name, create=False)
     except Exception:
         print(f"\n  No palace found at {palace_path}")
         print(f"  Run: mempalace init <dir> then mempalace mine <dir>")
@@ -186,7 +188,8 @@ def search_memories(
     # Cache lookup before backend call — key includes palace_path + collection_name
     try:
         cache = _get_query_cache()
-        cache_key = f"{palace_path}|{cfg.collection_name}|{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
+        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        cache_key = f"{palace_path}|{collection_name}|{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
         cached_result = cache.get_value(cache_key)
         if cached_result is not None:
             return cached_result
@@ -195,7 +198,8 @@ def search_memories(
 
     try:
         backend = get_backend(cfg.backend)
-        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
+        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        col = backend.get_collection(palace_path, collection_name, create=False)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -323,14 +327,6 @@ async def search_memories_async(
 
 
 
-# BM25 module-level state — path-aware to prevent cross-palace contamination
-_bm25_index = None
-_bm25_corpus = None
-_bm25_ids = None
-_bm25_metas = None
-_bm25_lock = threading.Lock()
-_bm25_path_cached: str | None = None  # palace_path of the current index
-
 # KG singleton — reused across hybrid_search calls, thread-safe
 _kg_instance = None
 _kg_path_cached: str | None = None
@@ -365,159 +361,6 @@ def _get_kg(palace_path: str):
     return _kg_instance
 
 
-def _get_bm25(col, palace_path: str, max_docs: int = 10000):
-    """Build BM25 index from collection. Returns (bm25, corpus_texts, doc_ids, metas) or (None, None, None, None).
-
-    Index is cached per palace_path — switching palaces invalidates the cache.
-    Memory-safe: loads in batches of 2000, checks memory pressure before/after each batch.
-    Stops early if memory becomes critical.
-    """
-    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas, _bm25_path_cached
-    try:
-        from rank_bm25 import BM25Okapi
-    except ImportError:
-        return None, None, None, None
-
-    # Return cached index only if same palace_path
-    if _bm25_index is not None and _bm25_path_cached == palace_path:
-        return _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
-
-    with _bm25_lock:
-        # Double-check after acquiring lock
-        if _bm25_index is not None and _bm25_path_cached == palace_path:
-            return _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas
-
-        # Different palace — invalidate stale index
-        if _bm25_index is not None and _bm25_path_cached != palace_path:
-            logger.debug("BM25 cache invalidated: palace changed (%s → %s)", _bm25_path_cached, palace_path)
-            _bm25_index = None
-            _bm25_corpus = None
-            _bm25_ids = None
-            _bm25_metas = None
-
-        # Memory guard check before starting build
-        try:
-            from .memory_guard import MemoryGuard, MemoryPressure
-            guard = MemoryGuard.get()
-            if guard.pressure == MemoryPressure.CRITICAL:
-                logger.warning("BM25 build skipped: memory pressure CRITICAL")
-                return None, None, None, None
-        except Exception:
-            pass  # MemoryGuard not available, proceed cautiously
-
-        try:
-            # Batched collection read — load incrementally to avoid RAM spike
-            BATCH = 2000
-            all_docs = []
-            all_ids = []
-            all_metas = []
-            offset = 0
-
-            while True:
-                batch = col.get(limit=BATCH, offset=offset, include=["documents", "metadatas"])
-                batch_docs = batch.get("documents", [])
-                if not batch_docs:
-                    break
-
-                all_docs.extend(batch_docs)
-                all_ids.extend(batch.get("ids", []))
-                all_metas.extend(batch.get("metadatas", []))
-
-                # Memory pressure check mid-build
-                try:
-                    from .memory_guard import MemoryGuard, MemoryPressure
-                    guard = MemoryGuard.get()
-                    if guard.pressure == MemoryPressure.CRITICAL:
-                        logger.warning("BM25 build interrupted: memory became CRITICAL at offset %d", offset)
-                        break
-                    elif guard.pressure == MemoryPressure.WARN:
-                        # Halve batch size under warning
-                        BATCH = 1000
-                except Exception:
-                    pass
-
-                offset += len(batch_docs)
-
-                # Early exit: stop if we've loaded max_docs
-                if len(all_docs) >= max_docs:
-                    logger.debug("BM25 build limited to %d documents (memory safety)", max_docs)
-                    all_docs = all_docs[:max_docs]
-                    all_ids = all_ids[:max_docs]
-                    all_metas = all_metas[:max_docs]
-                    break
-
-                if len(batch_docs) < BATCH:
-                    break
-
-            if not all_docs:
-                return None, None, None, None
-
-            tokenized = [d.lower().split() for d in all_docs]
-            bm25 = BM25Okapi(tokenized)
-
-            # Store in globals for reuse
-            _bm25_index = bm25
-            _bm25_corpus = all_docs
-            _bm25_ids = all_ids
-            _bm25_metas = all_metas
-            _bm25_path_cached = palace_path
-            logger.debug("BM25 index built: %d docs", len(all_docs))
-            return bm25, all_docs, all_ids, all_metas
-        except Exception as e:
-            logger.warning("BM25 index build failed: %s", e)
-            return None, None, None, None
-
-
-def _bm25_search(query: str, col, palace_path: str, n_results: int = 10, wing: str = None, room: str = None) -> list:
-    """Keyword search using BM25. Returns list of hit dicts compatible with search_memories() output."""
-    bm25, docs, ids, metas = _get_bm25(col, palace_path)
-    if bm25 is None:
-        return []
-
-    try:
-        tokenized_query = query.lower().split()
-        scores = bm25.get_scores(tokenized_query)
-        top_n = min(n_results * 2, len(scores))
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
-        max_score = max(scores) if max(scores) > 0 else 1.0
-
-        hits = []
-        for i, idx in enumerate(top_indices):
-            if scores[idx] <= 0:
-                continue
-            meta = metas[idx] if metas and idx < len(metas) else {}
-            if wing and meta.get("wing") != wing:
-                continue
-            if room and meta.get("room") != room:
-                continue
-            hits.append({
-                "id": ids[idx],
-                "text": docs[idx],
-                "wing": meta.get("wing", "unknown"),
-                "room": meta.get("room", "unknown"),
-                "source_file": meta.get("source_file", "?"),
-                "similarity": round(float(scores[idx]) / max_score, 3),
-                "source": "bm25",
-                "bm25_score": round(float(scores[idx]), 4),
-            })
-        return hits[:n_results]
-    except Exception as e:
-        logger.warning("BM25 search failed: %s", e)
-        return []
-
-
-def invalidate_bm25_cache() -> None:
-    """Call after any write operation to force BM25 index rebuild on next query."""
-    global _bm25_index, _bm25_corpus, _bm25_ids, _bm25_metas, _bm25_path_cached
-    with _bm25_lock:
-        _bm25_index = None
-        _bm25_corpus = None
-        _bm25_ids = None
-        _bm25_metas = None
-        _bm25_path_cached = None
-    logger.debug("BM25 cache invalidated")
-
-
 def invalidate_query_cache() -> None:
     """Clear all cached search results — call after any write."""
     try:
@@ -526,12 +369,6 @@ def invalidate_query_cache() -> None:
     except Exception:
         pass
     logger.debug("Query cache cleared")
-
-
-def invalidate_all_caches() -> None:
-    """Convenience: invalidate both BM25 and query cache after writes."""
-    invalidate_bm25_cache()
-    invalidate_query_cache()
 
 
 def _rrf_merge(result_lists: list, k: int = 60) -> list:
@@ -575,15 +412,16 @@ def hybrid_search(
     )
     hits = results.get("results", [])
 
-    # Vrstva 1b: BM25 keyword search (zachycuji presne vyrazy, verze, identifikatory)
-    bm25_hits = []
+    # Vrstva 1b: FTS5 keyword search (persistent SQLite index, zero memory at rest)
+    fts5_hits = []
     try:
         cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
-        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
-        bm25_hits = _bm25_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
+        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        col = backend.get_collection(palace_path, collection_name, create=False)
+        fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
     except Exception as e:
-        logger.warning("BM25 layer failed: %s", e)
+        logger.warning("FTS5 layer failed: %s", e)
 
     # Vrstva 2: KG entity search
     kg_hits = []
@@ -613,13 +451,13 @@ def hybrid_search(
                 logger.warning("KG layer failed in hybrid_search, vector search only: %s", e)
 
     # Reciprocal Rank Fusion — kombinuje vysledky ze vsech tri vrstev
-    merged = _rrf_merge([hits, bm25_hits, kg_hits])[:n_results]
+    merged = _rrf_merge([hits, fts5_hits, kg_hits])[:n_results]
 
     return {
         "query": query,
         "filters": {"wing": wing, "room": room, "agent_id": agent_id},
         "results": merged,
-        "sources": {"vector": len(hits), "bm25": len(bm25_hits), "kg": len(kg_hits)},
+        "sources": {"vector": len(hits), "fts5": len(fts5_hits), "kg": len(kg_hits)},
     }
 
 
@@ -636,3 +474,212 @@ async def hybrid_search_async(
             wing=wing, room=room, n_results=n_results, use_kg=use_kg,
             rerank=rerank, agent_id=agent_id, is_latest=is_latest)
     )
+
+
+# =============================================================================
+# SPLIT RETRIEVAL PATHS
+# =============================================================================
+
+import re as _re
+
+# Patterns that strongly indicate a code query (vs prose/diary query)
+_CODE_QUERY_PATTERNS = [
+    r'\bdef\s+\w+',          # Python function definition
+    r'\bfunction\s+\w+',     # JS/TS function
+    r'\bclass\s+\w+',       # class definition
+    r'\bimport\s+\w+',      # import statement
+    r'^from\s+\w+\s+import\b',  # from ... import (at start of query)
+    r'\brequire\s*\(',      # CommonJS require
+    r'\bexport\s+',         # ES module export
+    r'\blet\s+\w+',         # JS let
+    r'\bconst\s+\w+',       # JS const
+    r'=>',                  # arrow function
+    r'\.py\b',              # .py file reference
+    r'\.js\b',              # .js file reference
+    r'\.ts\b',              # .ts file reference
+    r'\.go\b',              # .go file reference
+    r'\.rs\b',              # .rs file reference
+    r'\.java\b',            # .java file reference
+    r'\w+\(\)',             # function call with ()
+    r'\w+\.\w+\(',          # method call
+    r'\b[A-Z][a-zA-Z0-9]+\s*\(',  # CamelCase function call
+    r'\bself\.',            # Python self
+    r'\bthis\.',            # JS this
+    r'::',                  # C++/Rust namespace/path operator
+]
+
+_CODE_QUERY_RE = _re.compile("|".join(_CODE_QUERY_PATTERNS), _re.IGNORECASE)
+
+
+def is_code_query(query: str) -> bool:
+    """Detect if a query looks like a code search (vs prose/memory search)."""
+    return bool(_CODE_QUERY_RE.search(query))
+
+
+def _fts5_search(
+    query: str,
+    col,
+    palace_path: str,
+    n_results: int = 10,
+    wing: str = None,
+    room: str = None,
+    language: str = None,
+) -> list:
+    """Keyword search via FTS5. Returns hits with document_id, score, metadata."""
+    try:
+        from .lexical_index import KeywordIndex
+
+        idx = KeywordIndex.get(palace_path)
+        results = idx.search(
+            query, n_results=n_results * 3,  # fetch more, filter below
+            wing=wing, room=room, language=language
+        )
+        if not results:
+            return []
+
+        # Fetch metadata for each hit from the collection
+        doc_ids = [r["document_id"] for r in results]
+        hits = []
+        for r in results:
+            try:
+                record = col.get(ids=[r["document_id"]], include=["documents", "metadatas"])
+                if record and record.get("ids"):
+                    doc = record["documents"][0] if record["documents"] else ""
+                    meta = record["metadatas"][0] if record["metadatas"] else {}
+                    hits.append({
+                        "id": r["document_id"],
+                        "text": doc,
+                        "wing": meta.get("wing", r.get("wing", "")),
+                        "room": meta.get("room", r.get("room", "")),
+                        "source_file": meta.get("source_file", "?"),
+                        "similarity": max(0.0, 1.0 - abs(r["score"]) / 10),  # Convert FTS5 score
+                        "source": "fts5",
+                        "fts5_score": round(r["score"], 4),
+                        "language": meta.get("language", r.get("language", "")),
+                    })
+            except Exception:
+                continue
+        return hits[:n_results]
+    except Exception as e:
+        logger.warning("FTS5 search failed: %s", e)
+        return []
+
+
+def code_search(
+    query: str,
+    palace_path: str,
+    n_results: int = 10,
+    language: str = None,
+    symbol_name: str = None,
+    file_path: str = None,
+    include_prose: bool = False,
+) -> dict:
+    """
+    Specialized retrieval for code content.
+
+    Filters: wing=repo, is_latest=True
+    Sources: vector search + FTS5 (for exact identifier match) + optional symbol filter
+
+    Args:
+        query: search query
+        palace_path: path to palace
+        n_results: number of results
+        language: filter by programming language (e.g. "Python", "JavaScript")
+        symbol_name: filter by exact symbol name (function/class name)
+        file_path: filter by source file path (substring match)
+        include_prose: if False (default), excludes prose/markdown files
+
+    Returns:
+        dict with results list, sources dict
+    """
+    from .config import MempalaceConfig
+
+    query = sanitize_query(query)
+    if not query:
+        return {"query": "", "filters": {}, "results": [], "error": "Query empty after sanitization"}
+
+    try:
+        cfg = MempalaceConfig()
+        backend = get_backend(cfg.backend)
+        collection_name = get_collection_name_for_wing("repo")
+        col = backend.get_collection(palace_path, collection_name, create=False)
+    except Exception:
+        return {"query": query, "filters": {}, "results": [], "error": f"No palace at {palace_path}"}
+
+    # Build filters
+    base_where = {"wing": "repo", "is_latest": True}
+
+    # FTS5 keyword search (exact identifier matching)
+    fts5_hits = []
+    if include_prose or language != "Markdown":
+        fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results, language=language)
+
+    # Vector search
+    vector_hits = []
+    try:
+        results = search_memories(
+            query=query, palace_path=palace_path,
+            wing="repo", room=None,
+            is_latest=True, n_results=n_results,
+        )
+        vector_hits = results.get("results", [])
+        # Apply language filter post-query
+        if language:
+            vector_hits = [h for h in vector_hits if h.get("language") == language]
+        # Apply symbol_name filter
+        if symbol_name:
+            vector_hits = [h for h in vector_hits if symbol_name.lower() in h.get("text", "").lower()]
+        # Apply file_path filter
+        if file_path:
+            vector_hits = [h for h in vector_hits if file_path.lower() in h.get("source_file", "").lower()]
+    except Exception as e:
+        logger.warning("Vector search in code_search failed: %s", e)
+
+    # Merge vector + FTS5 with RRF
+    merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
+
+    return {
+        "query": query,
+        "filters": {"language": language, "symbol_name": symbol_name, "file_path": file_path},
+        "results": merged,
+        "sources": {"vector": len(vector_hits), "fts5": len(fts5_hits)},
+    }
+
+
+def code_search_async(
+    query: str,
+    palace_path: str,
+    n_results: int = 10,
+    language: str = None,
+    symbol_name: str = None,
+    file_path: str = None,
+    include_prose: bool = False,
+) -> dict:
+    import asyncio, functools
+    loop = asyncio.get_event_loop()
+    return loop.run_in_executor(
+        _search_executor,
+        functools.partial(code_search, query=query, palace_path=palace_path,
+            n_results=n_results, language=language, symbol_name=symbol_name,
+            file_path=file_path, include_prose=include_prose)
+    )
+
+# Auto-routing: detect query type and route to appropriate specialized search
+def auto_search(
+    query: str,
+    palace_path: str,
+    n_results: int = 10,
+) -> dict:
+    """
+    Automatically detect query type and route to appropriate search path.
+
+    Detection rules:
+    - code-like query pattern → code_search()
+    - Otherwise → hybrid_search() (general search)
+
+    This is the recommended entry point for Claude Code — it handles routing automatically.
+    """
+    if is_code_query(query):
+        return code_search(query, palace_path, n_results=n_results)
+    else:
+        return hybrid_search(query, palace_path, n_results=n_results)

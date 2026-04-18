@@ -40,7 +40,7 @@ from .settings import settings, MemPalaceSettings
 from .version import __version__
 from .searcher import (
     search_memories, search_memories_async, hybrid_search_async,
-    invalidate_all_caches, code_search_async, auto_search,
+    invalidate_query_cache, code_search_async, auto_search,
     is_code_query,
 )
 from .palace_graph import traverse, find_tunnels, graph_stats
@@ -55,13 +55,8 @@ logger = logging.getLogger("mempalace_mcp")
 _wal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mp_wal")
 
 # Background work executor — bounded, prevents thread storm on M1/8GB
-# max_workers=2: one for general_extractor, one for BM25 rebuild
+# max_workers=2: one for general_extractor, one for background tasks
 _bg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mp_bg")
-
-# BM25 rebuild coalescing — dedup rebuild requests within a time window
-_bm25_pending_event: threading.Event = threading.Event()
-_bm25_pending_event.set()  # initially not pending
-_BM25_COALESCE_MS = 500  # debounce window
 
 # Status cache — wings/rooms aggregation cached for 60s
 _status_cache: dict = {"data": None, "ts": 0.0}
@@ -795,33 +790,8 @@ def _register_tools(server, backend, config, settings):
                 ],
             )
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-            invalidate_all_caches()
+            invalidate_query_cache()
             _invalidate_status_cache()
-
-            # Coalesced BM25 rebuild — debounce window prevents thread-per-write storm
-            def _schedule_bm25_rebuild():
-                if _bm25_pending_event.is_set():
-                    _bm25_pending_event.clear()
-
-                    def _debounced_rebuild():
-                        try:
-                            from .backends import get_backend
-                            backend2 = get_backend(settings.db_backend)
-                            col2 = backend2.get_collection(settings.db_path, settings.collection_name, create=False)
-                            from .searcher import _get_bm25
-                            _get_bm25(col2, settings.db_path)
-                        except Exception:
-                            pass
-                        finally:
-                            _bm25_pending_event.set()
-
-                    def _defer():
-                        time.sleep(_BM25_COALESCE_MS / 1000.0)
-                        _bg_executor.submit(_debounced_rebuild)
-
-                    threading.Thread(target=_defer, daemon=True, name="bm25_debounce").start()
-
-            _schedule_bm25_rebuild()
 
             return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
         except Exception as e:
@@ -852,7 +822,7 @@ def _register_tools(server, backend, config, settings):
 
         try:
             col.delete(ids=[drawer_id])
-            invalidate_all_caches()
+            invalidate_query_cache()
             _invalidate_status_cache()
             logger.info(f"Deleted drawer: {drawer_id}")
             return {"success": True, "drawer_id": drawer_id}
@@ -916,7 +886,7 @@ def _register_tools(server, backend, config, settings):
                 ],
             )
             logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
-            invalidate_all_caches()
+            invalidate_query_cache()
             _invalidate_status_cache()
             return {
                 "success": True,
@@ -1122,7 +1092,7 @@ def _register_tools(server, backend, config, settings):
                 }],
             )
             logger.info(f"Remembered code: {drawer_id} → {wing}/{room}")
-            invalidate_all_caches()
+            invalidate_query_cache()
             _invalidate_status_cache()
             return {
                 "success": True,
@@ -1210,7 +1180,7 @@ def _register_tools(server, backend, config, settings):
                         pass
 
                 logger.info(f"Consolidated {merged_count} duplicate memories for topic: {topic}")
-                invalidate_all_caches()
+                invalidate_query_cache()
                 _invalidate_status_cache()
 
             return {

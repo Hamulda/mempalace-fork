@@ -14,7 +14,7 @@ Canonical cache story:
   (protože search_memories volá invalidate_query_cache → clear())
 - write invalidace: LanceDB add/upsert/delete volá
   get_query_cache().invalidate_collection(palace_path, collection_name)
-  → fastmcp_server volá invalidate_all_caches() = clear() pro search cache
+  → fastmcp_server volá invalidate_query_cache() = clear() pro search cache
 """
 import time
 import threading
