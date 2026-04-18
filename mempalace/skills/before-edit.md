@@ -5,16 +5,34 @@ trigger: before claiming a file to edit
 
 # Before Edit — Claim Path
 
-Before claiming a file to edit, always run conflict check first.
+Before claiming a file to edit, follow this protocol:
 
-## Protocol
+## Step 1: Check Recent Changes (if known)
 
-### Step 1: Conflict Check
+If you know the file path, check if it's a hot spot:
+```
+mempalace_recent_changes(project_root="/path", n=5)
+```
+This tells you if the file has been changing frequently.
+
+## Step 2: Symbol Lookup (optional but recommended)
+
+If editing a function or class, find its current location and signature:
+```
+mempalace_find_symbol(symbol_name="my_function")
+mempalace_file_symbols(file_path="/path/to/file.py")
+```
+
+This helps you understand the current scope before making changes.
+
+## Step 3: Conflict Check
+
+Check for active claims before editing:
 ```
 mempalace_conflict_check(path="/path/to/file.py", session_id="your-session-id")
 ```
 
-### Step 2: If Conflict Detected
+### If Conflict Detected
 ```json
 {
   "has_conflict": true,
@@ -28,12 +46,13 @@ When conflict detected:
 - Wait for the claim to expire, or coordinate via handoff
 - Never edit a file with an active claim from another session
 
-### Step 3: If No Conflict
+### If No Conflict
 ```
 mempalace_claim_path(path="/path/to/file.py", session_id="your-session-id", ttl_seconds=600, note="fixing bug in auth flow")
 ```
 
-### Step 4: Log Intent to WriteCoordinator
+## Step 4: Log Intent to WriteCoordinator
+
 Use the WriteCoordinator to log your write intent for crash recovery:
 ```
 write_coordinator.log_intent(session_id, operation="edit", target_type="file", target_id="/path/to/file.py")
@@ -64,3 +83,10 @@ mempalace_claim_path(
   note="fixing session expiry bug — auth flow refactor"
 )
 ```
+
+## Wakeup Context Enrichment
+
+After claiming, your session's wakeup context will include:
+- active_claims (what you're holding)
+- active_symbols (symbols in the claimed files)
+- next_checks (validation steps)

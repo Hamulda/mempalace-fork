@@ -8,21 +8,20 @@ trigger: when taking over work from another session
 When another session stops and you need to take over their work, follow this protocol.
 
 ## Step 1: Pull Pending Handoffs
-See what's been left for you:
 
+See what's been left for you:
 ```
 mempalace_pull_handoffs(session_id="your-session-id")
 ```
 
 Or for broadcast handoffs (no specific recipient):
-
 ```
 mempalace_pull_handoffs(session_id=None)
 ```
 
 ## Step 2: Get Full Wakeup Context
-For complete picture:
 
+For complete picture including recent changes and hot spots:
 ```
 mempalace_wakeup_context(session_id="your-session-id", project_root="/path/to/project")
 ```
@@ -31,53 +30,54 @@ This returns:
 - Active claims you hold
 - Pending handoffs for you
 - Recent decisions you made
-- Any conflicts from expired claims
+- Recent repo changes (files changed recently)
+- Hot spots (most-frequently changed files)
+- Active symbols from claimed files
+- Relevant decisions (linked to your file context)
 - Session info from registry
-- Recommended tools based on context
+- Next checks (validation steps)
 
-## Step 3: Accept the Handoff
+## Step 3: Check Recent Changes Impact
+
+Before diving in, understand what's changed recently:
+```
+mempalace_recent_changes(project_root="/path/to/project", n=10)
+```
+
+This tells you which files have been active — helpful for understanding context.
+
+## Step 4: Accept the Handoff
+
 When you decide to take over work from a handoff:
-
 ```
 mempalace_accept_handoff(handoff_id="handoff-uuid", session_id="your-session-id")
 ```
 
 This marks the handoff as accepted and updates the status.
 
-## Step 4: Check Claims of Other Session
-If no handoff was pushed but you see claims from another session:
+## Step 5: Symbol Context (if handoff mentions specific files)
 
+If the handoff mentions specific files, get symbol context:
+```
+mempalace_file_symbols(file_path="/path/to/handoff-file.py")
+mempalace_find_symbol(symbol_name="function_in_handoff_file")
+```
+
+This helps you understand the current state of the code you're taking over.
+
+## Step 6: Check Claims of Other Session
+
+If no handoff was pushed but you see claims from another session:
 ```
 mempalace_list_claims()
 ```
 
 Check `expires_at` on their claims to know when they'll expire.
 
-## Step 5: Plan Next Steps from Blockers
-Review the `blockers` and `next_steps` fields in the handoff:
+## Hot Spot Awareness
 
-```
-blockers: ["Need to update API docs for new token format"]
-next_steps: ["Update API docs", "Add integration tests for JWT rotation"]
-```
-
-## Claim Expiration Behavior
-
-Claims have TTL (default 600 seconds / 10 minutes):
-- If the other session's claims expire, you can claim those files
-- Before editing, always run `mempalace_conflict_check`
-- Claims do NOT auto-renew — they expire and become available
-
-## Conflict Resolution
-
-If you and another session want the same file:
-
-1. Check `mempalace_conflict_check` to see who holds it
-2. If the other session has a claim:
-   - Wait for it to expire, or
-   - Push a handoff to coordinate
-3. If no active claim but there was recent conflict:
-   - Use `mempalace_claim_path` with note to negotiate
+The wakeup context includes `hot_spots` — files that have changed frequently recently.
+If the takeover involves a hot spot file, be extra careful about concurrent edits.
 
 ## After Takeover
 

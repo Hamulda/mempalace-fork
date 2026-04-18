@@ -1,63 +1,94 @@
-# MemPalace Search
+# MemPalace Search — Symbol-First Priority
 
 When the user wants to search their MemPalace memories, follow these steps:
 
-## 1. Parse the Search Query
+## Priority Order
 
-Extract the core search intent from the user's message. Identify any explicit
-or implicit filters:
-- Wing -- a top-level category (e.g., "work", "personal", "research")
-- Room -- a sub-category within a wing
-- Keywords / semantic query -- the actual search terms
+### 1. Symbol-First Lookup (for code queries)
 
-## 2. Determine Wing/Room Filters
+If the query looks like a symbol/function/class name, start with symbol tools:
 
-If the user mentions a specific domain, topic area, or context, map it to the
-appropriate wing and/or room. If unsure, omit filters to search globally. You
-can discover the taxonomy first if needed.
+```
+mempalace_find_symbol(symbol_name="process_file")
+```
+→ Returns file path, line range, signature immediately.
 
-## 3. Use MCP Tools (Preferred)
+For partial matches:
+```
+mempalace_search_symbols(pattern="process*")
+```
+
+For "who calls this" queries:
+```
+mempalace_callers(symbol_name="my_function", project_root="/path/to/project")
+```
+
+For "what's in this file":
+```
+mempalace_file_symbols(file_path="/src/myfile.py")
+```
+
+### 2. Semantic Search (Preferred for general queries)
 
 If MCP tools are available, use them in this priority order:
 
+- mempalace_auto_search(query, n_results) -- Auto-detects code vs prose, routes automatically.
+  Use this as the DEFAULT entry point for unknown query types.
 - mempalace_search(query, wing, room, rerank, is_latest, agent_id) -- Fast semantic search.
   Use for keyword/topic search. rerank=True for better precision on complex queries.
 - mempalace_hybrid_search(query, wing, room, use_kg, rerank) -- Hybrid search combining
-  semantic (LanceDB) + knowledge graph entity matches. Use this as the DEFAULT search
-  tool when the user asks about people, projects, or factual relationships. Prefer over
-  mempalace_search when context is rich or query involves entities.
-  Parameters: use_kg=True (include KG triples), rerank=True (cross-encoder reranking,
-  slower but more precise for queries > 3 words), agent_id (filter by agent).
-- mempalace_list_wings -- Discover all available wings. Use when the user asks
-  what categories exist or you need to resolve a wing name.
-- mempalace_list_rooms(wing) -- List rooms within a specific wing. Use to help
-  the user navigate or to resolve a room name.
-- mempalace_get_taxonomy -- Retrieve the full wing/room/drawer tree. Use when
-  the user wants an overview of their entire memory structure.
-- mempalace_traverse(room) -- Walk the knowledge graph starting from a room.
-  Use when the user wants to explore connections and related memories.
-- mempalace_find_tunnels(wing1, wing2) -- Find cross-wing connections (tunnels)
-  between two wings. Use when the user asks about relationships between
-  different knowledge domains.
+  semantic (LanceDB) + knowledge graph entity matches. Use when context is rich or query
+  involves entities. use_kg=True (include KG triples), rerank=True (cross-encoder reranking).
+- mempalace_code_search(query, language, symbol_name, file_path) -- Code-specialized search
+  with language/symbol/path filters. Best for "find me Python code about X".
 
-## 4. CLI Fallback
+### 3. Discover Structure
+
+- mempalace_list_wings -- Discover all available wings
+- mempalace_list_rooms(wing) -- List rooms within a specific wing
+- mempalace_get_taxonomy -- Full wing/room/drawer tree
+- mempalace_traverse(room) -- Walk the knowledge graph from a room
+- mempalace_find_tunnels(wing1, wing2) -- Find cross-wing connections
+
+### 4. CLI Fallback
 
 If MCP tools are not available, fall back to the CLI:
 
     mempalace search "query" [--wing X] [--room Y]
 
-## 5. Present Results
+## Query Type Detection
+
+| Query Type | Example | Start With |
+|-----------|---------|------------|
+| Symbol lookup | "where is process_file defined" | mempalace_find_symbol |
+| Caller search | "who calls validate_token" | mempalace_callers |
+| Code search | "find Python code about auth" | mempalace_code_search |
+| Semantic | "sessions don't expire correctly" | mempalace_auto_search |
+| Entity/fact | "what did we decide about JWT" | mempalace_hybrid_search |
+| File symbols | "what's in auth.py" | mempalace_file_symbols |
+
+## Recent Changes Awareness
+
+Before doing deep searches, consider checking recent changes:
+
+```
+mempalace_recent_changes(project_root="/path", n=10)
+```
+
+This shows files changed in recent commits — helps prioritize results from active files.
+
+## Present Results
 
 When presenting search results:
 - Always include source attribution: wing, room, and drawer for each result
 - Show relevance or similarity scores if available
+- For symbol results, show file path and line range
 - Group results by wing/room when returning multiple hits
-- Quote or summarize the memory content clearly
 
-## 6. Offer Next Steps
+## After Results
 
-After presenting results, offer the user options to go deeper:
+Offer next steps:
 - Drill deeper -- search within a specific room or narrow the query
+- Explore symbols -- use symbol tools to find callers/definitions
 - Traverse -- explore the knowledge graph from a related room
 - Check tunnels -- look for cross-wing connections if the topic spans domains
-- Browse taxonomy -- show the full structure for manual exploration

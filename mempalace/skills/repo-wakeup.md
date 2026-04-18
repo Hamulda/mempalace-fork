@@ -7,47 +7,74 @@ trigger: when waking up in a project with active sessions
 
 When you wake up in a project with active MemPalace sessions, follow this checklist:
 
-## Step 1: Check Active Claims
-Call `mempalace_list_claims` to see which files are currently claimed by other sessions.
-
-```
-mempalace_list_claims
-```
-
-## Step 2: Pull Pending Handoffs
-Call `mempalace_pull_handoffs` for your session to see what other sessions left for you.
-
-```
-mempalace_pull_handoffs(session_id="your-session-id")
-```
-
-## Step 3: Check for Conflicts
-Call `mempalace_conflict_check` on any files you plan to edit.
-
-```
-mempalace_conflict_check(path="/path/to/file.py", session_id="your-session-id")
-```
-
-## Step 4: Get Full Wakeup Context
-For complete context bundle including active claims, pending handoffs, recent decisions:
+## Step 1: Get Full Wakeup Context
 
 ```
 mempalace_wakeup_context(session_id="your-session-id", project_root="/path/to/project")
 ```
 
-## Step 5: Load Recent Decisions
-Check what architectural decisions were made recently:
+This returns:
+- Active claims you hold
+- Pending handoffs for you
+- Recent decisions you made
+- Recent repo changes (last 20 files changed)
+- Hot spots (files changed most in last 30 days)
+- Active symbols from claimed files
+- Relevant decisions (linked to your file context)
+- Next checks (validation steps based on context)
+
+## Step 2: Check Recent Changes
 
 ```
-mempalace_list_decisions(session_id="your-session-id", category="architecture")
+mempalace_recent_changes(project_root="/path/to/project", n=10)
 ```
 
-## After Loading Context
+This shows:
+- Files that changed in recent commits
+- Hot spots (most-frequently changed files)
+- Languages with recent activity
 
-- If there are pending handoffs: review the `blockers` and `next_steps` fields
-- If there are active claims by others: wait or coordinate via handoff
-- If you have claims from a previous session: check if they're still valid
-- If conflicts exist: use `mempalace_claim_path` with a note to negotiate ownership
+This is especially useful for understanding what other sessions have been working on.
+
+## Step 3: Check Active Claims
+
+```
+mempalace_list_claims()
+```
+
+See which files are currently claimed by other sessions.
+
+## Step 4: Pull Pending Handoffs
+
+```
+mempalace_pull_handoffs(session_id="your-session-id")
+```
+
+See what other sessions left for you.
+
+## Step 5: Symbol Context for Active Claims
+
+If you have active claims, understand what's in those files:
+```
+mempalace_file_symbols(file_path="/path/to/file.py")
+```
+
+Or find a specific symbol:
+```
+mempalace_find_symbol(symbol_name="function_name")
+```
+
+## Step 6: Check for Conflicts
+
+Call `mempalace_conflict_check` on any files you plan to edit:
+```
+mempalace_conflict_check(path="/path/to/file.py", session_id="your-session-id")
+```
+
+## Hot Spots in Wakeup Context
+
+The wakeup context now includes `hot_spots` — files changed most in the last 30 days.
+If you see a file you need to edit in hot_spots, coordinate carefully to avoid conflicts.
 
 ## Session Resume vs Takeover
 

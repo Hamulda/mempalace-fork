@@ -9,7 +9,7 @@ When you've made an architectural decision, capture it for future reference.
 
 ## Why Capture Decisions?
 
-- Avoid revisiting the same权衡
+- Avoid revisiting the same trade-offs
 - Onboard future sessions faster
 - Track rationale for architectural choices
 - Enable superseding when better decisions are made
@@ -29,12 +29,22 @@ Capture decisions when:
 mempalace_capture_decision(
   session_id="your-session-id",
   decision="Use JWT instead of sessions for auth",
-  rationale="Sessions don't scale across multiple servers. JWT is stateless and works better with horizontal scaling.",
+  rationale="Sessions don't scale across multiple servers. JWT is stateless and works better with horizontal scaling. Affects /src/auth.py token handling and /src/middleware.py.",
   alternatives=["Keep sessions with sticky sessions", "Use cookies with server-side validation"],
   category="architecture",
   confidence=4
 )
 ```
+
+## Include File Context in Rationale
+
+Always include affected file paths in rationale — this makes decisions more useful for takeover:
+
+```
+rationale="Changed token refresh from 30min to 24h — affects /src/auth.py (token handling), /src/middleware.py (session validation), and /tests/test_auth.py"
+```
+
+This allows `mempalace_list_decisions` to surface decisions relevant to files you're currently editing.
 
 ## Categories
 
@@ -64,10 +74,14 @@ Always document alternatives, even if quickly:
 - Why was the chosen option better?
 - What would need to change for you to choose differently?
 
+## Relevant Decisions in Wakeup
+
+When `mempalace_wakeup_context` returns decisions, it filters by file context from your active claims.
+If you're editing `/src/auth.py` and there's a decision with `/src/auth.py` in its rationale, it appears in `relevant_decisions`.
+
 ## Superseding Decisions
 
 If you later make a better decision that supersedes an old one:
-
 ```
 mempalace_supersede_decision(
   decision_id="old-decision-uuid",

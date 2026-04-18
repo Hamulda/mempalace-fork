@@ -44,6 +44,8 @@ from .searcher import (
     is_code_query,
 )
 from .palace_graph import traverse, find_tunnels, graph_stats
+from .symbol_index import SymbolIndex, extract_symbols
+from .recent_changes import get_recent_changes, get_hot_spots, build_change_summary
 from .knowledge_graph import KnowledgeGraph
 from .backends import get_backend
 from .entity_detector import extract_candidates
@@ -1669,6 +1671,98 @@ def _register_tools(server, backend, config, settings):
 
         decisions = mgr.list_decisions(session_id=session_id, category=category)
         return {"decisions": decisions, "count": len(decisions)}
+
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_find_symbol(
+        ctx: Context,
+        symbol_name: str,
+        palace_path: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Find exact symbol definition by name. Returns file, line range, signature."""
+        if not symbol_name:
+            return {"error": "symbol_name is required"}
+        palace_path = palace_path or _get_palace_path()
+        try:
+            si = SymbolIndex.get(palace_path)
+            results = si.find_symbol(symbol_name)
+            if not results:
+                # Try partial match
+                results = si.search_symbols(symbol_name)
+            return {"symbol_name": symbol_name, "results": results, "count": len(results)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_search_symbols(
+        ctx: Context,
+        pattern: str,
+        palace_path: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Search symbol names matching a pattern (glob or regex)."""
+        if not pattern:
+            return {"error": "pattern is required"}
+        palace_path = palace_path or _get_palace_path()
+        try:
+            si = SymbolIndex.get(palace_path)
+            results = si.search_symbols(pattern)
+            return {"pattern": pattern, "results": results, "count": len(results)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_callers(
+        ctx: Context,
+        symbol_name: str,
+        project_root: str | None = None,
+        palace_path: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Find files that reference/call a symbol (via import or text)."""
+        if not symbol_name:
+            return {"error": "symbol_name is required"}
+        palace_path = palace_path or _get_palace_path()
+        project_root = project_root or os.environ.get("PROJECT_ROOT", "")
+        try:
+            si = SymbolIndex.get(palace_path)
+            results = si.get_callers(symbol_name, project_root)
+            return {"symbol_name": symbol_name, "callers": results, "count": len(results)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_recent_changes(
+        ctx: Context,
+        project_root: str | None = None,
+        n: int = 20,
+    ) -> dict:
+        """[MEMPALACE] Get recently changed files from git log."""
+        if not project_root:
+            project_root = os.environ.get("PROJECT_ROOT", "")
+        if not project_root:
+            return {"error": "project_root is required"}
+        try:
+            changes = get_recent_changes(project_root, n=n)
+            hot_spots = get_hot_spots(project_root, n=5)
+            return {"recent_changes": changes, "hot_spots": hot_spots, "count": len(changes)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_file_symbols(
+        ctx: Context,
+        file_path: str,
+        palace_path: str | None = None,
+    ) -> dict:
+        """[MEMPALACE] Get all symbols defined in a file."""
+        if not file_path:
+            return {"error": "file_path is required"}
+        palace_path = palace_path or _get_palace_path()
+        try:
+            si = SymbolIndex.get(palace_path)
+            result = si.get_file_symbols(file_path)
+            return {"file_path": file_path, **result}
+        except Exception as e:
+            return {"error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════

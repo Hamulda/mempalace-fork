@@ -21,6 +21,7 @@ from collections import defaultdict
 from .config import MempalaceConfig
 from .backends import get_backend
 from .palace import SKIP_DIRS, file_already_mined  # Only SKIP_DIRS and file_already_mined remain from palace.py
+from .symbol_index import SymbolIndex, extract_symbols
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -58,6 +59,79 @@ CHUNK_SIZE = 800  # chars per drawer
 CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — skip files larger than this
+
+# Language detection from file extension
+LANGUAGE_MAP = {
+    ".py": "Python", ".pyi": "Python",
+    ".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".mts": "TypeScript", ".cts": "TypeScript",
+    ".java": "Java", ".go": "Go", ".rs": "Rust", ".rb": "Ruby", ".php": "PHP",
+    ".c": "C", ".h": "C", ".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".hpp": "C++",
+    ".cs": "C#", ".swift": "Swift", ".kt": "Kotlin", ".scala": "Scala",
+    ".r": "R", ".R": "R", ".lua": "Lua", ".pl": "Perl",
+    ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell", ".fish": "Shell", ".ps1": "PowerShell",
+    ".sql": "SQL", ".yaml": "YAML", ".yml": "YAML", ".json": "JSON", ".toml": "TOML",
+    ".xml": "XML", ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS",
+    ".less": "Less", ".md": "Markdown", ".rst": "reStructuredText", ".txt": "Text",
+    ".csv": "CSV", ".tf": "HCL", ".hcl": "HCL", ".dockerfile": "Dockerfile",
+}
+
+# Language detection from file extension
+LANGUAGE_MAP = {
+    ".py": "Python",
+    ".pyi": "Python",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".mjs": "JavaScript",
+    ".cjs": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".mts": "TypeScript",
+    ".cts": "TypeScript",
+    ".java": "Java",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".rb": "Ruby",
+    ".php": "PHP",
+    ".c": "C",
+    ".h": "C",
+    ".cpp": "C++",
+    ".cc": "C++",
+    ".cxx": "C++",
+    ".hpp": "C++",
+    ".cs": "C#",
+    ".swift": "Swift",
+    ".kt": "Kotlin",
+    ".scala": "Scala",
+    ".r": "R",
+    ".R": "R",
+    ".lua": "Lua",
+    ".pl": "Perl",
+    ".sh": "Shell",
+    ".bash": "Shell",
+    ".zsh": "Shell",
+    ".fish": "Shell",
+    ".ps1": "PowerShell",
+    ".sql": "SQL",
+    ".yaml": "YAML",
+    ".yml": "YAML",
+    ".json": "JSON",
+    ".toml": "TOML",
+    ".xml": "XML",
+    ".html": "HTML",
+    ".htm": "HTML",
+    ".css": "CSS",
+    ".scss": "SCSS",
+    ".less": "Less",
+    ".md": "Markdown",
+    ".rst": "reStructuredText",
+    ".txt": "Text",
+    ".csv": "CSV",
+    ".tf": "HCL",
+    ".hcl": "HCL",
+    ".dockerfile": "Dockerfile",
+    ".toml": "TOML",
+}
 
 
 # =============================================================================
@@ -369,8 +443,316 @@ def chunk_text(content: str, source_file: str) -> list:
 
 
 # =============================================================================
-# PALACE — ChromaDB operations
+# LANGUAGE DETECTION
 # =============================================================================
+
+
+def detect_language(source_file: str) -> str:
+    """Detect programming language from file extension."""
+    ext = Path(source_file).suffix.lower()
+    return LANGUAGE_MAP.get(ext, "Text")
+
+
+def _is_code_line(line: str) -> bool:
+    """Check if a line looks like code (not a comment or blank)."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # Skip single-line comments
+    if stripped.startswith("#") or stripped.startswith("//") or stripped.startswith(";"):
+        return False
+    return True
+
+
+def _find_string_bounds(content: str, start: int) -> tuple[int, str]:
+    """Find the end of a string literal starting at 'start'. Returns (end_pos, quote_char)."""
+    quote = content[start]
+    end = start + 1
+    while end < len(content):
+        if content[end] == "\\" and end + 1 < len(content):
+            end += 2
+            continue
+        if content[end] == quote:
+            return end + 1, quote
+        end += 1
+    return end, quote
+
+
+def _in_string_or_comment(content: str, pos: int) -> bool:
+    """Check if position is inside a string or line comment."""
+    line = content[:pos]
+    # Find the last line start
+    last_newline = line.rfind("\n")
+    line_start = last_newline + 1 if last_newline >= 0 else 0
+    current_line = line[line_start:]
+
+    # Check for line comment
+    in_string = False
+    quote = None
+    i = 0
+    while i < len(current_line):
+        c = current_line[i]
+        if not in_string:
+            if c in ('"', "'", "`"):
+                in_string = True
+                quote = c
+            elif c == "#" or current_line[i:i+2] == "//":
+                return False  # line comment starts
+        else:
+            if c == "\\" and i + 1 < len(current_line):
+                i += 2
+                continue
+            if c == quote:
+                in_string = False
+                quote = None
+        i += 1
+    return in_string
+
+
+# =============================================================================
+# STRUCTURAL CODE CHUNKING
+# =============================================================================
+
+# Pattern definitions for language-specific structural splitting
+_PYTHON_PATTERNS = [
+    (r'^def\s+(\w+)', 'def'),
+    (r'^class\s+(\w+)', 'class'),
+    (r'^async\s+def\s+(\w+)', 'async_def'),
+    (r'^@(\w+)', 'decorator'),
+]
+
+_JS_PATTERNS = [
+    (r'^function\s+(\w+)', 'function'),
+    (r'^async\s+function\s+(\w+)', 'async_function'),
+    (r'^const\s+(\w+)\s*=', 'const'),
+    (r'^let\s+(\w+)\s*=', 'let'),
+    (r'^class\s+(\w+)', 'class'),
+    (r'^export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)', 'export_fn'),
+    (r'^export\s+(?:default\s+)?class\s+(\w+)', 'export_class'),
+]
+
+_GENERIC_CODE_PATTERNS = [
+    (r'^(?:public|private|protected|static|abstract|final)\s+(?:class|interface|enum)', 'java_member'),
+    (r'^(?:func|func\s+\([^)]+\))\s+(\w+)', 'go_func'),
+    (r'^(?:pub|pub\s+fn|fn)\s+(\w+)', 'rust_fn'),
+    (r'^(?:def|class)\s+(\w+)', 'generic_def'),
+]
+
+import re as _re
+
+_PATTERNS_BY_LANG = {
+    "Python": _PYTHON_PATTERNS,
+    "TypeScript": _JS_PATTERNS,
+    "JavaScript": _JS_PATTERNS,
+    "Java": _GENERIC_CODE_PATTERNS,
+    "Go": _GENERIC_CODE_PATTERNS,
+    "Rust": _GENERIC_CODE_PATTERNS,
+    "C": _GENERIC_CODE_PATTERNS,
+    "C++": _GENERIC_CODE_PATTERNS,
+    "C#": _GENERIC_CODE_PATTERNS,
+}
+
+
+def split_code_structurally(content: str, source_file: str, max_chunk_chars: int = 1200) -> list:
+    """
+    Split code content along structural boundaries (function/class definitions).
+
+    For code files: splits at function/class definitions, decorators.
+    For non-code files: falls back to paragraph chunking.
+
+    Returns list of dicts with keys: content, line_start, line_end, symbol_name, symbol_scope, chunk_kind
+    """
+    language = detect_language(source_file)
+    ext = Path(source_file).suffix.lower()
+
+    # Non-code files: use paragraph chunking
+    non_code_extensions = {
+        ".md", ".txt", ".rst", ".json", ".yaml", ".yml", ".toml", ".xml",
+        ".html", ".htm", ".css", ".scss", ".less", ".csv", ".sql",
+    }
+    if ext in non_code_extensions or language == "Text":
+        raw_chunks = chunk_text(content, source_file)
+        # Add line info
+        lines = content.split("\n")
+        pos_to_line = []
+        line_start = 0
+        for i, line in enumerate(lines):
+            pos_to_line.append((line_start, line_start + len(line)))
+            line_start += len(line) + 1
+
+        chunks = []
+        for ck in raw_chunks:
+            # Find line range for this chunk
+            content_str = ck["content"]
+            start_pos = content.find(content_str[:50])
+            if start_pos < 0:
+                start_pos = 0
+            # Find line numbers
+            line_start = 1
+            line_end = len(lines)
+            acc = 0
+            for i, line in enumerate(lines):
+                if acc >= start_pos:
+                    line_start = i + 1
+                    break
+                acc += len(line) + 1
+            acc2 = acc
+            for i, line in enumerate(lines):
+                if acc2 >= start_pos + len(content_str):
+                    line_end = i + 1
+                    break
+                acc2 += len(line) + 1
+            chunks.append({
+                "content": ck["content"],
+                "line_start": line_start,
+                "line_end": line_end,
+                "symbol_name": "",
+                "symbol_scope": "",
+                "chunk_kind": "prose",
+            })
+        return chunks
+
+    patterns = _PATTERNS_BY_LANG.get(language, _GENERIC_CODE_PATTERNS)
+
+    # Build regex for this language (numbered groups, not named)
+    # Each pattern gets its own group for the whole match, plus inner group for symbol name
+    all_patterns = "|".join(f"({p})" for i, (p, _) in enumerate(patterns))
+    pattern_re = _re.compile(all_patterns, _re.MULTILINE)
+
+    # Find all structural split points
+    lines = content.split("\n")
+    split_points = [0]  # line indices where chunks begin
+    current_scope = []
+    symbol_map = {}  # line_index -> (symbol_name, symbol_scope)
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("//") or stripped.startswith(";"):
+            continue
+
+        match = pattern_re.match(stripped)
+        if match:
+            # Find which pattern group matched and get the symbol name
+            # Group numbering: group(1) = first pattern, group(2) = its inner (\w+)
+            #                  group(3) = second pattern, group(4) = its inner (\w+), etc.
+            sym_name = ""
+            kind = None
+            for gi in range(len(patterns)):
+                outer_group = match.group(gi * 2 + 1)
+                if outer_group is not None:
+                    # This pattern matched
+                    name_group = match.group(gi * 2 + 2)
+                    sym_name = name_group if name_group else outer_group.split()[1] if outer_group else ""
+                    _, kind = patterns[gi]
+                    break
+
+            # Build scope
+            scope_parts = [s for s in current_scope if s]
+            scope = ".".join(scope_parts) if scope_parts else ""
+
+            symbol_map[i] = (sym_name, scope)
+
+            # Class definitions push to scope; methods inside classes are tracked
+            # in symbol_map but don't create structural split boundaries
+            if kind in ("class", "export_class"):
+                current_scope.append(sym_name)
+
+            # Only add split point for top-level definitions, not methods inside classes
+            is_method_scope = bool(current_scope)  # inside a class body
+            is_method_pattern = kind in ("def", "function", "async_def", "async_function", "go_func", "rust_fn", "generic_def")
+            if not (is_method_scope and is_method_pattern):
+                split_points.append(i)
+
+    # Deduplicate and sort
+    split_points = sorted(set(split_points))
+
+    # Build chunks between split points
+    chunks = []
+    for idx in range(len(split_points)):
+        start_line = split_points[idx]
+        # Next split point is the start of the NEXT chunk
+        next_split = split_points[idx + 1] if idx + 1 < len(split_points) else len(lines)
+
+        # Accumulate lines from start_line, stopping at next split point or max_chunk_chars
+        chunk_lines = []
+        char_count = 0
+        chunk_end = start_line
+        for li in range(start_line, len(lines)):
+            # Stop at next split point (structural boundary)
+            if li >= next_split and chunk_lines:
+                chunk_end = li - 1
+                break
+
+            line_text = lines[li]
+            line_len = len(line_text) + 1
+
+            # Stop if we've exceeded max_chunk_chars and have content
+            if char_count + line_len > max_chunk_chars and chunk_lines:
+                chunk_end = li - 1
+                break
+
+            chunk_lines.append(line_text)
+            char_count += line_len
+            chunk_end = li
+
+        if not chunk_lines:
+            continue
+
+        chunk_content = "\n".join(chunk_lines).strip()
+        if len(chunk_content) < MIN_CHUNK_SIZE:
+            continue
+
+        sym_name, sym_scope = symbol_map.get(start_line, ("", ""))
+        if not sym_name and symbol_map:
+            # Use the closest earlier symbol
+            for prev in range(start_line - 1, -1, -1):
+                if prev in symbol_map:
+                    sym_name, sym_scope = symbol_map[prev]
+                    break
+
+        # Detect chunk kind
+        if any(stripped.startswith(("#", "//", "/*", "*/", '"""', "'''")) for stripped in chunk_lines[:5]):
+            chunk_kind = "comment"
+        elif '"""' in chunk_content or "'''" in chunk_content:
+            chunk_kind = "docstring"
+        elif "def " in chunk_content or "class " in chunk_content or "function " in chunk_content:
+            chunk_kind = "code_block"
+        else:
+            chunk_kind = "mixed"
+
+        chunks.append({
+            "content": chunk_content,
+            "line_start": start_line + 1,  # 1-based
+            "line_end": chunk_end + 1,
+            "symbol_name": sym_name,
+            "symbol_scope": sym_scope,
+            "chunk_kind": chunk_kind,
+        })
+
+    return chunks
+
+
+def chunk_with_metadata(content: str, source_file: str) -> list:
+    """
+    Unified entry point: structural chunking for code files, paragraph for prose.
+
+    Returns list of dicts with code-aware metadata.
+    """
+    ext = Path(source_file).suffix.lower()
+    code_extensions = {
+        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mts", ".cts",
+        ".java", ".go", ".rs", ".rb", ".php", ".c", ".h", ".cpp", ".cc",
+        ".cxx", ".hpp", ".cs", ".swift", ".kt", ".scala", ".r", ".R",
+        ".lua", ".pl", ".sh", ".bash", ".zsh", ".fish", ".ps1",
+    }
+
+    if ext in code_extensions or detect_language(source_file) not in ("Text", "Markdown", "YAML", "JSON", "TOML", "HTML", "CSS"):
+        return split_code_structurally(content, source_file)
+    else:
+        raw = chunk_text(content, source_file)
+        return [{"content": c["content"], "line_start": 0, "line_end": 0,
+                 "symbol_name": "", "symbol_scope": "", "chunk_kind": "prose"}
+                for c in raw]
 
 
 def add_drawer(
@@ -411,6 +793,22 @@ def add_drawer(
 # =============================================================================
 
 
+def _compute_file_revision(source_file: str, content: str) -> str:
+    """Compute a revision identifier for a file: SHA256 of first 4KB + mtime."""
+    prefix = content[:4096].encode("utf-8")
+    try:
+        mtime = os.path.getmtime(source_file)
+    except OSError:
+        mtime = 0
+    revision_bytes = prefix + str(mtime).encode("utf-8")
+    return hashlib.sha256(revision_bytes).hexdigest()[:32]
+
+
+def _compute_content_hash(content: str) -> str:
+    """Compute SHA256 hash of chunk content for tombstone detection."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
+
+
 def process_file(
     filepath: Path,
     project_path: Path,
@@ -419,13 +817,17 @@ def process_file(
     rooms: list,
     agent: str,
     dry_run: bool,
+    palace_path: str = None,
 ) -> tuple:
-    """Read, chunk, route, and file one file. Returns (drawer_count, room_name)."""
+    """Read, chunk, route, and file one file. Returns (drawer_count, room_name).
 
-    # Skip if already filed
+    Implements revision-based ingest:
+    - Existing chunks for this source_file are looked up (is_latest=True)
+    - New chunks that supersede old ones set is_latest=False on old, supersedes_id on new
+    - Content-hash matching prevents unnecessary tombstones when content is unchanged
+    """
+
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
-        return 0, None
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
@@ -437,53 +839,109 @@ def process_file(
         return 0, None
 
     room = detect_room(filepath, content, rooms, project_path)
-    chunks = chunk_text(content, source_file)
+
+    # Use code-aware chunking
+    chunks = chunk_with_metadata(content, source_file)
+    if not chunks:
+        return 0, None
 
     if dry_run:
         print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
         return len(chunks), room
 
-    # Batch: collect all drawer data then fire one upsert per file.
-    documents, ids, metadatas = [], [], []
+    # Compute revision_id for this file
+    revision_id = _compute_file_revision(source_file, content)
     timestamp = datetime.utcnow().isoformat() + "Z"
+
     try:
         source_mtime = os.path.getmtime(source_file)
     except OSError:
         source_mtime = None
 
-    for chunk in chunks:
-        drawer_id = (
-            f"drawer_{wing}_{room}_"
-            f"{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+    # Revision-based ingest: tombstone old chunks for this source_file
+    try:
+        existing = collection.get(
+            where={"source_file": source_file, "is_latest": True},
+            include=["metadatas", "ids"]
         )
+    except Exception:
+        existing = {"ids": [], "metadatas": []}
+
+    old_ids_by_content_hash = {}
+    if existing and existing.get("ids"):
+        for old_id, old_meta in zip(existing["ids"], existing["metadatas"]):
+            if old_meta:
+                old_hash = old_meta.get("content_hash", "")
+                if old_hash:
+                    old_ids_by_content_hash[old_hash] = (old_id, old_meta)
+
+    # Prepare new chunks with code-aware metadata
+    documents, ids, metadatas = [], [], []
+    for idx, chunk in enumerate(chunks):
+        content_hash = _compute_content_hash(chunk["content"])
+        drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(idx)).encode()).hexdigest()[:24]}"
+
         metadata = {
             "wing": wing,
             "room": room,
             "source_file": source_file,
-            "chunk_index": chunk["chunk_index"],
+            "chunk_index": idx,
             "added_by": agent,
             "agent_id": agent,
             "timestamp": timestamp,
             "origin_type": "observation",
             "is_latest": True,
             "supersedes_id": "",
+            # Code-aware fields
+            "language": detect_language(source_file),
+            "line_start": chunk.get("line_start", 0),
+            "line_end": chunk.get("line_end", 0),
+            "symbol_name": chunk.get("symbol_name", ""),
+            "symbol_scope": chunk.get("symbol_scope", ""),
+            "chunk_kind": chunk.get("chunk_kind", "mixed"),
+            "revision_id": revision_id,
+            "content_hash": content_hash,
         }
         if source_mtime is not None:
             metadata["source_mtime"] = source_mtime
+
+        # Tombstone: find old chunk with same content_hash
+        if content_hash in old_ids_by_content_hash:
+            old_id, old_meta = old_ids_by_content_hash[content_hash]
+            metadata["supersedes_id"] = old_id
+            metadata["is_latest"] = True
+            # Don't re-upsert old_id's replacement — just update it to is_latest=False
+            # We do this via a separate update below
 
         documents.append(chunk["content"])
         ids.append(drawer_id)
         metadatas.append(metadata)
 
+    # Upsert new chunks
+    collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
+
+    # Tombstone old chunks that have no matching new content_hash
+    new_hashes = set(c["content_hash"] if "content_hash" in c else _compute_content_hash(c["content"])
+                     for c in chunks)
+    for old_hash, (old_id, old_meta) in old_ids_by_content_hash.items():
+        if old_hash not in new_hashes:
+            try:
+                collection.upsert(
+                    documents=[old_meta.get("source_content", old_meta.get("document", ""))],
+                    ids=[old_id],
+                    metadatas=[{"is_latest": False}]
+                )
+            except Exception:
+                pass  # Best-effort tombstone
+
+    # Update cross-reference symbol index
     try:
-        collection.upsert(
-            documents=documents,
-            ids=ids,
-            metadatas=metadatas,
-        )
-        return len(documents), room
+        si = SymbolIndex.get(palace_path)
+        si.update_file(source_file, content)
     except Exception:
-        raise
+        pass  # Best-effort, non-critical
+
+    return len(documents), room
 
 
 # =============================================================================
@@ -621,6 +1079,7 @@ def mine(
             rooms=rooms,
             agent=agent,
             dry_run=dry_run,
+            palace_path=palace_path,
         )
         if drawers == 0 and not dry_run:
             files_skipped += 1
@@ -629,6 +1088,16 @@ def mine(
             room_counts[room] += 1
             if not dry_run:
                 print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+
+    # Build cross-reference symbol index for all files
+    if not dry_run and files:
+        try:
+            si = SymbolIndex.get(palace_path)
+            si.build_index(str(project_path), [str(f) for f in files])
+            stats = si.stats()
+            print(f"  Symbol index: {stats['total_symbols']} symbols, {stats['total_files']} files")
+        except Exception:
+            pass
 
     print(f"\n{'=' * 55}")
     print("  Done.")
