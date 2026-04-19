@@ -14,7 +14,7 @@ from fastmcp import FastMCP
 from fastmcp.resources import DirectoryResource
 from starlette.responses import JSONResponse
 
-from ._infrastructure import wal_log_async, get_wal_path
+from ._infrastructure import wal_log_async, get_wal_path, make_status_cache
 from ._search_tools import register_search_tools
 from ._write_tools import register_write_tools
 from ._kg_tools import register_kg_tools
@@ -53,6 +53,9 @@ def create_server(settings=None, shared_server_mode=False):
     for mw in middleware_stack:
         server.add_middleware(mw)
 
+    # ── Status cache — per-server-instance ──────────────────────────────────
+    server._status_cache = make_status_cache()
+
     # ── Session coordinators (shared_server_mode or HTTP transport) ──────
     if shared_server_mode or settings.transport == "http":
         from ..session_registry import SessionRegistry
@@ -81,7 +84,7 @@ def create_server(settings=None, shared_server_mode=False):
 
     # ── Skills resource ─────────────────────────────────────────────────────
     try:
-        skills_path = Path(__file__).parent / "skills"
+        skills_path = Path(__file__).parent.parent / "skills"
         if skills_path.exists() and any(skills_path.iterdir()):
             server.add_resource(DirectoryResource(
                 name="palace_skills",

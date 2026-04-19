@@ -55,3 +55,29 @@ class TestSkillsDirectoryResourceLoads:
         assert skills_path.exists(), "skills/ directory must exist"
         md_files = list(skills_path.glob("*.md"))
         assert len(md_files) >= 5, "skills/ should have at least 5 .md files"
+
+    @pytest.mark.asyncio
+    async def test_skills_resource_registered(self, tmp_path):
+        """FastMCP server has palace_skills DirectoryResource registered."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+
+        from mempalace.fastmcp_server import create_server
+        from mempalace.settings import MemPalaceSettings
+
+        test_settings = MemPalaceSettings(
+            db_path=str(tmp_path / "palace"),
+            db_backend="chroma",
+        )
+        server = create_server(settings=test_settings)
+
+        resources = await server.list_resources()
+        resources_by_name = {r.name: r for r in resources}
+        assert "palace_skills" in resources_by_name, (
+            f"palace_skills resource not found. Available: {list(resources_by_name.keys())}"
+        )
+
+        skill_res = resources_by_name["palace_skills"]
+        assert "skills" in str(skill_res.path), (
+            f"palace_skills path does not point to skills/ dir: {skill_res.path}"
+        )
