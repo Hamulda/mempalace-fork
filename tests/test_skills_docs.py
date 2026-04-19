@@ -43,7 +43,7 @@ class TestSkillsDirectoryResourceLoads:
 
         test_settings = MemPalaceSettings(
             db_path=str(tmp_path / "palace"),
-            db_backend="chromadb",
+            db_backend="chroma",
         )
 
         # Should not raise

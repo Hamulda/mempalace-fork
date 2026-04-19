@@ -257,3 +257,17 @@ class MempalaceConfig:
         with open(self._people_map_file, "w") as f:
             json.dump(people_map, f, indent=2)
         return self._people_map_file
+
+    @property
+    def namespace_config(self) -> dict:
+        """Return namespace configuration dict for server initialization."""
+        return {
+            "enabled": True,
+            "defaults": {
+                "session_memory": "session_memory",
+                "repo_chunks": "repo_chunks",
+                "handoffs": "handoffs",
+                "decisions": "decisions",
+                "chat_archive": "chat_archive",
+            }
+        }

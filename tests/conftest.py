@@ -12,6 +12,7 @@ throwaway location instead of the real user profile.
 import os
 import shutil
 import tempfile
+import unittest.mock
 
 # ── Isolate HOME before any mempalace imports ──────────────────────────
 _original_env = {}
@@ -25,12 +26,76 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# ── Deterministic mock embeddings ───────────────────────────────────────
+# Fast, deterministic mock — bypasses MLX, fastembed, and MemoryGuard.
+# Tests that intentionally test real embedding behavior should be marked @pytest.mark.slow.
+
+
+def _mock_embed_texts(texts):
+    """Deterministic fake embeddings — no MLX, no memory pressure, no daemon."""
+    import hashlib
+    dim = 256
+    result = []
+    for text in texts:
+        h = hashlib.sha256(text.encode()).digest()
+        vec = list(h[:dim]) + [0.0] * (dim - len(h))
+        result.append(vec)
+    return result
+
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
 
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
+
+
+# ── Deterministic mock embeddings ───────────────────────────────────────
+# Fast, deterministic mock — bypasses MLX, fastembed, and MemoryGuard.
+# Tests that intentionally test real embedding behavior should be marked @pytest.mark.slow.
+
+
+def _mock_embed_texts(texts):
+    """Deterministic fake embeddings — no MLX, no memory pressure, no daemon."""
+    import hashlib
+    dim = 256
+    result = []
+    for text in texts:
+        h = hashlib.sha256(text.encode()).digest()
+        vec = list(h[:dim]) + [0.0] * (dim - len(h))
+        result.append(vec)
+    return result
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _mock_embed_for_all_tests():
+    """Patch _embed_texts for the entire test session — no slow MLX/daemon needed."""
+    import sys
+
+    # Patch any already-loaded lance modules
+    for mod_name in list(sys.modules.keys()):
+        if "mempalace.backends.lance" in mod_name:
+            mod = sys.modules[mod_name]
+            if hasattr(mod, "_embed_texts"):
+                mod._embed_texts = _mock_embed_texts
+
+    # Also patch the module-level reference so new imports get the mock
+    try:
+        import mempalace.backends.lance as lance_mod
+        lance_mod._embed_texts = _mock_embed_texts
+        # Also patch the socket-based variant and fallback
+        if hasattr(lance_mod, "_embed_via_socket"):
+            lance_mod._embed_via_socket = lambda *args, **kwargs: _mock_embed_texts(*args, **kwargs)
+        if hasattr(lance_mod, "_embed_texts_fallback"):
+            lance_mod._embed_texts_fallback = _mock_embed_texts
+    except ImportError:
+        pass  # lance not available in this environment
+
+    # Disable MEMPALACE_COALESCE_MS to avoid 500ms window delays in tests
+    os.environ.setdefault("MEMPALACE_COALESCE_MS", "0")
+
+    yield
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -48,6 +113,34 @@ def _isolate_home():
         else:
             os.environ[var] = orig
     shutil.rmtree(_session_tmp, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_resources():
+    """Clean up singleton resources after test session."""
+    yield
+    # Stop MemoryGuard daemon thread
+    try:
+        from mempalace.memory_guard import MemoryGuard
+        MemoryGuard.get().stop()
+    except Exception:
+        pass
+    # Close all SymbolIndex instances
+    try:
+        from mempalace.symbol_index import SymbolIndex
+        with SymbolIndex._instances_lock:
+            for idx in list(SymbolIndex._instances.values()):
+                idx._close()
+            SymbolIndex._instances.clear()
+    except Exception:
+        pass
+    # Clear query cache
+    try:
+        from mempalace.query_cache import get_query_cache
+        cache = get_query_cache()
+        cache.clear()
+    except Exception:
+        pass
 
 
 @pytest.fixture

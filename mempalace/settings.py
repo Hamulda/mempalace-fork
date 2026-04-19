@@ -24,7 +24,29 @@ class MemPalaceSettings(BaseSettings):
     # Database (zachovat stávající env vars z config.py)
     db_path: str = os.path.expanduser("~/.mempalace/palace")
     db_backend: Literal["lance", "chroma"] = "lance"  # canonical: lance is primary, chroma is legacy compat
+
+    # Collection name: canonical source is MempalaceConfig (config.json).
+    # This field defaults to the same value so settings.py works standalone
+    # (e.g. in tests that don't load config.json) while matching production behavior.
     collection_name: str = "mempalace_drawers"
+
+    def _resolve_collection_name(self) -> str:
+        """Resolve collection_name from canonical config source at runtime.
+
+        Uses MempalaceConfig (config.json) as the single source of truth.
+        This ensures the MCP server respects user configuration from config.json
+        rather than having a hardcoded separate default.
+        """
+        try:
+            from .config import MempalaceConfig
+            return MempalaceConfig().collection_name
+        except Exception:
+            return self.collection_name  # fallback to hardcoded default
+
+    @property
+    def effective_collection_name(self) -> str:
+        """Runtime-resolved collection name from canonical config."""
+        return self._resolve_collection_name()
 
     # Cache TTL (zachovat hodnoty z middleware.py)
     cache_ttl_status: int = 5  # sekund
@@ -50,6 +72,21 @@ class MemPalaceSettings(BaseSettings):
     timeout_embed: int = 15  # embed daemon / vector search operations
     timeout_read: int = 10  # ChromaDB/LanceDB read operations
     timeout_write: int = 20  # ChromaDB/LanceDB write operations (writes are slower)
+
+    # Multi-session / shared server
+    shared_server_mode: bool = False        # When True, HTTP transport is canonical
+    session_registry_enabled: bool = True  # Enable session registry
+    write_coordinator_enabled: bool = True  # Enable write coordinator
+
+    # Session registry
+    session_timeout_seconds: int = 300      # Mark session idle after 5min no heartbeat
+    session_stale_seconds: int = 900        # Consider session stale after 15min
+
+    # Write coordinator
+    claim_timeout_seconds: int = 60        # Auto-release claim after 60s (prevents deadlocks)
+
+    # Namespace
+    namespace_default: str = "session_memory"  # Default namespace for observations
 
     class Config:
         env_prefix = "MEMPALACE_"

@@ -174,7 +174,11 @@ class HandoffManager:
         to_session_id: Optional[str] = None,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
     ) -> dict:
-        """Create a new handoff."""
+        """Create a new handoff.
+
+        to_session_id=None creates a broadcast handoff — any session can accept it.
+        to_session_id="X" creates a directed handoff — only session X can accept it.
+        """
         handoff_id = str(uuid.uuid4())
         now = _utc_now()
         expires = _expires_at(ttl_seconds)
@@ -214,7 +218,14 @@ class HandoffManager:
         status: Optional[str] = None,
         limit: int = 20,
     ) -> list[dict]:
-        """List handoffs. If session_id=None, returns broadcast (to_session_id=None) handoffs."""
+        """List handoffs filtered by session and/or status.
+
+        - session_id=X: returns handoffs where from_session_id=X OR to_session_id=X
+          (both sent and received directed handoffs for X).
+        - session_id=None + status=X: returns handoffs with that status.
+        - session_id=None (no status): returns broadcast handoffs
+          (to_session_id IS NULL), filtered to pending status.
+        """
         self.cleanup_expired()
 
         with self._conn_ctx as conn:
@@ -268,7 +279,7 @@ class HandoffManager:
         return {"success": True, "status": _STATUS_ACCEPTED, "accepted_at": now}
 
     def complete_handoff(self, handoff_id: str, session_id: str) -> dict:
-        """Mark handoff as completed."""
+        """Mark handoff as completed. Either from_session_id or to_session_id can complete."""
         self.cleanup_expired()
         now = _utc_now()
 
@@ -300,7 +311,7 @@ class HandoffManager:
         return {"success": True, "status": _STATUS_COMPLETED, "completed_at": now}
 
     def cancel_handoff(self, handoff_id: str, session_id: str) -> dict:
-        """Cancel a handoff. Only owner (from_session_id) can cancel."""
+        """Cancel a handoff. Only the owner (from_session_id) can cancel."""
         self.cleanup_expired()
         now = _utc_now()
 

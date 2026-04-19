@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"python3 -c \\\"\\nfrom mempalace.session_registry import SessionRegistry\\nimport tempfile, os\\n\\ntmp = tempfile.mkdtemp()\\nreg = SessionRegistry(palace_path=tmp)\\n\\n# Test register_session\\ns...",
+  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 36, in <module>\nOSError: [Errno 66] Directory not empty: '/var/folders/wx/6pbc46rn1w57p4w4v2zbcgb40000gn/T/tmpmpxi75hg'\nregister_session: Claudeuserhost-1234 active {'foo': 'bar'}\nheartbeat_session: abc123 ['src/main.py']\nget_session: True\nget_active_sessions (filtered): 1\nget_active_sessions (all): 1\nupdate_session_metadata: {'foo': 'bar', 'baz': 123}\nunregister_session: True",
+  "timestamp": "2026-04-17T16:23:03.174Z",
+  "retry_count": 1
+}

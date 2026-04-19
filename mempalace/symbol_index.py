@@ -48,6 +48,11 @@ _GENERIC_DEF_RE = re.compile(r'^(?:public|private|protected|static|abstract|fina
 _GENERIC_IMPORT_RE = re.compile(r'^\s*(?:import|require)\s+[\'"]([^\'"]+)[\'"]', re.MULTILINE)
 
 
+def _line_number(content: str, char_offset: int) -> int:
+    """Convert character offset to 1-based line number."""
+    return content[:char_offset].count("\n") + 1
+
+
 def _extract_py_symbols(content: str) -> dict:
     symbols = []
     imports = []
@@ -58,7 +63,10 @@ def _extract_py_symbols(content: str) -> dict:
         indent, kind, name = match.group(1), match.group(2), match.group(3)
         is_top_level = indent == "" or indent.startswith("    ") is False
         sym_type = "class" if kind == "class" else "function"
-        symbols.append({"name": name, "type": sym_type, "line": match.start()})
+        # keyword (def/class) starts after indent whitespace; ^ matches after preceding newline
+        keyword_pos = match.start() + len(indent)
+        line_num = _line_number(content, keyword_pos)
+        symbols.append({"name": name, "type": sym_type, "line": line_num})
 
     for match in _PY_IMPORT_RE.finditer(content):
         mod = match.group(1) or match.group(2)
@@ -92,11 +100,11 @@ def _extract_js_symbols(content: str) -> dict:
     exports = []
 
     for match in _JS_FN_RE.finditer(content):
-        symbols.append({"name": match.group(1), "type": "function", "line": match.start()})
+        symbols.append({"name": match.group(1), "type": "function", "line": _line_number(content, match.start())})
     for match in _JS_CLASS_RE.finditer(content):
-        symbols.append({"name": match.group(1), "type": "class", "line": match.start()})
+        symbols.append({"name": match.group(1), "type": "class", "line": _line_number(content, match.start())})
     for match in _JS_CONST_RE.finditer(content):
-        symbols.append({"name": match.group(1), "type": "const", "line": match.start()})
+        symbols.append({"name": match.group(1), "type": "const", "line": _line_number(content, match.start())})
     for match in _JS_IMPORT_RE.finditer(content):
         if match.group(1):
             imports.append(match.group(1))
@@ -109,7 +117,7 @@ def _extract_go_symbols(content: str) -> dict:
     imports = []
 
     for match in _GO_FUNC_RE.finditer(content):
-        symbols.append({"name": match.group(1), "type": "function", "line": match.start()})
+        symbols.append({"name": match.group(1), "type": "function", "line": _line_number(content, match.start())})
     for match in _GO_IMPORT_RE.finditer(content):
         imports.append(match.group(1))
 
@@ -121,9 +129,9 @@ def _extract_rust_symbols(content: str) -> dict:
     imports = []
 
     for match in _RUST_FN_RE.finditer(content):
-        symbols.append({"name": match.group(1), "type": "function", "line": match.start()})
+        symbols.append({"name": match.group(1), "type": "function", "line": _line_number(content, match.start())})
     for match in _RUST_STRUCT_RE.finditer(content):
-        symbols.append({"name": match.group(1), "type": "struct", "line": match.start()})
+        symbols.append({"name": match.group(1), "type": "struct", "line": _line_number(content, match.start())})
     for match in _RUST_IMPORT_RE.finditer(content):
         imports.append(match.group(1))
 
@@ -135,7 +143,7 @@ def _extract_generic_symbols(content: str) -> dict:
     imports = []
 
     for match in _GENERIC_DEF_RE.finditer(content):
-        symbols.append({"name": match.group(1), "type": "definition", "line": match.start()})
+        symbols.append({"name": match.group(1), "type": "definition", "line": _line_number(content, match.start())})
     for match in _GENERIC_IMPORT_RE.finditer(content):
         if match.group(1):
             imports.append(match.group(1))
@@ -198,166 +206,175 @@ CREATE INDEX IF NOT EXISTS idx_file_path ON symbol_index(file_path);
 class SymbolIndex:
     """
     SQLite-backed cross-reference index for symbol/import/export lookup.
-    Thread-safe via locking for writes; reads are lock-free.
+    Thread-safe: all operations use per-instance lock to serialize access.
 
     DB file: {palace_path}/symbol_index.sqlite3
     """
 
     _instances: dict[str, "SymbolIndex"] = {}
-    _lock = threading.Lock()
+    _instances_lock = threading.Lock()
 
     def __init__(self, palace_path: str):
         self.palace_path = palace_path
         self.db_path = str(Path(palace_path).expanduser().resolve() / "symbol_index.sqlite3")
         self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SYMBOL_INDEX_SCHEMA)
-        conn.commit()
         self._conn = conn
 
     @classmethod
     def get(cls, palace_path: str) -> "SymbolIndex":
         """Return cached SymbolIndex instance for palace_path."""
-        with cls._lock:
+        with cls._instances_lock:
             if palace_path not in cls._instances:
                 cls._instances[palace_path] = cls(palace_path)
             return cls._instances[palace_path]
+
+    def _close(self):
+        """Close the SQLite connection. For use in tests or forced reset."""
+        with self._lock:
+            if self._conn:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
 
     def find_symbol(self, symbol_name: str) -> list[dict]:
         """
         Find all definitions of symbol_name (exact match).
         Returns list of dicts with file_path, line_start, line_end, symbol_type, file_signature.
         """
-        if not self._conn:
-            return []
-        try:
-            cur = self._conn.execute(
-                """SELECT symbol_name, symbol_type, file_path, line_start, line_end,
-                          file_signature, imports, exports
-                   FROM symbol_index
-                   WHERE symbol_name = ?
-                   ORDER BY file_path""",
-                (symbol_name,),
-            )
-            rows = cur.fetchall()
-            return [
-                {
-                    "symbol_name": r[0],
-                    "symbol_type": r[1],
-                    "file_path": r[2],
-                    "line_start": r[3],
-                    "line_end": r[4],
-                    "file_signature": r[5] or "",
-                    "imports": r[6] or "",
-                    "exports": r[7] or "",
-                }
-                for r in rows
-            ]
-        except Exception:
-            return []
+        with self._lock:
+            if not self._conn:
+                return []
+            try:
+                cur = self._conn.execute(
+                    """SELECT symbol_name, symbol_type, file_path, line_start, line_end,
+                              file_signature, imports, exports
+                       FROM symbol_index
+                       WHERE symbol_name = ?
+                       ORDER BY file_path""",
+                    (symbol_name,),
+                )
+                rows = cur.fetchall()
+                return [
+                    {
+                        "symbol_name": r[0],
+                        "symbol_type": r[1],
+                        "file_path": r[2],
+                        "line_start": r[3],
+                        "line_end": r[4],
+                        "file_signature": r[5] or "",
+                        "imports": r[6] or "",
+                        "exports": r[7] or "",
+                    }
+                    for r in rows
+                ]
+            except Exception:
+                return []
 
     def search_symbols(self, pattern: str) -> list[dict]:
         """
         Search symbol names matching regex pattern.
         Returns list of dicts with symbol_name, file_path, symbol_type.
         """
-        if not self._conn:
-            return []
-        try:
-            # Convert simple glob-like patterns to SQL LIKE
-            if pattern.startswith("^"):
-                where_clause = "symbol_name LIKE ?"
-                like_pattern = pattern[1:] + "%"
-            elif "%" in pattern or "_" in pattern:
-                where_clause = "symbol_name LIKE ?"
-                like_pattern = pattern
-            else:
-                where_clause = "symbol_name LIKE ?"
-                like_pattern = f"%{pattern}%"
+        with self._lock:
+            if not self._conn:
+                return []
+            try:
+                if pattern.startswith("^"):
+                    where_clause = "symbol_name LIKE ?"
+                    like_pattern = pattern[1:] + "%"
+                elif "%" in pattern or "_" in pattern:
+                    where_clause = "symbol_name LIKE ?"
+                    like_pattern = pattern
+                else:
+                    where_clause = "symbol_name LIKE ?"
+                    like_pattern = f"%{pattern}%"
 
-            cur = self._conn.execute(
-                f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end
-                   FROM symbol_index
-                   WHERE {where_clause}
-                   ORDER BY symbol_name
-                   LIMIT 100""",
-                (like_pattern,),
-            )
-            rows = cur.fetchall()
-            return [
-                {
-                    "symbol_name": r[0],
-                    "symbol_type": r[1],
-                    "file_path": r[2],
-                    "line_start": r[3],
-                    "line_end": r[4],
-                }
-                for r in rows
-            ]
-        except Exception:
-            return []
+                cur = self._conn.execute(
+                    f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end
+                       FROM symbol_index
+                       WHERE {where_clause}
+                       ORDER BY symbol_name
+                       LIMIT 100""",
+                    (like_pattern,),
+                )
+                rows = cur.fetchall()
+                return [
+                    {
+                        "symbol_name": r[0],
+                        "symbol_type": r[1],
+                        "file_path": r[2],
+                        "line_start": r[3],
+                        "line_end": r[4],
+                    }
+                    for r in rows
+                ]
+            except Exception:
+                return []
 
     def get_file_symbols(self, file_path: str) -> dict:
         """
         Get all symbols defined in a file.
         Returns dict with symbols, imports, exports, file_signature.
         """
-        if not self._conn:
-            return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
-        try:
-            cur = self._conn.execute(
-                """SELECT symbol_name, symbol_type, line_start, line_end, imports, exports, file_signature
-                   FROM symbol_index
-                   WHERE file_path = ?
-                   ORDER BY line_start""",
-                (file_path,),
-            )
-            rows = cur.fetchall()
-            if not rows:
+        with self._lock:
+            if not self._conn:
                 return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
-            symbols = [
-                {"name": r[0], "type": r[1], "line_start": r[2], "line_end": r[3]}
-                for r in rows
-            ]
-            # imports/exports from first row (same for all rows of same file)
-            imports_raw = rows[0][4] or ""
-            exports_raw = rows[0][5] or ""
-            file_sig = rows[0][6] or ""
-            imports = imports_raw.split(",") if imports_raw else []
-            exports = exports_raw.split(",") if exports_raw else []
-            return {
-                "symbols": symbols,
-                "imports": [i for i in imports if i],
-                "exports": [e for e in exports if e],
-                "file_signature": file_sig,
-            }
-        except Exception:
-            return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+            try:
+                cur = self._conn.execute(
+                    """SELECT symbol_name, symbol_type, line_start, line_end, imports, exports, file_signature
+                       FROM symbol_index
+                       WHERE file_path = ?
+                       ORDER BY line_start""",
+                    (file_path,),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+                symbols = [
+                    {"name": r[0], "type": r[1], "line_start": r[2], "line_end": r[3]}
+                    for r in rows
+                ]
+                imports_raw = rows[0][4] or ""
+                exports_raw = rows[0][5] or ""
+                file_sig = rows[0][6] or ""
+                imports = imports_raw.split(",") if imports_raw else []
+                exports = exports_raw.split(",") if exports_raw else []
+                return {
+                    "symbols": symbols,
+                    "imports": [i for i in imports if i],
+                    "exports": [e for e in exports if e],
+                    "file_signature": file_sig,
+                }
+            except Exception:
+                return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
 
     def get_callers(self, symbol_name: str, project_path: str) -> list[dict]:
         """
         Find files that reference a symbol (via import statement or text occurrence).
         Returns list of dicts with file_path, line, context.
         """
-        if not self._conn:
-            return []
-        # Find files that import the module containing this symbol
-        # First, find the symbol to get its file
+        with self._lock:
+            if not self._conn:
+                return []
+
         defs = self.find_symbol(symbol_name)
         if not defs:
             return []
 
-        # For each defining file, find other files that import it
         callers = []
         for def_ in defs:
             def_file = def_["file_path"]
-            # Get the module name from file path
             try:
                 rel = Path(def_file).relative_to(project_path).as_posix()
             except ValueError:
@@ -365,89 +382,96 @@ class SymbolIndex:
 
             module_name = str(Path(rel).with_suffix("")).replace("/", ".").replace("\\", ".")
 
-            # Search for files that import this module
-            cur = self._conn.execute(
-                """SELECT file_path, imports FROM symbol_index WHERE imports LIKE ? LIMIT 50""",
-                (f"%{module_name}%",),
-            )
-            for row in cur.fetchall():
-                if row[0] != def_file:
-                    callers.append({
-                        "file_path": row[0],
-                        "imported_module": module_name,
-                        "called_symbol": symbol_name,
-                    })
+            with self._lock:
+                if not self._conn:
+                    break
+                try:
+                    cur = self._conn.execute(
+                        """SELECT file_path, imports FROM symbol_index WHERE imports LIKE ? LIMIT 50""",
+                        (f"%{module_name}%",),
+                    )
+                    for row in cur.fetchall():
+                        if row[0] != def_file:
+                            callers.append({
+                                "file_path": row[0],
+                                "imported_module": module_name,
+                                "called_symbol": symbol_name,
+                            })
+                except Exception:
+                    break
         return callers[:20]
 
     def update_file(self, file_path: str, content: str):
         """
         Extract symbols from content and upsert into index.
         """
-        if not self._conn:
-            return
-        try:
-            extracted = extract_symbols(content, file_path)
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self._lock:
+            if not self._conn:
+                return
+            try:
+                extracted = extract_symbols(content, file_path)
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-            # Delete existing entries for this file
-            self._conn.execute("DELETE FROM symbol_index WHERE file_path = ?", (file_path,))
+                self._conn.execute("DELETE FROM symbol_index WHERE file_path = ?", (file_path,))
 
-            # Insert new entries
-            for sym in extracted.get("symbols", []):
-                imports_str = ",".join(extracted.get("imports", []))
-                exports_str = ",".join(extracted.get("exports", []))
-                self._conn.execute(
-                    """INSERT OR REPLACE INTO symbol_index
-                       (symbol_name, symbol_type, file_path, line_start, line_end,
-                        file_signature, imports, exports, indexed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        sym["name"],
-                        sym.get("type", "definition"),
-                        file_path,
-                        sym.get("line", 0),
-                        0,
-                        extracted.get("file_signature", ""),
-                        imports_str,
-                        exports_str,
-                        now,
-                    ),
-                )
-            self._conn.commit()
-        except Exception as e:
-            self._conn.rollback()
+                for sym in extracted.get("symbols", []):
+                    imports_str = ",".join(extracted.get("imports", []))
+                    exports_str = ",".join(extracted.get("exports", []))
+                    self._conn.execute(
+                        """INSERT OR REPLACE INTO symbol_index
+                           (symbol_name, symbol_type, file_path, line_start, line_end,
+                            file_signature, imports, exports, indexed_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            sym["name"],
+                            sym.get("type", "definition"),
+                            file_path,
+                            sym.get("line", 0),
+                            0,
+                            extracted.get("file_signature", ""),
+                            imports_str,
+                            exports_str,
+                            now,
+                        ),
+                    )
+                self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
 
     def build_index(self, project_path: str, file_paths: list[str]):
         """
         Build full index from a list of file paths.
         Call this on first mine or full re-mine.
         """
-        if not self._conn:
-            return
-        try:
-            for fp in file_paths:
-                try:
-                    content = Path(fp).read_text(encoding="utf-8", errors="replace")
-                    self.update_file(fp, content)
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        for fp in file_paths:
+            try:
+                content = Path(fp).read_text(encoding="utf-8", errors="replace")
+                self.update_file(fp, content)
+            except Exception:
+                continue
 
     def clear(self):
         """Clear all entries from the index."""
-        if self._conn:
-            self._conn.execute("DELETE FROM symbol_index")
-            self._conn.commit()
+        with self._lock:
+            if self._conn:
+                try:
+                    self._conn.execute("DELETE FROM symbol_index")
+                    self._conn.commit()
+                except Exception:
+                    pass
 
     def stats(self) -> dict:
         """Return index statistics."""
-        if not self._conn:
-            return {"total_symbols": 0, "total_files": 0}
-        try:
-            cur = self._conn.execute("SELECT COUNT(*), COUNT(DISTINCT file_path) FROM symbol_index")
-            row = cur.fetchone()
-            return {"total_symbols": row[0] or 0, "total_files": row[1] or 0}
-        except Exception:
-            return {"total_symbols": 0, "total_files": 0}
+        with self._lock:
+            if not self._conn:
+                return {"total_symbols": 0, "total_files": 0}
+            try:
+                cur = self._conn.execute("SELECT COUNT(*), COUNT(DISTINCT file_path) FROM symbol_index")
+                row = cur.fetchone()
+                return {"total_symbols": row[0] or 0, "total_files": row[1] or 0}
+            except Exception:
+                return {"total_symbols": 0, "total_files": 0}

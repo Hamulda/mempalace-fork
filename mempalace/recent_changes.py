@@ -17,12 +17,14 @@ import re
 import subprocess
 import threading
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 
 _git_lock = threading.Lock()
+# Matches a git commit hash (40 hex chars) — used to detect hash lines in git log output
+_GIT_HASH_RE = re.compile(r'^[0-9a-f]{40}$')
 
 
 def _run_git(project_path: str, args: list[str]) -> str:
@@ -54,8 +56,8 @@ def get_recent_changes(project_path: str, n: int = 20) -> list[dict]:
     project_path = str(Path(project_path).expanduser().resolve())
 
     output = _run_git(project_path, [
-        "log", "--oneline", "--format=%H|%ad|%s", "--date=iso",
-        "-n", str(n * 2),  # fetch more, filter below
+        "log", "--format=%H%x00%ad%x00%s", "--date=iso-strict",
+        "-n", str(n * 2),
     ])
 
     if not output:
@@ -63,20 +65,16 @@ def get_recent_changes(project_path: str, n: int = 20) -> list[dict]:
 
     changes = []
     seen_files = set()
-    lines = output.split("\n")
 
-    # Get file lists for recent commits
+    # Parse null-byte-delimited log entries: hash\x00date\x00message\x00
+    entries = output.split("\x00")
     commit_hashes = []
-    for line in lines:
-        if "|" not in line:
-            continue
-        parts = line.split("|", 2)
-        if len(parts) < 3:
-            continue
-        commit_hash = parts[0].strip()
-        commit_date = parts[1].strip()
-        commit_message = parts[2].strip() if len(parts) > 2 else ""
-        commit_hashes.append((commit_hash, commit_date, commit_message))
+    for i in range(0, len(entries) - 2, 3):
+        commit_hash = entries[i].strip()
+        commit_date = entries[i + 1].strip() if i + 1 < len(entries) else ""
+        commit_message = entries[i + 2].strip() if i + 2 < len(entries) else ""
+        if commit_hash and len(commit_hash) >= 7:
+            commit_hashes.append((commit_hash, commit_date, commit_message))
 
     # Get file lists for each commit (limit to n)
     for commit_hash, commit_date, commit_message in commit_hashes[:n]:
@@ -95,8 +93,15 @@ def get_recent_changes(project_path: str, n: int = 20) -> list[dict]:
 
             # Check age — skip commits older than 90 days
             try:
-                commit_dt = datetime.fromisoformat(commit_date.replace(" ", "T").split(".")[0])
-                if datetime.now() - commit_dt > timedelta(days=90):
+                # Robust date parsing: handle iso format with/without timezone
+                date_str = commit_date.strip()
+                if "." in date_str:
+                    date_str = date_str.split(".")[0]
+                date_str = date_str.replace(" ", "T")
+                if "+" not in date_str and date_str[-1] != "Z":
+                    date_str += "Z"
+                commit_dt = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - commit_dt > timedelta(days=90):
                     continue
             except Exception:
                 pass
@@ -122,8 +127,7 @@ def get_hot_spots(project_path: str, n: int = 10) -> list[dict]:
     """
     project_path = str(Path(project_path).expanduser().resolve())
 
-    # Get commits from last 30 days
-    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
 
     output = _run_git(project_path, [
         "log", "--since", cutoff, "--name-only", "--format=%H",
@@ -132,19 +136,26 @@ def get_hot_spots(project_path: str, n: int = 10) -> list[dict]:
     if not output:
         return []
 
-    # Count file changes
     counts = defaultdict(int)
-    current_hash = None
+    in_commit_block = False
 
     for line in output.split("\n"):
-        if line and not line.startswith(" "):
-            current_hash = line.strip()
-        elif line.strip() and current_hash:
-            fp = line.strip()
-            if _is_code_file(fp):
-                counts[fp] += 1
+        stripped = line.strip()
+        if not stripped:
+            in_commit_block = False
+            continue
+        # Indented line = filename (git --name-only indents with tab/space)
+        if line.startswith(" ") or line.startswith("\t"):
+            if in_commit_block and stripped:
+                if _is_code_file(stripped):
+                    counts[stripped] += 1
+        elif _GIT_HASH_RE.match(stripped):
+            # Non-indented non-blank = commit hash
+            in_commit_block = True
+        else:
+            # Non-indented non-hash non-blank: reset (e.g., commit message line if format changes)
+            in_commit_block = False
 
-    # Sort by frequency
     sorted_files = sorted(counts.items(), key=lambda x: x[1], reverse=True)
 
     return [
@@ -190,7 +201,7 @@ def build_change_summary(project_path: str, n: int = 10) -> dict:
             languages.add(lang_map[lang])
 
     # Count recent commits
-    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
     count_output = _run_git(project_path, ["log", "--since", cutoff, "--oneline"])
     total_commits = len(count_output.split("\n")) if count_output else 0
 

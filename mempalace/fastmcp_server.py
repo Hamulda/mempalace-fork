@@ -229,7 +229,7 @@ def _register_tools(server, backend, config, settings):
         """Return the palace collection using the configured backend."""
         try:
             return backend.get_collection(
-                settings.db_path, settings.collection_name, create=create
+                settings.db_path, settings.effective_collection_name, create=create
             )
         except Exception:
             return None

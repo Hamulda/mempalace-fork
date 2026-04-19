@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .backends import get_backend
-from .namespaces import get_collection_name_for_wing
 from .query_sanitizer import sanitize_query
 
 logger = logging.getLogger("mempalace_mcp")
@@ -98,7 +97,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     try:
         cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
-        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        collection_name = cfg.collection_name
         col = backend.get_collection(palace_path, collection_name, create=False)
     except Exception:
         print(f"\n  No palace found at {palace_path}")
@@ -188,7 +187,7 @@ def search_memories(
     # Cache lookup before backend call — key includes palace_path + collection_name
     try:
         cache = _get_query_cache()
-        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        collection_name = cfg.collection_name
         cache_key = f"{palace_path}|{collection_name}|{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
         cached_result = cache.get_value(cache_key)
         if cached_result is not None:
@@ -198,7 +197,7 @@ def search_memories(
 
     try:
         backend = get_backend(cfg.backend)
-        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        collection_name = cfg.collection_name
         col = backend.get_collection(palace_path, collection_name, create=False)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
@@ -417,7 +416,7 @@ def hybrid_search(
     try:
         cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
-        collection_name = get_collection_name_for_wing(wing) if wing else cfg.collection_name
+        collection_name = cfg.collection_name
         col = backend.get_collection(palace_path, collection_name, create=False)
         fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
     except Exception as e:
@@ -601,7 +600,7 @@ def code_search(
     try:
         cfg = MempalaceConfig()
         backend = get_backend(cfg.backend)
-        collection_name = get_collection_name_for_wing("repo")
+        collection_name = cfg.collection_name
         col = backend.get_collection(palace_path, collection_name, create=False)
     except Exception:
         return {"query": query, "filters": {}, "results": [], "error": f"No palace at {palace_path}"}

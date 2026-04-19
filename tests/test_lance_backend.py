@@ -9,6 +9,7 @@ import os
 import tempfile
 import threading
 from pathlib import Path
+import unittest.mock
 
 import pytest
 
@@ -17,6 +18,20 @@ pytest.importorskip("lancedb", reason="LanceDB not installed — run: pip instal
 
 from mempalace.backends.lance import LanceBackend, LanceCollection, _where_to_sql, _apply_where_filter
 from mempalace.backends import get_backend, ChromaBackend
+
+
+# ── Deterministic mock embeddings ───────────────────────────────────────────────
+
+def _mock_embed_texts(texts):
+    """Deterministic fake embeddings — bypasses MLX and memory guard."""
+    import hashlib
+    dim = 256
+    result = []
+    for text in texts:
+        h = hashlib.sha256(text.encode()).digest()
+        vec = list(h[:dim]) + [0.0] * (dim - len(h))
+        result.append(vec)
+    return result
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────────
@@ -31,13 +46,25 @@ def tmp_palace(tmp_path):
 
 @pytest.fixture
 def lance_collection(tmp_palace):
-    """Fresh LanceDB collection with dedup disabled for predictable test results."""
+    """Fresh LanceDB collection — deterministic embeddings, no coalescer, no daemon."""
     import os
     os.environ["MEMPALACE_DEDUP_HIGH"] = "1.0"
     os.environ["MEMPALACE_DEDUP_LOW"] = "0.99"
+    # Disable coalescer to avoid 500ms window delays in tests
+    os.environ["MEMPALACE_COALESCE_MS"] = "0"
+
+    # Mock embeddings so tests don't hit MLX or memory guard delays
+    import mempalace.backends.lance as lance_module
+    original = lance_module._embed_texts
+    lance_module._embed_texts = _mock_embed_texts
+
     backend = LanceBackend()
     col = backend.get_collection(tmp_palace, "test_drawers", create=True)
-    return col
+
+    yield col
+
+    # Restore
+    lance_module._embed_texts = original
 
 
 # ── Backend abstraction ────────────────────────────────────────────────────────
@@ -45,7 +72,9 @@ def lance_collection(tmp_palace):
 class TestBackendFactory:
     def test_get_chroma_backend(self):
         backend = get_backend("chroma")
-        assert isinstance(backend, ChromaBackend)
+        # ChromaBackend may be None if ChromaDB is not installed
+        if ChromaBackend is not None:
+            assert isinstance(backend, ChromaBackend)
 
     def test_get_lance_backend(self):
         backend = get_backend("lance")

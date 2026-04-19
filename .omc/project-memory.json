@@ -1,0 +1,340 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776438007722,
+  "projectRoot": "/Users/vojtechhamada/.claude/plugins/marketplaces/mempalace",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "assets",
+      "examples",
+      "scripts",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "assets": {
+      "path": "assets",
+      "purpose": "Static assets",
+      "fileCount": 1,
+      "lastAccessed": 1776438007679,
+      "keyFiles": [
+        "mempalace_logo.png"
+      ]
+    },
+    "benchmarks": {
+      "path": "benchmarks",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1776438007680,
+      "keyFiles": [
+        "BENCHMARKS.md",
+        "HYBRID_MODE.md",
+        "README.md",
+        "convomem_bench.py",
+        "locomo_bench.py"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 5,
+      "lastAccessed": 1776438007680,
+      "keyFiles": [
+        "HOOKS_TUTORIAL.md",
+        "basic_mining.py",
+        "convo_import.py",
+        "gemini_cli_setup.md",
+        "mcp_setup.md"
+      ]
+    },
+    "hooks": {
+      "path": "hooks",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1776438007680,
+      "keyFiles": [
+        "README.md",
+        "mempal_precompact_hook.sh",
+        "mempal_save_hook.sh"
+      ]
+    },
+    "integrations": {
+      "path": "integrations",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776438007681,
+      "keyFiles": []
+    },
+    "mempalace": {
+      "path": "mempalace",
+      "purpose": null,
+      "fileCount": 38,
+      "lastAccessed": 1776438007682,
+      "keyFiles": [
+        "F176_phase2_metadata_contract.md",
+        "README.md",
+        "__init__.py",
+        "__main__.py",
+        "circuit_breaker.py"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 2,
+      "lastAccessed": 1776438007682,
+      "keyFiles": [
+        "dev_server.sh",
+        "start_server.sh"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 55,
+      "lastAccessed": 1776438007683,
+      "keyFiles": [
+        "conftest.py",
+        "test_backend_defaults.py",
+        "test_background_work_bounded.py",
+        "test_batch_dedup.py",
+        "test_bugfixes.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "",
+      "accessCount": 17,
+      "lastAccessed": 1776442782985,
+      "type": "directory"
+    },
+    {
+      "path": "mempalace/backends/lance.py",
+      "accessCount": 13,
+      "lastAccessed": 1776442560422,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/fastmcp_server.py",
+      "accessCount": 11,
+      "lastAccessed": 1776442990924,
+      "type": "file"
+    },
+    {
+      "path": "mempalace",
+      "accessCount": 6,
+      "lastAccessed": 1776442795363,
+      "type": "directory"
+    },
+    {
+      "path": "mempalace/query_cache.py",
+      "accessCount": 5,
+      "lastAccessed": 1776442585910,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/config.py",
+      "accessCount": 5,
+      "lastAccessed": 1776442789483,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/knowledge_graph.py",
+      "accessCount": 4,
+      "lastAccessed": 1776442784356,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/settings.py",
+      "accessCount": 4,
+      "lastAccessed": 1776442789138,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/backends/base.py",
+      "accessCount": 3,
+      "lastAccessed": 1776442692866,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/namespaces.py",
+      "accessCount": 3,
+      "lastAccessed": 1776442892294,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/session_registry.py",
+      "accessCount": 3,
+      "lastAccessed": 1776442978385,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/searcher.py",
+      "accessCount": 2,
+      "lastAccessed": 1776442559964,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/backends/__init__.py",
+      "accessCount": 2,
+      "lastAccessed": 1776442569424,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/write_coalescer.py",
+      "accessCount": 2,
+      "lastAccessed": 1776442577729,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/backends",
+      "accessCount": 2,
+      "lastAccessed": 1776442598601,
+      "type": "directory"
+    },
+    {
+      "path": "mempalace/middleware.py",
+      "accessCount": 2,
+      "lastAccessed": 1776442693032,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/palace.py",
+      "accessCount": 2,
+      "lastAccessed": 1776442788007,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/write_coordinator.py",
+      "accessCount": 2,
+      "lastAccessed": 1776442966830,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_search_cache_correctness.py",
+      "accessCount": 1,
+      "lastAccessed": 1776438027661,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_search_cache_isolation.py",
+      "accessCount": 1,
+      "lastAccessed": 1776438027828,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_query_cache.py",
+      "accessCount": 1,
+      "lastAccessed": 1776438027882,
+      "type": "file"
+    },
+    {
+      "path": "tests",
+      "accessCount": 1,
+      "lastAccessed": 1776440439039,
+      "type": "directory"
+    },
+    {
+      "path": "tests/test_lance_backend.py",
+      "accessCount": 1,
+      "lastAccessed": 1776440454667,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_lance_backend_contract.py",
+      "accessCount": 1,
+      "lastAccessed": 1776440457138,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/cli.py",
+      "accessCount": 1,
+      "lastAccessed": 1776442557562,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/miner.py",
+      "accessCount": 1,
+      "lastAccessed": 1776442559380,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/memory_guard.py",
+      "accessCount": 1,
+      "lastAccessed": 1776442561894,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/hooks_cli.py",
+      "accessCount": 1,
+      "lastAccessed": 1776442561951,
+      "type": "file"
+    },
+    {
+      "path": "pyproject.toml",
+      "accessCount": 1,
+      "lastAccessed": 1776442562008,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/backends/chroma.py",
+      "accessCount": 1,
+      "lastAccessed": 1776442577588,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1776442782938,
+      "type": "file"
+    },
+    {
+      "path": "mempalace/normalize.py",
+      "accessCount": 1,
+      "lastAccessed": 1776442787955,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

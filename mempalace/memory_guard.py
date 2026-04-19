@@ -136,3 +136,12 @@ class MemoryGuard:
 
             self._pressure = pressure
             self._used_ratio = ratio
+
+    def stop(self) -> None:
+        """Stop the background monitor thread. Call on application shutdown."""
+        self._stop.set()
+        with type(self)._lock:
+            type(self)._instance = None
+        if self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        logger.info("MemoryGuard stopped")

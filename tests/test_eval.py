@@ -29,7 +29,7 @@ class TestEvalReturnsSummary:
         from mempalace.settings import MemPalaceSettings
         from fastmcp import Client
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             result = await client.call_tool(
@@ -49,7 +49,7 @@ class TestEvalMax10Queries:
         from mempalace.settings import MemPalaceSettings
         from fastmcp import Client
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         queries_15 = [f"query {i}" for i in range(15)]
         async with Client(transport=server) as client:
@@ -68,7 +68,7 @@ class TestEvalDiagnosisLow:
         from mempalace.settings import MemPalaceSettings
         from fastmcp import Client
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             result = await client.call_tool(
@@ -87,7 +87,7 @@ class TestEvalWingPrecision:
         from mempalace.settings import MemPalaceSettings
         from fastmcp import Client
 
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chromadb")
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
         async with Client(transport=server) as client:
             result = await client.call_tool(

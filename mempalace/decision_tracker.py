@@ -74,6 +74,16 @@ SELECT id, session_id, category, decision_text, rationale, alternatives, confide
 FROM decisions ORDER BY created_at DESC LIMIT ?
 """
 
+_SELECT_BY_SESSION_AND_STATUS = """
+SELECT id, session_id, category, decision_text, rationale, alternatives, confidence, status, created_at, expires_at, superseded_by
+FROM decisions WHERE session_id=? AND status=? ORDER BY created_at DESC LIMIT ?
+"""
+
+_SELECT_BY_CATEGORY_AND_STATUS = """
+SELECT id, session_id, category, decision_text, rationale, alternatives, confidence, status, created_at, expires_at, superseded_by
+FROM decisions WHERE category=? AND status=? ORDER BY created_at DESC LIMIT ?
+"""
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -139,6 +149,7 @@ class DecisionTracker:
         with self._write_lock:
             self._conn_ctx.executescript(_SCHEMA)
             self._conn_ctx.commit()
+        self.cleanup_expired()
 
     def capture_decision(
         self,
@@ -191,9 +202,19 @@ class DecisionTracker:
         status: Optional[str] = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Query decisions by session/category/status."""
+        """Query decisions by session/category/status.
+
+        When status='active', returns decisions with status='active' that are not
+        past their expires_at. When status='expired', returns decisions past
+        their expires_at. When status='superseded', returns superseded decisions.
+        """
         with self._conn_ctx as conn:
-            if session_id:
+            # Combined filters use SQL-level LIMIT for efficiency
+            if session_id and status:
+                cursor = conn.execute(_SELECT_BY_SESSION_AND_STATUS, (session_id, status, limit))
+            elif category and status:
+                cursor = conn.execute(_SELECT_BY_CATEGORY_AND_STATUS, (category, status, limit))
+            elif session_id:
                 cursor = conn.execute(_SELECT_BY_SESSION, (session_id,))
             elif category:
                 cursor = conn.execute(_SELECT_BY_CATEGORY, (category,))
@@ -209,9 +230,12 @@ class DecisionTracker:
         if session_id is None and category is None and status is None:
             decisions = decisions[:limit]
 
-        # Filter by status if both session_id and status given
-        if session_id and status:
-            decisions = [d for d in decisions if d["status"] == status]
+        # Filter by expires_at for 'active' vs 'expired' semantics
+        now = _utc_now()
+        if status == "active":
+            decisions = [d for d in decisions if d.get("expires_at") is None or d["expires_at"] > now]
+        elif status == "expired":
+            decisions = [d for d in decisions if d.get("expires_at") is not None and d["expires_at"] <= now]
 
         return decisions
 
@@ -254,6 +278,18 @@ class DecisionTracker:
             if row is None:
                 return None
             return _row_to_decision(row)
+
+    def cleanup_expired(self) -> dict:
+        """Mark expired decisions as expired. Returns count of marked."""
+        now = _utc_now()
+        with self._write_lock:
+            conn = self._conn_ctx
+            cursor = conn.execute(
+                "UPDATE decisions SET status='expired' WHERE status='active' AND expires_at IS NOT NULL AND expires_at <= ?",
+                (now,),
+            )
+            conn.commit()
+            return {"expired": cursor.rowcount}
 
     def close(self) -> None:
         with self._write_lock:

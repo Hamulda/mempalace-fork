@@ -29,18 +29,21 @@ def build_wakeup_context(
     """
     Build a compact wake-up context bundle for session resume or takeover.
 
-    Phase 6 returns:
-    - active_claims: list of claims this session holds
-    - pending_handoffs: handoffs addressed to this session (or broadcast)
-    - recent_decisions: last 10 decisions from this session
+    Returns:
+    - session_id, project_root: identifying info
+    - active_claims: unexpired claims this session holds
+    - pending_handoffs: directed handoffs (from/to this session) AND broadcast
+      handoffs (to_session_id=None), limited to 20, filtered to pending/accepted
+    - recent_decisions: last 10 decisions created by this session (active only,
+      not expired or superseded)
     - recent_changes: last 20 memories from repo wing with source_file
-    - conflicts: any expired claims that had conflicts
+    - conflicts: expired claims that had conflicts (from claim_events)
     - session_info: current session metadata from registry
-    - recommended_tools: based on what's missing (handoffs need hybrid_search, etc.)
-    - active_symbols: symbols from recently touched files
-    - hot_spots: files changed most in recent commits
-    - relevant_decisions: decisions related to current scope
-    - next_checks: suggested validation steps
+    - recommended_tools: based on context gaps
+    - active_symbols: symbols from recently touched files (Phase 6)
+    - hot_spots: files changed most in recent commits (Phase 6)
+    - relevant_decisions: decisions whose rationale mentions active file paths (Phase 6)
+    - next_checks: suggested validation steps (Phase 6)
     """
     if palace_path is None:
         palace_path = os.environ.get("MEMPALACE_PATH", os.path.expanduser("~/.mempalace"))
@@ -75,11 +78,19 @@ def build_wakeup_context(
     except Exception:
         pass
 
-    # Pending handoffs for this session
+    # Pending handoffs for this session (directed + broadcast)
+    # Directed: from_session_id=X OR to_session_id=X
+    # Broadcast: to_session_id IS NULL (available to any session)
     try:
-        all_handoffs = handoff_mgr.get_handoffs_for_session(session_id)
-        pending = [h for h in all_handoffs if h["status"] in ("pending", "accepted")]
-        result["pending_handoffs"] = pending[:20]
+        directed = handoff_mgr.get_handoffs_for_session(session_id)
+        broadcasts = handoff_mgr.pull_handoffs(session_id=None, status="pending")
+        seen = set()
+        merged = []
+        for h in directed + broadcasts:
+            if h["id"] not in seen and h["status"] in ("pending", "accepted"):
+                seen.add(h["id"])
+                merged.append(h)
+        result["pending_handoffs"] = merged[:20]
     except Exception:
         pass
 
@@ -164,7 +175,8 @@ def build_wakeup_context(
     except Exception:
         pass
 
-    # Phase 6: Relevant decisions (decisions whose rationale mentions active files)
+    # Phase 6: Relevant decisions from this session whose rationale mentions active files
+    # Note: only checks this session's decisions (recent_decisions), not all-palace decisions
     try:
         if result["active_claims"] and result["recent_decisions"]:
             active_files = set(c.get("target_id", "") for c in result["active_claims"])

@@ -622,11 +622,25 @@ def split_code_structurally(content: str, source_file: str, max_chunk_chars: int
     # Find all structural split points
     lines = content.split("\n")
     split_points = [0]  # line indices where chunks begin
-    current_scope = []
+    # Track (scope_name, scope_indent) pairs. scope_indent is the indentation
+    # of the line that opened this scope. When we see a line at or below that
+    # indentation, the scope has ended and we pop it.
+    current_scope_stack = []  # list of (scope_name, scope_indent)
     symbol_map = {}  # line_index -> (symbol_name, symbol_scope)
 
     for i, line in enumerate(lines):
+        # Compute line indentation (leading whitespace)
         stripped = line.strip()
+        stripped_line = stripped
+        if not stripped:
+            continue
+        line_indent = len(line) - len(line.lstrip())
+
+        # Pop scopes whose opening indentation >= current line's indentation.
+        # This means we've dedented past that scope's body.
+        while current_scope_stack and current_scope_stack[-1][1] >= line_indent:
+            current_scope_stack.pop()
+
         if not stripped or stripped.startswith("#") or stripped.startswith("//") or stripped.startswith(";"):
             continue
 
@@ -646,19 +660,35 @@ def split_code_structurally(content: str, source_file: str, max_chunk_chars: int
                     _, kind = patterns[gi]
                     break
 
-            # Build scope
-            scope_parts = [s for s in current_scope if s]
+            # Build scope string from current stack
+            scope_parts = [s[0] for s in current_scope_stack if s[0]]
             scope = ".".join(scope_parts) if scope_parts else ""
 
-            symbol_map[i] = (sym_name, scope)
+            # Decorators are not structural split boundaries and are absorbed
+            # into the preceding chunk — don't pollute symbol_map with them.
+            if kind != "decorator":
+                symbol_map[i] = (sym_name, scope)
 
-            # Class definitions push to scope; methods inside classes are tracked
-            # in symbol_map but don't create structural split boundaries
+            # Class definitions push to scope stack.
+            # Rules:
+            # 1. At indent 0: always clear all scopes first (we're at module level).
+            #    This handles: class Foo → method → class Bar → Bar correctly gets
+            #    empty scope instead of inheriting Foo's scope.
+            # 2. At SAME indent as current scope's opening: sibling at that level
+            #    (e.g. Inner at indent 4 inside Outer's body at indent 4).
+            #    Pop the current scope before pushing so they're siblings, not nested.
+            # 3. At DEEPER indent than current scope's opening: normal nested push.
             if kind in ("class", "export_class"):
-                current_scope.append(sym_name)
+                if line_indent == 0:
+                    # Module level: clear ALL class scopes before pushing
+                    current_scope_stack.clear()
+                elif current_scope_stack and line_indent == current_scope_stack[-1][1]:
+                    # Same indent as current scope's opening: sibling class, pop first
+                    current_scope_stack.pop()
+                current_scope_stack.append((sym_name, line_indent))
 
             # Only add split point for top-level definitions, not methods inside classes
-            is_method_scope = bool(current_scope)  # inside a class body
+            is_method_scope = bool(current_scope_stack)  # inside a class body
             is_method_pattern = kind in ("def", "function", "async_def", "async_function", "go_func", "rust_fn", "generic_def")
             if not (is_method_scope and is_method_pattern):
                 split_points.append(i)
@@ -704,11 +734,13 @@ def split_code_structurally(content: str, source_file: str, max_chunk_chars: int
 
         sym_name, sym_scope = symbol_map.get(start_line, ("", ""))
         if not sym_name and symbol_map:
-            # Use the closest earlier symbol
+            # Find the closest earlier line with a real (non-decorator) symbol
             for prev in range(start_line - 1, -1, -1):
                 if prev in symbol_map:
-                    sym_name, sym_scope = symbol_map[prev]
-                    break
+                    prev_name, prev_scope = symbol_map[prev]
+                    if prev_name:  # Skip empty/decorator entries
+                        sym_name, sym_scope = prev_name, prev_scope
+                        break
 
         # Detect chunk kind
         if any(stripped.startswith(("#", "//", "/*", "*/", '"""', "'''")) for stripped in chunk_lines[:5]):
@@ -867,13 +899,16 @@ def process_file(
     except Exception:
         existing = {"ids": [], "metadatas": []}
 
-    old_ids_by_content_hash = {}
+    # Build mapping from content_hash -> list of (old_id, old_meta)
+    # Using a list instead of dict to handle duplicate hashes at different positions.
+    # When multiple old chunks share the same content_hash, all must be superseded.
+    old_chunks_by_hash: dict[str, list[tuple]] = defaultdict(list)
     if existing and existing.get("ids"):
         for old_id, old_meta in zip(existing["ids"], existing["metadatas"]):
             if old_meta:
                 old_hash = old_meta.get("content_hash", "")
                 if old_hash:
-                    old_ids_by_content_hash[old_hash] = (old_id, old_meta)
+                    old_chunks_by_hash[old_hash].append((old_id, old_meta))
 
     # Prepare new chunks with code-aware metadata
     documents, ids, metadatas = [], [], []
@@ -905,13 +940,18 @@ def process_file(
         if source_mtime is not None:
             metadata["source_mtime"] = source_mtime
 
-        # Tombstone: find old chunk with same content_hash
-        if content_hash in old_ids_by_content_hash:
-            old_id, old_meta = old_ids_by_content_hash[content_hash]
-            metadata["supersedes_id"] = old_id
+        # Tombstone: find old chunk(s) with same content_hash.
+        # ALL matching old chunks are superseded by this new chunk.
+        # We track all superseded IDs in a list so the supersession set is complete,
+        # while storing only the last one in supersedes_id (single-string contract).
+        superseded_ids_for_chunk = []
+        if content_hash in old_chunks_by_hash:
+            for old_id, old_meta in old_chunks_by_hash[content_hash]:
+                superseded_ids_for_chunk.append(old_id)
+            # Store last ID in supersedes_id (single-string field); the complete
+            # supersession set is built from all metadatas below.
+            metadata["supersedes_id"] = superseded_ids_for_chunk[-1]
             metadata["is_latest"] = True
-            # Don't re-upsert old_id's replacement — just update it to is_latest=False
-            # We do this via a separate update below
 
         documents.append(chunk["content"])
         ids.append(drawer_id)
@@ -920,19 +960,32 @@ def process_file(
     # Upsert new chunks
     collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
 
-    # Tombstone old chunks that have no matching new content_hash
-    new_hashes = set(c["content_hash"] if "content_hash" in c else _compute_content_hash(c["content"])
-                     for c in chunks)
-    for old_hash, (old_id, old_meta) in old_ids_by_content_hash.items():
-        if old_hash not in new_hashes:
-            try:
-                collection.upsert(
-                    documents=[old_meta.get("source_content", old_meta.get("document", ""))],
-                    ids=[old_id],
-                    metadatas=[{"is_latest": False}]
-                )
-            except Exception:
-                pass  # Best-effort tombstone
+    # Tombstone old chunks that have no matching new content_hash.
+    # An old chunk is tombstoned when it was not matched by any new chunk.
+    # This is now a set operation: all old IDs minus superseded IDs = survivors to tombstone.
+    all_old_ids = set()
+    for old_list in old_chunks_by_hash.values():
+        for old_id, _ in old_list:
+            all_old_ids.add(old_id)
+
+    # Superseded IDs are those referenced by new chunks via supersedes_id
+    superseded_ids = set()
+    for meta in metadatas:
+        if meta.get("supersedes_id"):
+            superseded_ids.add(meta["supersedes_id"])
+
+    # Tombstone every old chunk that was NOT superseded
+    for old_hash, old_list in old_chunks_by_hash.items():
+        for old_id, old_meta in old_list:
+            if old_id not in superseded_ids:
+                try:
+                    collection.upsert(
+                        documents=[old_meta.get("source_content", old_meta.get("document", ""))],
+                        ids=[old_id],
+                        metadatas=[{"is_latest": False}]
+                    )
+                except Exception:
+                    pass  # Best-effort tombstone
 
     # Update cross-reference symbol index
     try:

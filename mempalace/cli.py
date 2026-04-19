@@ -278,7 +278,7 @@ def cmd_status(args):
     if os.path.isdir(palace_path):
         try:
             backend = get_backend(backend_type)
-            col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
+            col = backend.get_collection(palace_path, config.collection_name, create=False)
             count = col.count()
             backend_label = "lance" if backend_type == "lance" else "chroma"
             print(f"Backend: {backend_label}")
@@ -327,7 +327,7 @@ def cmd_repair(args):
     # Try to read existing drawers via Lance backend
     try:
         backend = get_backend("lance")
-        col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
+        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
         total = col.count()
         print(f"  Drawers found: {total}")
     except FileNotFoundError:
@@ -371,7 +371,7 @@ def cmd_repair(args):
     shutil.copytree(palace_path, backup_path)
 
     print("  Rebuilding collection...")
-    new_col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
+    new_col = backend.get_collection(palace_path, cfg.collection_name, create=True)
 
     filed = 0
     for i in range(0, len(all_ids), batch_size):
@@ -561,7 +561,7 @@ def cmd_cleanup(args):
     # Only deletes old (timestamp < cutoff) AND is_latest=False drawers.
     try:
         backend = get_backend(cfg.backend)
-        col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
+        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
         deleted = 0
         BATCH = 5000
         offset = 0
@@ -824,7 +824,7 @@ def cmd_compress(args):
 
     try:
         backend = get_backend(backend_type)
-        col = backend.get_collection(palace_path, "mempalace_drawers", create=False)
+        col = backend.get_collection(palace_path, cfg.collection_name, create=False)
         count = col.count()
     except Exception:
         print(f"\n  No palace found at {palace_path}")

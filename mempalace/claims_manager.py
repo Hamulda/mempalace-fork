@@ -158,11 +158,13 @@ class ClaimsManager:
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
         payload: Optional[dict] = None,
     ) -> dict:
-        """
-        Acquire a claim on (target_type, target_id) for session_id with TTL.
+        """Acquire or refresh a claim on (target_type, target_id).
 
-        Returns:
-            {"acquired": bool, "owner": session_id or None, "expires_at": str or None}
+        - If no claim exists: acquires one for session_id.
+        - If session_id already holds it: refreshes TTL (renew).
+        - If another session holds it: returns conflict, does NOT store a claim.
+
+        Returns: {"acquired": bool, "owner": session_id or str, "expires_at": str}
         """
         payload = payload or {}
         now = _utc_now()
@@ -297,7 +299,11 @@ class ClaimsManager:
             }
 
     def get_session_claims(self, session_id: str) -> list[dict]:
-        """Get all active claims for a session."""
+        """Get all unexpired claims held by a session.
+
+        Calls cleanup_expired() first to purge stale claims from storage.
+        Only returns claims where expires_at > now.
+        """
         self.cleanup_expired()
         now = _utc_now()
 
@@ -322,7 +328,15 @@ class ClaimsManager:
             ]
 
     def get_claims_for_target(self, target_type: str, target_id: str, include_expired: bool = True) -> list[dict]:
-        """Get all claims (including expired by default) for conflict analysis."""
+        """Get claims for a target.
+
+        Note: due to INSERT OR REPLACE semantics, this returns the last-known state
+        per (session_id, target_type, target_id) — not a full history of all attempts.
+        Conflict events are recorded in claim_events separately.
+
+        include_expired=True: returns all stored claims (active and expired).
+        include_expired=False: returns only currently unexpired claims.
+        """
         with self._conn_ctx as conn:
             if include_expired:
                 cursor = conn.execute(
@@ -352,7 +366,10 @@ class ClaimsManager:
             ]
 
     def list_active_claims(self, project_root: Optional[str] = None) -> list[dict]:
-        """List all unexpired claims, optionally filtered by project_root prefix in target_id."""
+        """List all unexpired claims across all sessions.
+
+        Calls cleanup_expired() first. Optionally filtered by project_root prefix.
+        """
         self.cleanup_expired()
         now = _utc_now()
 
@@ -409,7 +426,11 @@ class ClaimsManager:
         handoff_payload: dict,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
     ) -> dict:
-        """Atomic claim + handoff. Fails if another session holds the claim."""
+        """Atomic claim + handoff event. Fails if another session holds an active claim.
+
+        Unlike claim(), this does not refresh TTL for self — it is strictly an
+        acquisition attempt. Logs a 'handoff_claim' event on success.
+        """
         payload = handoff_payload or {}
         now = _utc_now()
         expires = _expires_at(ttl_seconds)
@@ -434,7 +455,11 @@ class ClaimsManager:
             return {"acquired": True, "owner": session_id, "expires_at": expires}
 
     def cleanup_expired(self) -> dict:
-        """Remove expired claims. Returns count of removed claims."""
+        """Delete expired claims from storage. Returns count of deleted rows.
+
+        An expired claim is one where expires_at <= now. This is called
+        automatically before claim operations but can be invoked manually.
+        """
         now = _utc_now()
         with self._write_lock:
             conn = self._conn_ctx

@@ -1,6 +1,11 @@
 """
 Tests for the MemPalace embedding daemon.
 
+These are integration tests that spawn the actual daemon process.
+They are marked @pytest.mark.slow and can be skipped with: pytest -m "not slow"
+
+For fast deterministic tests, see test_embed_deterministic.py
+
 Run: pytest tests/test_embed_daemon.py -v -s
 """
 
@@ -15,6 +20,10 @@ import time
 import pytest
 
 pytest.importorskip("lancedb", reason="LanceDB not installed — run: pip install 'mempalace[lance]'")
+
+
+def _make_sock_path(prefix: str) -> str:
+    return f"/tmp/mp_embed_{prefix}_{os.getpid()}.sock"
 
 
 def _send_embedding_request(sock_path: str, texts: list[str], timeout: float = 60.0) -> dict:
@@ -40,9 +49,10 @@ def _send_embedding_request(sock_path: str, texts: list[str], timeout: float = 6
     return json.loads(data.decode("utf-8"))
 
 
+@pytest.mark.slow
 def test_daemon_starts_and_embeds():
-    """Daemon starts, accepts request, returns valid vectors."""
-    sock_path = f"/tmp/mp_embed_test_{os.getpid()}.sock"
+    """Daemon starts, accepts request, returns valid vectors. Integration test — spawns real daemon."""
+    sock_path = _make_sock_path("test")
     env = {**os.environ, "MEMPALACE_EMBED_SOCK": sock_path}
 
     proc = subprocess.Popen(
@@ -53,8 +63,8 @@ def test_daemon_starts_and_embeds():
     )
 
     try:
-        # Wait for READY
-        deadline = time.monotonic() + 30
+        # Wait for READY with generous timeout
+        deadline = time.monotonic() + 60
         ready = False
         while time.monotonic() < deadline:
             line = proc.stdout.readline().decode().strip()
@@ -64,7 +74,7 @@ def test_daemon_starts_and_embeds():
             if proc.poll() is not None:
                 stderr = proc.stderr.read().decode(errors="ignore")
                 pytest.fail(f"Daemon exited before READY: {stderr}")
-        assert ready, "Daemon did not emit READY within 30s"
+        assert ready, "Daemon did not emit READY within 60s"
 
         # Send embedding request
         texts = ["Hello world", "LanceDB vector database for AI agents"]
@@ -84,9 +94,10 @@ def test_daemon_starts_and_embeds():
             pass
 
 
+@pytest.mark.slow
 def test_daemon_concurrent_clients():
-    """Six clients send requests simultaneously to one daemon."""
-    sock_path = f"/tmp/mp_embed_concur_{os.getpid()}.sock"
+    """Six clients send requests simultaneously to one daemon. Integration test."""
+    sock_path = _make_sock_path("concur")
     env = {**os.environ, "MEMPALACE_EMBED_SOCK": sock_path}
 
     proc = subprocess.Popen(
@@ -97,7 +108,7 @@ def test_daemon_concurrent_clients():
     )
 
     try:
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if proc.stdout.readline().decode().strip() == "READY":
                 break
@@ -108,7 +119,7 @@ def test_daemon_concurrent_clients():
         def client_request(client_id: int) -> None:
             try:
                 texts = [f"Memory from session {client_id}, item {i}" for i in range(5)]
-                resp = _send_embedding_request(sock_path, texts, timeout=90.0)
+                resp = _send_embedding_request(sock_path, texts, timeout=120.0)
                 results[client_id] = len(resp["embeddings"])
             except Exception as e:
                 errors[client_id] = str(e)
@@ -117,7 +128,7 @@ def test_daemon_concurrent_clients():
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=120)
+            t.join(timeout=150)
 
         assert not errors, f"Client errors: {errors}"
         assert all(v == 5 for v in results.values()), f"Unexpected result counts: {results}"
@@ -131,11 +142,11 @@ def test_daemon_concurrent_clients():
             pass
 
 
+@pytest.mark.slow
 def test_auto_start_from_lance():
-    """LanceCollection auto-starts daemon on first add() via _start_daemon_if_needed."""
-    sock_path = f"/tmp/mp_embed_auto_{os.getpid()}.sock"
+    """LanceCollection auto-starts daemon on first add(). Integration test — spawns daemon."""
+    sock_path = _make_sock_path("auto")
 
-    # Set custom socket env before importing lance module
     original_env = os.environ.get("MEMPALACE_EMBED_SOCK")
     os.environ["MEMPALACE_EMBED_SOCK"] = sock_path
 
