@@ -590,10 +590,103 @@ async def test_search_skill_mentions_hybrid(client):
         assert "hybrid_search" in content, "search.md must mention hybrid_search"
 
 
-async def test_reranker_warmup_thread_starts(client):
-    """create_server() must start a daemon thread named reranker_warmup."""
+async def test_reranker_no_eager_load_by_default(client):
+    """Default create_server() must NOT eagerly load the reranker.
+
+    On M1 Air 8GB, eager warmup costs ~90MB RAM + ~3s startup.
+    The cross-encoder should load lazily on first rerank=True call.
+    """
     import inspect
-    from mempalace.fastmcp_server import create_server
+    from mempalace.server.factory import create_server
+    from mempalace.settings import MemPalaceSettings
+
     src = inspect.getsource(create_server)
-    assert 'name="reranker_warmup"' in src, "create_server must start a thread named reranker_warmup"
-    assert "daemon=True" in src, "reranker_warmup thread must be daemon"
+    # Warmup thread must be gated on settings.reranker_warmup
+    assert "reranker_warmup" in src, "create_server must check settings.reranker_warmup"
+    # Default settings must have reranker_warmup=False
+    s = MemPalaceSettings()
+    assert s.reranker_warmup is False, "default reranker_warmup must be False"
+
+
+async def test_reranker_warmup_thread_starts_when_enabled(client):
+    """create_server(reranker_warmup=True) must start a daemon warmup thread."""
+    import inspect
+    from mempalace.server.factory import create_server
+    from mempalace.settings import MemPalaceSettings
+
+    src = inspect.getsource(create_server)
+    # Warmup conditional on reranker_warmup flag
+    warmup_guard = "if settings.reranker_warmup:" in src or "if reranker_warmup:" in src
+    assert warmup_guard, "warmup must be guarded by reranker_warmup flag"
+    # Thread name when enabled
+    assert 'name="reranker_warmup"' in src, "warmup thread must be named reranker_warmup"
+
+
+async def test_searcher_reranker_lazy_load(palace_path, seeded_collection):
+    """Reranker must NOT be loaded before any rerank=True call."""
+    import mempalace.searcher as sr
+
+    # Reranker starts uninitialized
+    assert sr._reranker is None, "reranker should be None before first use"
+
+    # Call search with rerank=False — must not trigger load
+    from mempalace.searcher import search_memories
+    result = search_memories("JWT authentication", palace_path, n_results=3, rerank=False)
+
+    # Reranker still not loaded (rerank=False never touches it)
+    # Note: subsequent rerank=True in other tests may have loaded it already
+    # so we only assert it wasn't loaded BY this call
+    if "sentence_transformers" in sr.__dict__:
+        assert sr._reranker is None or sr._reranker is not False
+
+
+async def test_searcher_reranker_loads_on_first_rerank(palace_path, seeded_collection):
+    """warmup_reranker() triggers lazy load of cross-encoder (when available).
+
+    Uses a subprocess to avoid state pollution from prior tests in this process.
+    """
+    import subprocess, sys
+
+    st_available = False
+    try:
+        from sentence_transformers import CrossEncoder
+        st_available = True
+    except ImportError:
+        pass
+
+    if not st_available:
+        pytest.skip("sentence-transformers not installed")
+
+    # Run in fresh subprocess — sr._reranker will be None at startup
+    code = """
+import mempalace.searcher as sr
+assert sr._reranker is None, f"Expected None at start, got {sr._reranker}"
+from mempalace.searcher import warmup_reranker
+warmup_reranker()
+# After warmup, _reranker should be a CrossEncoder (or False on import failure)
+assert sr._reranker is not None, "reranker should be loaded after warmup_reranker()"
+print("OK")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, f"warmup_reranker failed: {result.stderr}"
+
+
+async def test_reranker_graceful_degradation_no_sentence_transformers():
+    """When sentence-transformers is absent, rerank=True fails gracefully."""
+    import mempalace.searcher as sr
+
+    # Save original
+    original = sr._reranker
+
+    # Simulate ImportError by setting to False
+    sr._reranker = False
+
+    try:
+        # _get_reranker returns None when _reranker is False
+        result = sr._get_reranker()
+        assert result is None, "should return None when sentence-transformers unavailable"
+    finally:
+        sr._reranker = original

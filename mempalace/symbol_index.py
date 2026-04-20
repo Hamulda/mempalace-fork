@@ -648,6 +648,21 @@ class SymbolIndex:
                 except Exception:
                     pass
 
+    def list_indexed_files(self) -> set[str]:
+        """
+        Return the set of all file paths currently in the index.
+
+        Public API — diagnostics should use this instead of accessing _conn/_lock.
+        """
+        with self._lock:
+            if not self._conn:
+                return set()
+            try:
+                cur = self._conn.execute("SELECT DISTINCT file_path FROM symbol_index")
+                return {row[0] for row in cur.fetchall()}
+            except Exception:
+                return set()
+
     def stats(self) -> dict:
         """Return index statistics."""
         with self._lock:

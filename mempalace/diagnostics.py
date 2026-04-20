@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,26 +109,13 @@ def validate_symbol_index(palace_path: str, project_path: str) -> dict:
         "stats": {},
     }
 
-    # Get indexed files from symbol_index
     idx = SymbolIndex.get(palace_path)
-    indexed_files: set[str] = set()
-    with idx._lock:
-        if idx._conn:
-            try:
-                cur = idx._conn.execute(
-                    "SELECT DISTINCT file_path FROM symbol_index"
-                )
-                for row in cur.fetchall():
-                    indexed_files.add(row[0])
-            except Exception:
-                pass
+    indexed_files = idx.list_indexed_files()
 
-    # Check each indexed file exists on disk
     for fp in sorted(indexed_files):
         if not os.path.isfile(fp):
             result["orphaned_files"].append(fp)
 
-    # Discover project files and check against index
     project_files = set(_walk_project(project_path, respect_gitignore=True))
     for fp in sorted(project_files):
         if fp not in indexed_files:
@@ -164,20 +149,14 @@ def validate_keyword_index(palace_path: str) -> dict:
         "stats": {},
     }
 
-    # Get FTS5 count
     ki = KeywordIndex.get(palace_path)
     result["fts5_count"] = ki.count()
 
-    # Get LanceDB count
+    from .backends import get_backend
     cfg = MempalaceConfig()
-    backend_type = cfg.backend
-    if backend_type not in ("lance", "chroma"):
-        backend_type = "lance"
-
     lance_count = 0
     try:
-        from .backends import get_backend
-        backend = get_backend(backend_type)
+        backend = get_backend("lance")
         col = backend.get_collection(palace_path, cfg.collection_name, create=False)
         lance_count = col.count()
     except Exception as e:
@@ -186,28 +165,17 @@ def validate_keyword_index(palace_path: str) -> dict:
     result["lance_count"] = lance_count
     result["counts_match"] = result["fts5_count"] == result["lance_count"]
 
-    # Sample check: grab document_ids from FTS5 and verify they exist in LanceDB
     if result["fts5_count"] > 0:
-        try:
-            conn = sqlite3.connect(ki.db_path, timeout=5.0)
-            cur = conn.execute(
-                "SELECT document_id FROM drawers_fts LIMIT 10"
-            )
-            sample_ids = [row[0] for row in cur.fetchall()]
-            conn.close()
-
-            if sample_ids and lance_count > 0:
-                # Try to fetch sample ids from LanceDB
-                try:
-                    backend = get_backend(backend_type)
-                    col = backend.get_collection(palace_path, cfg.collection_name, create=False)
-                    sample_data = col.get(ids=sample_ids[:5], include=["documents"])
-                    found_ids = sample_data.get("ids", [])
-                    result["sample_check_passed"] = len(found_ids) == len(sample_ids)
-                except Exception as e:
-                    result["sample_errors"].append(str(e))
-        except Exception as e:
-            result["sample_errors"].append(str(e))
+        sample_ids = ki.sample_ids(n=10)
+        if sample_ids and lance_count > 0:
+            try:
+                backend = get_backend("lance")
+                col = backend.get_collection(palace_path, cfg.collection_name, create=False)
+                sample_data = col.get(ids=sample_ids[:5], include=["documents"])
+                found_ids = sample_data.get("ids", [])
+                result["sample_check_passed"] = len(found_ids) == len(sample_ids)
+            except Exception as e:
+                result["sample_errors"].append(str(e))
 
     result["stats"]["fts5_count"] = result["fts5_count"]
     result["stats"]["lance_count"] = result["lance_count"]
@@ -224,9 +192,10 @@ def validate_runtime_state(palace_path: str) -> dict:
         "daemon_running": bool,
         "memory_pressure": str,
         "palace_initialized": bool,
+        "memory_guard_running": bool,
     }
 
-    Diagnostics only.
+    Diagnostics only — does NOT start MemoryGuard or trigger daemon startup.
     """
     palace_path = str(Path(palace_path).expanduser().resolve())
 
@@ -235,9 +204,9 @@ def validate_runtime_state(palace_path: str) -> dict:
         "daemon_running": False,
         "memory_pressure": "unknown",
         "palace_initialized": False,
+        "memory_guard_running": False,
     }
 
-    # Query cache stats
     try:
         from .query_cache import get_query_cache
         cache = get_query_cache()
@@ -245,21 +214,20 @@ def validate_runtime_state(palace_path: str) -> dict:
     except Exception:
         pass
 
-    # Memory pressure
     try:
-        guard = MemoryGuard.get()
-        result["memory_pressure"] = guard.pressure.value
+        guard = MemoryGuard.get_if_running()
+        if guard is not None:
+            result["memory_pressure"] = guard.pressure.value
+            result["memory_guard_running"] = True
     except Exception:
         pass
 
-    # Daemon status
     try:
         from .backends.lance import _daemon_is_running
         result["daemon_running"] = _daemon_is_running()
     except Exception:
         pass
 
-    # Palace initialized
     result["palace_initialized"] = os.path.isdir(palace_path)
 
     return result
@@ -383,47 +351,40 @@ def rebuild_symbol_index(palace_path: str, project_path: str) -> dict:
     return result
 
 
-def rebuild_keyword_index(palace_path: str) -> dict:
+def rebuild_keyword_index(palace_path: str, batch_size: int = 2000) -> dict:
     """
     Clear and rebuild keyword_index from LanceDB drawer content.
 
-    Reads all drawers from LanceDB with offset pagination, extracts text content,
-    upserts into FTS5 index via bulk_upsert().
+    Streams LanceDB content in batches and flushes each batch to FTS5
+    immediately — no full-corpus accumulation in RAM.  Uses bulk_insert_batch
+    (clear-once at start, then stream-insert per batch) to avoid the
+    redundant DELETE that bulk_upsert would perform on every call.
 
     Repair — destructive. Backs up current index first.
-    Returns: {"documents_indexed": N}
+    Returns: {"documents_indexed": N, "batches": N, "backup_path": str}
     """
     palace_path = str(Path(palace_path).expanduser().resolve())
 
-    result = {"documents_indexed": 0, "backup_path": None}
+    result = {"documents_indexed": 0, "batches": 0, "backup_path": None}
 
     ki = KeywordIndex.get(palace_path)
 
-    # Backup current index
     backup_path = _timestamped_backup(ki.db_path)
     result["backup_path"] = backup_path
 
-    # Clear existing index
     ki.clear()
 
-    # Read drawers from LanceDB
-    cfg = MempalaceConfig()
-    backend_type = cfg.backend
-    if backend_type not in ("lance", "chroma"):
-        backend_type = "lance"
-
-    BATCH = 5000
-    offset = 0
-    all_entries: list[dict] = []
+    from .backends import get_backend
 
     try:
-        from .backends import get_backend
-        backend = get_backend(backend_type)
+        backend = get_backend("lance")
+        cfg = MempalaceConfig()
         col = backend.get_collection(palace_path, cfg.collection_name, create=False)
 
+        offset = 0
         while True:
             batch = col.get(
-                limit=BATCH,
+                limit=batch_size,
                 offset=offset,
                 include=["documents", "metadatas"],
             )
@@ -434,27 +395,27 @@ def rebuild_keyword_index(palace_path: str) -> dict:
             batch_docs = batch.get("documents", []) or []
             batch_metas = batch.get("metadatas", []) or []
 
-            for doc_id, doc, meta in zip(batch_ids, batch_docs, batch_metas):
-                entry = {
+            entries = [
+                {
                     "document_id": doc_id,
                     "content": doc or "",
                     "wing": meta.get("wing", "") if meta else "",
                     "room": meta.get("room", "") if meta else "",
                     "language": meta.get("language", "") if meta else "",
                 }
-                all_entries.append(entry)
+                for doc_id, doc, meta in zip(batch_ids, batch_docs, batch_metas)
+            ]
 
+            ki.bulk_insert_batch(entries)
+            result["batches"] += 1
             offset += len(batch_ids)
-            if len(batch_ids) < BATCH:
+
+            if len(batch_ids) < batch_size:
                 break
 
     except Exception as e:
         result["error"] = str(e)
         return result
-
-    # Bulk upsert into FTS5
-    if all_entries:
-        ki.bulk_upsert(all_entries)
 
     result["documents_indexed"] = ki.count()
     return result

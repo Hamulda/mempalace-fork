@@ -308,7 +308,7 @@ def cmd_status(args):
         print("Embedding daemon: ❌ not running")
 
     # ── Palace ──────────────────────────────────────────────────────────
-    # Canonical backend: Lance is primary storage, Chroma is legacy compat.
+    # Canonical backend: Lance is primary storage; Chroma is legacy/migration-only.
     # Read from config unless --palace is explicitly passed.
     backend_type = config.backend  # from config.json / env
     if backend_type not in ("lance", "chroma"):
@@ -570,7 +570,7 @@ def cmd_serve(args):
     os.environ["MEMPALACE_TRANSPORT"] = "http"
     os.environ["MEMPALACE_HTTP_HOST"] = args.host
     os.environ["MEMPALACE_HTTP_PORT"] = str(args.port)
-    from .fastmcp_server import serve_http
+    from .server.factory import serve_http
     serve_http(host=args.host, port=args.port)
 
 
@@ -1147,7 +1147,7 @@ def cmd_repair_index(args):
             if "error" in result:
                 print(f"  ❌ ERROR: {result['error']}")
             else:
-                print(f"  ✅ Done: {docs} documents indexed")
+                print(f"  ✅ Done: {docs} documents indexed in {result.get('batches', 0)} batches")
                 print(f"  Backup: {backup}")
         except Exception as e:
             print(f"  ❌ ERROR: {e}")

@@ -1,9 +1,15 @@
 """
 migrate.py — Migrate MemPalace palace storage between backends.
 
-Usage:
-    python -m mempalace.migrate chroma-to-lance [--palace PATH] [--collection NAME]
-    python -m mempalace.migrate lance-to-chroma [--palace PATH] [--collection NAME]
+# LEGACY COMPAT — ChromaDB migration path
+#
+# ChromaDB is no longer used as a primary backend. This module exists solely
+# to migrate existing ChromaDB palaces to LanceDB. All production MemPalace
+# operations (search, write, repair, diagnostics) use LanceDB exclusively.
+#
+# Usage:
+#     python -m mempalace.migrate chroma-to-lance [--palace PATH] [--collection NAME]
+#     python -m mempalace.migrate lance-to-chroma [--palace PATH] [--collection NAME]
 """
 
 from __future__ import annotations

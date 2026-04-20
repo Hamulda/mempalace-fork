@@ -120,6 +120,16 @@ def _get_reranker():
     return _reranker if _reranker is not False else None
 
 
+def warmup_reranker():
+    """Eagerly load the cross-encoder reranker.
+
+    Call this only if reranker_warmup=True in settings (opt-in only).
+    On M1 Air 8GB this costs ~90MB RAM + ~3s on first load.
+    Safe to call multiple times — no-op if already loaded.
+    """
+    _get_reranker()
+
+
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
 

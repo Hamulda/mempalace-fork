@@ -41,10 +41,16 @@ def create_server(settings=None, shared_server_mode=False):
     if settings is None:
         settings = MemPalaceSettings()
 
+    # Canonical palace path (resolved from env or default, same chain as MempalaceConfig).
+    # db_path may differ if MEMPALACE_DB_PATH override is set (backward compat), but
+    # palace_path is what session managers and config_dir derive from — split-brain prevention.
+    palace_path = settings.palace_path
     db_path = Path(settings.db_path)
     db_path.mkdir(parents=True, exist_ok=True)
 
-    config = MempalaceConfig(config_dir=str(db_path.parent.parent))
+    # config_dir is derived from palace_path, NOT from db_path (which may have a compat override).
+    # This ensures MempalaceConfig.palace_path and session managers always agree with palace_path.
+    config = MempalaceConfig(config_dir=str(Path(palace_path).parent))
     backend = get_backend(settings.db_backend)
 
     middleware_stack = build_middleware_stack(settings)
@@ -64,11 +70,14 @@ def create_server(settings=None, shared_server_mode=False):
         from ..handoff_manager import HandoffManager
         from ..decision_tracker import DecisionTracker
 
-        registry = SessionRegistry(config.palace_path)
-        coordinator = WriteCoordinator(config.palace_path)
-        claims_mgr = ClaimsManager(config.palace_path)
-        handoff_mgr = HandoffManager(config.palace_path)
-        decision_tracker = DecisionTracker(config.palace_path)
+        # All coordinators use palace_path directly — single source of truth.
+        # config.palace_path would also be correct (same resolution chain), but
+        # using palace_path directly avoids any property lookup indirection.
+        registry = SessionRegistry(palace_path)
+        coordinator = WriteCoordinator(palace_path)
+        claims_mgr = ClaimsManager(palace_path)
+        handoff_mgr = HandoffManager(palace_path)
+        decision_tracker = DecisionTracker(palace_path)
 
         setattr(server, "_session_registry", registry)
         setattr(server, "_write_coordinator", coordinator)
@@ -113,14 +122,15 @@ def create_server(settings=None, shared_server_mode=False):
     register_session_tools(server, backend, config, settings)
     register_symbol_tools(server, backend, config, settings)
 
-    # ── Reranker warmup ─────────────────────────────────────────────────────
-    def _warmup_reranker():
-        try:
-            from ..searcher import _get_reranker
-            _get_reranker()
-        except Exception:
-            pass
-    threading.Thread(target=_warmup_reranker, daemon=True, name="reranker_warmup").start()
+    # ── Optional reranker warmup (disabled by default — saves ~90MB RAM + ~3s startup) ──
+    if settings.reranker_warmup:
+        def _warmup_reranker():
+            try:
+                from ..searcher import warmup_reranker
+                warmup_reranker()
+            except Exception:
+                pass
+        threading.Thread(target=_warmup_reranker, daemon=True, name="reranker_warmup").start()
 
     return server
 

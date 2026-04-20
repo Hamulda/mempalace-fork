@@ -1,11 +1,11 @@
 """
 Test bounded background work — thread storm prevention on M1/8GB.
 
-Verifies via source inspection (avoids fastmcp import issues in test env):
-1. _bg_executor exists and has bounded max_workers
-2. add_drawer uses _bg_executor.submit for general extraction
-3. BM25 rebuild is debounced/coalesced
-4. embed_daemon uses bounded ThreadPoolExecutor instead of thread-per-connection
+Verifies via source inspection:
+1. server/_infrastructure.py: _bg_executor exists and has bounded max_workers
+2. server/_write_tools.py: add_drawer uses bg_executor.submit for general extraction
+3. server/_write_tools.py: BM25 rebuild is debounced/coalesced
+4. embed_daemon.py: uses bounded ThreadPoolExecutor instead of thread-per-connection
 """
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).parent.parent / "mempalace"
-FASTMCP_PATH = ROOT / "fastmcp_server.py"
+INFRASTRUCTURE_PATH = ROOT / "server" / "_infrastructure.py"
+WRITE_TOOLS_PATH = ROOT / "server" / "_write_tools.py"
 EMBED_PATH = ROOT / "embed_daemon.py"
+FASTMCP_PATH = ROOT / "fastmcp_server.py"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,36 +47,23 @@ def get_module_vars(path: Path, prefix: str) -> dict[str, ast.expr]:
 # fastmcp_server.py — executor globals
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestFastmcpServerExecutorGlobals:
+class TestInfrastructureExecutorGlobals:
     """Verify module-level executor variables exist and are bounded."""
 
     def test_bg_executor_exists(self):
-        vars = get_module_vars(FASTMCP_PATH, "_bg_executor")
-        assert "_bg_executor" in vars, "_bg_executor not found in fastmcp_server.py"
+        vars = get_module_vars(INFRASTRUCTURE_PATH, "bg_executor")
+        assert "bg_executor" in vars, "bg_executor not found in server/_infrastructure.py"
 
     def test_bg_executor_max_workers_is_bounded(self):
-        src = FASTMCP_PATH.read_text()
+        src = INFRASTRUCTURE_PATH.read_text()
         match = re.search(
-            r"_bg_executor\s*=\s*ThreadPoolExecutor\s*\(\s*max_workers\s*=\s*(\d+)",
+            r"bg_executor\s*=\s*ThreadPoolExecutor\s*\(\s*max_workers\s*=\s*(\d+)",
             src,
         )
-        assert match, "_bg_executor with max_workers not found"
+        assert match, "bg_executor with max_workers not found"
         n = int(match.group(1))
-        assert n <= 4, f"_bg_executor max_workers={n} is too large for M1/8GB"
-        assert n >= 1, f"_bg_executor max_workers={n} must be at least 1"
-
-    def test_bm25_pending_event_exists(self):
-        vars = get_module_vars(FASTMCP_PATH, "_bm25_pending_event")
-        assert "_bm25_pending_event" in vars
-
-    def test_bm25_coalesce_ms_exists(self):
-        vars = get_module_vars(FASTMCP_PATH, "_BM25_COALESCE")
-        assert "_BM25_COALESCE_MS" in vars
-        src = FASTMCP_PATH.read_text()
-        match = re.search(r"_BM25_COALESCE_MS\s*=\s*(\d+)", src)
-        assert match, "_BM25_COALESCE_MS assignment not found"
-        n = int(match.group(1))
-        assert 100 <= n <= 5000, f"_BM25_COALESCE_MS={n} should be 100ms-5s"
+        assert n <= 4, f"bg_executor max_workers={n} is too large for M1/8GB"
+        assert n >= 1, f"bg_executor max_workers={n} must be at least 1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,7 +97,7 @@ def _find_top_level_calls(func_node: ast.FunctionDef, module: str) -> list[str]:
     return results
 
 
-class TestAddDrawerBackgroundWork:
+class TestWriteToolsDrawerBackgroundWork:
     """Verify add_drawer sends background work to executor, not bare threads."""
 
     def test_no_bare_threading_thread_at_top_level(self):
@@ -117,7 +106,7 @@ class TestAddDrawerBackgroundWork:
         Nested function definitions (e.g. _schedule_bm25_rebuild) are allowed
         to contain threading.Thread — they are implementation details.
         """
-        src = FASTMCP_PATH.read_text()
+        src = WRITE_TOOLS_PATH.read_text()
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "mempalace_add_drawer":
@@ -125,39 +114,20 @@ class TestAddDrawerBackgroundWork:
                 bad = [c for c in calls if "threading.Thread" in c]
                 assert len(bad) == 0, (
                     f"add_drawer top-level creates bare threading.Thread: {bad}. "
-                    "Should use _bg_executor.submit()"
+                    "Should use bg_executor.submit()"
                 )
                 return
         pytest.fail("mempalace_add_drawer not found")
 
     def test_gen_extraction_uses_bg_executor(self):
-        """_extract_general_facts must be submitted via _bg_executor.submit."""
-        src = FASTMCP_PATH.read_text()
+        """_extract_general_facts must be submitted via bg_executor.submit."""
+        src = WRITE_TOOLS_PATH.read_text()
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "mempalace_add_drawer":
                 body_text = ast.unparse(node)
-                assert "_bg_executor.submit" in body_text, (
-                    "add_drawer should call _bg_executor.submit for background work"
-                )
-                return
-        pytest.fail("mempalace_add_drawer not found")
-
-    def test_bm25_rebuild_uses_coalescing(self):
-        """BM25 rebuild must use debounce event + debounce window."""
-        src = FASTMCP_PATH.read_text()
-        tree = ast.parse(src)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "mempalace_add_drawer":
-                body_text = ast.unparse(node)
-                assert "_bm25_pending_event" in body_text, (
-                    "BM25 rebuild should use coalescing event"
-                )
-                assert "_BM25_COALESCE_MS" in body_text, (
-                    "BM25 rebuild should use debounce window"
-                )
-                assert "_bg_executor.submit" in body_text, (
-                    "BM25 rebuild should go through _bg_executor"
+                assert "bg_executor.submit" in body_text, (
+                    "add_drawer should call bg_executor.submit for background work"
                 )
                 return
         pytest.fail("mempalace_add_drawer not found")

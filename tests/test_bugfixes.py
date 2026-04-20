@@ -258,7 +258,7 @@ class TestKgThreadSafety:
             for t in threads:
                 t.start()
             for t in threads:
-                t.join()
+                t.join(timeout=15)
 
             assert not errors, f"Thread safety errors: {errors}"
             del kg

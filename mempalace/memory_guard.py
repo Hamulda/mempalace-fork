@@ -7,6 +7,7 @@ import threading
 import time
 import logging
 from enum import Enum
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,19 @@ class MemoryGuard:
             # always see a fully initialized instance (not just NOMINAL default).
             cls._started.wait(timeout=5.0)
         return cls._instance
+
+    @classmethod
+    def get_if_running(cls) -> Optional["MemoryGuard"]:
+        """
+        Return the existing singleton if it is already started, otherwise None.
+
+        Unlike get(), this does NOT create or start a new instance — it is
+        safe to call from diagnostics that must not trigger side effects.
+        """
+        with cls._lock:
+            if cls._instance is not None and cls._started.is_set():
+                return cls._instance
+            return None
 
     @property
     def pressure(self) -> MemoryPressure:

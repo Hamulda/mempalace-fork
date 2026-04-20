@@ -6,3 +6,10 @@ __pycache__/
 .pytest_cache/
 mempal.yaml
 .a5c/
+*.bak
+*.omc
+.venv/
+node_modules/
+.DS_Store
+.env
+si_*/

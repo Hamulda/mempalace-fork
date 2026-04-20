@@ -125,6 +125,7 @@ def _cleanup_resources():
     - MemoryGuard daemon thread stopped and singleton reset
     - SymbolIndex instances closed and cleared
     - QueryCache cleared
+    - ChromaDB client reset
     """
     yield
     # Stop MemoryGuard daemon thread and reset singleton
@@ -156,6 +157,12 @@ def _cleanup_resources():
         from mempalace.query_cache import get_query_cache
         cache = get_query_cache()
         cache.clear()
+    except Exception:
+        pass
+    # Reset ChromaDB client singleton
+    try:
+        import chromadb
+        chromadb.reset_client()
     except Exception:
         pass
 
@@ -194,7 +201,14 @@ def collection(palace_path):
     client = chromadb.PersistentClient(path=palace_path)
     col = client.get_or_create_collection("mempalace_drawers")
     yield col
-    client.delete_collection("mempalace_drawers")
+    try:
+        client.delete_collection("mempalace_drawers")
+    except Exception:
+        pass
+    try:
+        client.close()
+    except Exception:
+        pass
     del client
 
 

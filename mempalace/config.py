@@ -13,7 +13,7 @@ from pathlib import Path
 # ── Input validation ──────────────────────────────────────────────────────────
 # Shared sanitizers for wing/room/entity names. Prevents path traversal,
 # excessively long strings, and special characters that could cause issues
-# in file paths, SQLite, or ChromaDB metadata.
+# in file paths, SQLite, or LanceDB metadata.
 
 MAX_NAME_LENGTH = 128
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_ .'-]{0,126}[a-zA-Z0-9]?$")
@@ -155,18 +155,13 @@ class MempalaceConfig:
     @property
     def backend(self) -> str:
         """
-        Storage backend: 'lance' (canonical primary) or 'chroma' (legacy compat).
+        Storage backend: 'lance' (canonical primary) or 'chroma' (legacy/migration only).
 
-        Legacy note:
-          config.json historically defaulted to 'chroma' (before Lance existed).
-          New installations should set 'lance' explicitly.
-          If config is missing or set to an unknown value, code that reads
-          this property should treat 'lance' as the canonical default.
+        Canonical default is 'lance'. Use 'chroma' only for migrating existing ChromaDB
+        palaces to LanceDB — not for new installations or ongoing use.
 
-        settings.py uses 'db_backend' with values 'chromadb'/'lancedb' —
-        that is a separate Pydantic layer for the server binary.
-        This config.py backend is what the CLI reads for CLI operations
-        (status, mine, search, cleanup, etc.).
+        Note: the Pydantic layer in settings.py uses the same 'lance'/'chroma' values
+        (not 'lancedb'/'chromadb'). The canonical values are consistent across all layers.
         """
         env_val = os.environ.get("MEMPALACE_BACKEND")
         if env_val:

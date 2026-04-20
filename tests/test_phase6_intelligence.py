@@ -379,7 +379,7 @@ class TestSymbolIndexThreadSafety:
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            t.join(timeout=15)
 
         assert not errors, f"Thread errors: {errors}"
         stats = si.stats()
@@ -426,7 +426,7 @@ class TestSymbolIndexThreadSafety:
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            t.join(timeout=15)
 
         assert not write_errors, f"Write errors: {write_errors}"
         assert len(read_results) == 60

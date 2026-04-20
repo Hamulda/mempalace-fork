@@ -228,9 +228,12 @@ class KeywordIndex:
             logger.warning("FTS5 prefix search failed: %s", e)
             return []
 
-    def bulk_upsert(self, entries: list[dict]) -> None:
+    def bulk_insert_batch(self, entries: list[dict]) -> None:
         """
-        Bulk upsert multiple drawers in one transaction.
+        Bulk-insert a batch of entries in one transaction.
+
+        Does NOT clear the table — safe for streaming rebuild where the caller
+        clears once before the first batch.
 
         entries: list of dicts with keys: document_id, content, wing, room, language
         """
@@ -241,7 +244,6 @@ class KeywordIndex:
                 conn = sqlite3.connect(self.db_path)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("DELETE FROM drawers_fts")  # Simple approach: clear + rebuild
                 for entry in entries:
                     conn.execute(
                         "INSERT INTO drawers_fts(document_id, content, wing, room, language) VALUES (?, ?, ?, ?, ?)",
@@ -256,7 +258,23 @@ class KeywordIndex:
                 conn.commit()
                 conn.close()
             except sqlite3.Error as e:
-                logger.warning("FTS5 bulk upsert failed: %s", e)
+                logger.warning("FTS5 bulk insert failed: %s", e)
+
+    def sample_ids(self, n: int = 10) -> list[str]:
+        """
+        Return a sample of up to n document IDs from the index.
+
+        Public API — diagnostics should use this instead of opening
+        a raw sqlite3 connection on db_path.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            cur = conn.execute(f"SELECT document_id FROM drawers_fts LIMIT {n}")
+            ids = [row[0] for row in cur.fetchall()]
+            conn.close()
+            return ids
+        except sqlite3.Error:
+            return []
 
     def count(self) -> int:
         """Return the total number of indexed documents."""

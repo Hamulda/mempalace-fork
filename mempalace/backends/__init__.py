@@ -4,14 +4,22 @@ MemPalace storage backends.
 Export BaseCollection interface and available backends.
 Use get_backend() to instantiate the configured backend.
 
-Naming convention:
-  - "lance" / "lancedb" — canonical primary storage (LanceDB)
-  - "chroma" / "chromadb" — legacy compatibility
+Canonical naming:
+  - "lance" — LanceDB, primary storage (default)
+  - "chroma" — ChromaDB, legacy/migration compatibility only
 
-Both config.py and settings.py use the same canonical names: "lance" | "chroma".
+The canonical runtime path is always Lance. Chroma exists solely to support
+data migration FROM Chroma TO Lance. All production paths (search, write, repair,
+diagnostics) use Lance exclusively.
 """
 
+from typing import Literal
+
 from .base import BaseCollection
+
+# Canonical backend type — use this across the codebase, not hardcoded strings
+BackendType = Literal["lance", "chroma"]
+BACKEND_CHOICES: tuple[BackendType, ...] = ("lance", "chroma")
 
 # Lazy import pattern: backends are imported on-demand, not at package import time.
 # This prevents Chroma from being eagerly loaded when only Lance is used.
@@ -31,26 +39,28 @@ __all__ = [
     "BaseCollection",
     "get_backend",
     "_LANCE_AVAILABLE",
+    "BackendType",
+    "BACKEND_CHOICES",
 ]
 
 
-def get_backend(backend_type: str = "lance") -> "ChromaBackend | LanceBackend":
+def get_backend(backend_type: BackendType = "lance") -> "ChromaBackend | LanceBackend":
     """
     Factory for storage backends. Uses LAZY imports — backend module loaded on first use.
 
-    Canonical backend names (use these consistently):
-      - "lance" — LanceDB, canonical primary storage
-      - "chroma" — ChromaDB, legacy compat
+    Canonical backend names:
+      - "lance" — LanceDB, canonical primary storage (default)
+      - "chroma" — ChromaDB, legacy/migration compatibility only
 
     Args:
-        backend_type: "lance" (default, canonical) or "chroma" (legacy compat)
+        backend_type: "lance" (default, canonical) or "chroma" (migration compat)
 
     Returns:
         An instance of LanceBackend or ChromaBackend.
 
     Raises:
         ImportError: If "lance" is requested but LanceDB is not installed.
-        ValueError: If an unknown backend_type is requested.
+        ValueError: If an unknown backend_type is requested (not in BACKEND_CHOICES).
     """
     global ChromaBackend, ChromaCollection
 
@@ -72,4 +82,7 @@ def get_backend(backend_type: str = "lance") -> "ChromaBackend | LanceBackend":
         ChromaCollection = CC
         return ChromaBackend()
 
-    raise ValueError(f"Unknown backend type: {backend_type!r}. Use 'lance' or 'chroma'.")
+    raise ValueError(
+        f"Unknown backend type: {backend_type!r}. "
+        f"Use one of: {', '.join(repr(b) for b in BACKEND_CHOICES)}."
+    )
