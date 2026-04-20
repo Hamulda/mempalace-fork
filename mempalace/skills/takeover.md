@@ -10,20 +10,31 @@ When another session stops and you need to take over their work, follow this pro
 ## Step 1: Pull Pending Handoffs
 
 See what's been left for you:
-```
-mempalace_pull_handoffs(session_id="your-session-id")
-```
 
-Or for broadcast handoffs (no specific recipient):
-```
+```python
+# With your session ID (directed + broadcast handoffs for you)
+mempalace_pull_handoffs()
+
+# Without session ID — pulls all broadcast handoffs (anyone can pick up)
 mempalace_pull_handoffs(session_id=None)
 ```
+
+**session_id is auto-detected** — no need to pass it explicitly unless you want
+to pull for a specific session context.
 
 ## Step 2: Get Full Wakeup Context
 
 For complete picture including recent changes and hot spots:
-```
-mempalace_wakeup_context(session_id="your-session-id", project_root="/path/to/project")
+
+```python
+# All arguments are optional — session_id and project_root are auto-detected
+mempalace_wakeup_context()
+
+# Or with explicit overrides
+mempalace_wakeup_context(
+  session_id="your-session-id",
+  project_root="/path/to/project"
+)
 ```
 
 This returns:
@@ -40,8 +51,9 @@ This returns:
 ## Step 3: Check Recent Changes Impact
 
 Before diving in, understand what's changed recently:
+
 ```
-mempalace_recent_changes(project_root="/path/to/project", n=10)
+mempalace_recent_changes(n=10)
 ```
 
 This tells you which files have been active — helpful for understanding context.
@@ -49,25 +61,25 @@ This tells you which files have been active — helpful for understanding contex
 ## Step 4: Accept the Handoff
 
 When you decide to take over work from a handoff:
-```
-mempalace_accept_handoff(handoff_id="handoff-uuid", session_id="your-session-id")
-```
 
-This marks the handoff as accepted and updates the status.
+```python
+# session_id auto-detected — just pass the handoff_id
+mempalace_accept_handoff(handoff_id="handoff-uuid")
+```
 
 ## Step 5: Symbol Context (if handoff mentions specific files)
 
 If the handoff mentions specific files, get symbol context:
+
 ```
 mempalace_file_symbols(file_path="/path/to/handoff-file.py")
 mempalace_find_symbol(symbol_name="function_in_handoff_file")
 ```
 
-This helps you understand the current state of the code you're taking over.
-
 ## Step 6: Check Claims of Other Session
 
 If no handoff was pushed but you see claims from another session:
+
 ```
 mempalace_list_claims()
 ```

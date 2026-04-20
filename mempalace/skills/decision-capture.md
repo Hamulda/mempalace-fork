@@ -25,16 +25,26 @@ Capture decisions when:
 
 ## How to Capture
 
-```
+```python
+# Minimal — only decision and rationale are required
 mempalace_capture_decision(
-  session_id="your-session-id",
   decision="Use JWT instead of sessions for auth",
-  rationale="Sessions don't scale across multiple servers. JWT is stateless and works better with horizontal scaling. Affects /src/auth.py token handling and /src/middleware.py.",
+  rationale="Sessions don't scale across multiple servers. JWT is stateless and works better with horizontal scaling. Affects /src/auth.py token handling and /src/middleware.py."
+)
+
+# Full — all optional fields with defaults
+mempalace_capture_decision(
+  decision="Use JWT instead of sessions for auth",
+  rationale="Sessions don't scale across multiple servers.",
   alternatives=["Keep sessions with sticky sessions", "Use cookies with server-side validation"],
-  category="architecture",
-  confidence=4
+  category="architecture",     # default: "general"
+  confidence=4,                # default: 3
+  # session_id is auto-detected — no need to pass it
 )
 ```
+
+**session_id is auto-detected** from the Claude Code harness context. Pass it explicitly
+only when you need to override.
 
 ## Include File Context in Rationale
 
@@ -55,7 +65,7 @@ This allows `mempalace_list_decisions` to surface decisions relevant to files yo
 | `testing` | Test strategy, coverage approaches |
 | `deployment` | Infrastructure, CI/CD, hosting |
 | `data` | Data model, storage choices |
-| `other` | Anything not covered above |
+| `general` | Anything not covered above (default) |
 
 ## Confidence Scale
 
@@ -63,7 +73,7 @@ This allows `mempalace_list_decisions` to surface decisions relevant to files yo
 |------------|---------|
 | 1 | Unsure, might revisit |
 | 2 | Leaning toward this choice |
-| 3 | Confident, would choose again |
+| 3 | Confident, would choose again (default) |
 | 4 | Very confident, good evidence |
 | 5 | Certain, no other reasonable choice |
 
@@ -81,13 +91,8 @@ If you're editing `/src/auth.py` and there's a decision with `/src/auth.py` in i
 
 ## Superseding Decisions
 
-If you later make a better decision that supersedes an old one:
-```
-mempalace_supersede_decision(
-  decision_id="old-decision-uuid",
-  superseding_decision_id="new-decision-uuid",
-  session_id="your-session-id"
-)
-```
+If you later make a better decision that supersedes an old one, use `mempalace_kg_supersede`
+for KG facts, or simply capture a new decision with the same topic.
 
-This marks the old decision as superseded and links it to the new one.
+Note: there is no separate `mempalace_supersede_decision` tool — capture a new decision
+and let future sessions see both (old and new) via `mempalace_list_decisions`.

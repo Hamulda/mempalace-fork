@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
 
 # WAL async executor — offloads file I/O from async tool handlers
-wal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mp_wal")
+wal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mp_wal")  # kept for backward compat — WAL now synchronous via wal_log()
 
 # Background work executor — bounded, prevents thread storm on M1/8GB
 bg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mp_bg")

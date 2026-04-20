@@ -42,7 +42,7 @@ class QueryCache:
     def __init__(
         self,
         maxsize: int = 256,
-        ttl_seconds: float = 5.0,
+        ttl_seconds: float = 60.0,
     ):
         self._cache: OrderedDict[str, tuple[Any, float]] = OrderedDict()
         self._maxsize = maxsize
@@ -221,7 +221,7 @@ class QueryCache:
 # Globální cache singleton sdílená v HTTP MCP serveru
 _query_cache = QueryCache(
     maxsize=int(os.environ.get("MEMPALACE_CACHE_SIZE", "256")),
-    ttl_seconds=float(os.environ.get("MEMPALACE_CACHE_TTL", "5.0")),
+    ttl_seconds=float(os.environ.get("MEMPALACE_CACHE_TTL", "60.0")),
 )
 
 

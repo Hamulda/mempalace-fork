@@ -1374,6 +1374,11 @@ class LanceCollection(BaseCollection):
                 # No filter — enforce hard limit to prevent full-table RAM spike.
                 # 5000 is a safe default that fits comfortably in 8GB RAM.
                 effective_limit = min(limit or 5000, 5000)
+                if limit is None and effective_limit == 5000:
+                    logger.warning(
+                        "get(where=None) with no limit hit 5000-row hard cap. "
+                        "Results are truncated. Use a filter or explicit limit."
+                    )
                 search = self._table.search()
                 if offset is not None and offset > 0:
                     search = search.offset(offset)

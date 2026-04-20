@@ -8,15 +8,57 @@ from pathlib import Path
 from fastmcp import Context
 
 
+def _claim_check(server, target_id: str, session_id: str | None, mode: str = "advisory") -> dict | None:
+    """
+    Check claim before a write operation.
+
+    Returns None (proceed) if:
+      - no ClaimsManager available (non-shared mode) — fail open
+      - session_id is None — advisory only, no session identity
+      - mode=advisory — warn on conflict but allow write
+      - session_id owns the target — proceed
+
+    Returns an error dict (block) only when:
+      - mode=strict AND another session holds an active claim on target_id
+    """
+    if session_id is None:
+        return None  # No session identity — fail open
+    claims_mgr = getattr(server, "_claims_manager", None)
+    if claims_mgr is None:
+        return None  # Non-shared mode — no coordination available
+    conflict = claims_mgr.check_conflicts("file", target_id, session_id)
+    if not conflict.get("has_conflict"):
+        return None  # No active conflict
+    if conflict.get("is_self"):
+        return None  # Self holds the claim — proceed
+    if mode == "strict":
+        return {
+            "error": "claim_conflict",
+            "owner": conflict["owner"],
+            "target_id": target_id,
+            "hint": "Another session holds an active claim. Wait for TTL expiry or request handoff.",
+        }
+    # advisory — warn but allow write; return warning dict so caller surfaces it
+    return {
+        "warning": "claim_advisory_write",
+        "owner": conflict["owner"],
+        "target_id": target_id,
+        "message": f"Proceeding with write despite active claim by {conflict['owner']} on {target_id}.",
+    }
+
+
 def register_write_tools(server, backend, config, settings, memory_guard):
     """
     Register all write @mcp.tool() as closures over backend/config/kg.
     Called by factory._register_tools().
     """
-    from ._infrastructure import wal_log_async, get_wal_path, bg_executor
+    from ._infrastructure import wal_log, get_wal_path, bg_executor
     from ..searcher import invalidate_query_cache
     from ..entity_detector import extract_candidates
     from ..config import sanitize_name, sanitize_content
+
+    # Capture WriteCoordinator for intent lifecycle — fail-open if unavailable
+    _wc = getattr(server, "_write_coordinator", None)
 
     def _get_collection(create=False):
         try:
@@ -34,6 +76,33 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         # Uses per-server StatusCache attached to server in create_server().
         server._status_cache.invalidate()
 
+    def _log_intent(session_id, operation, target_type, target_id, payload=None):
+        """Log intent — fail-open, returns intent_id or None."""
+        if _wc is None or session_id is None:
+            return None
+        try:
+            return _wc.log_intent(session_id, operation, target_type, target_id, payload)
+        except Exception:
+            return None
+
+    def _commit_intent(intent_id, session_id):
+        """Commit intent — fail-open."""
+        if _wc is None or intent_id is None or session_id is None:
+            return
+        try:
+            _wc.commit_intent(intent_id, session_id)
+        except Exception:
+            pass
+
+    def _rollback_intent(intent_id, session_id):
+        """Rollback intent — fail-open."""
+        if _wc is None or intent_id is None or session_id is None:
+            return
+        try:
+            _wc.rollback_intent(intent_id, session_id)
+        except Exception:
+            pass
+
     @server.tool(timeout=settings.timeout_write)
     def mempalace_add_drawer(
         ctx: Context,
@@ -42,6 +111,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         content: str,
         source_file: str | None = None,
         added_by: str = "mcp",
+        session_id: str | None = None,
+        claim_mode: str = "advisory",
     ) -> dict:
         try:
             wing = sanitize_name(wing, "wing")
@@ -56,16 +127,29 @@ def register_write_tools(server, backend, config, settings, memory_guard):
 
         drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content[:100]).encode()).hexdigest()[:24]}"
 
-        wal_log_async(
+        if claim_mode not in ("advisory", "strict"):
+            claim_mode = "advisory"
+        target_id = f"{settings.palace_path}/{wing}/{room}"
+        claim_err = _claim_check(server, target_id, session_id, claim_mode)
+        claim_warning = None
+        if claim_err:
+            if "error" in claim_err:
+                return claim_err
+            claim_warning = claim_err.get("message")
+
+        wal_log(
             "add_drawer",
             {"drawer_id": drawer_id, "wing": wing, "room": room, "added_by": added_by,
              "content_length": len(content), "content_preview": content[:200]},
             wal_file=get_wal_path(settings.wal_dir),
         )
 
+        intent_id = _log_intent(session_id, "add_drawer", "drawer", drawer_id, {"wing": wing, "room": room})
+
         try:
             existing = col.get(ids=[drawer_id])
             if existing and existing["ids"]:
+                _rollback_intent(intent_id, session_id)
                 return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
         except Exception:
             pass
@@ -74,6 +158,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             try:
                 if memory_guard.should_pause_writes():
                     reason = f"memory pressure: {memory_guard.pressure.value} ({memory_guard.used_ratio:.0%} used)"
+                    _rollback_intent(intent_id, session_id)
                     return {"error": f"Write blocked: {reason}", "blocked_by": "memory_guard", "pressure": memory_guard.pressure.value}
             except Exception:
                 pass  # Fail open
@@ -112,14 +197,24 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     "origin_type": "observation", "is_latest": True, "supersedes_id": "",
                 }],
             )
+            _commit_intent(intent_id, session_id)
             invalidate_query_cache()
             _invalidate_status_cache()
-            return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+            resp = {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+            if claim_warning:
+                resp["claim_warning"] = claim_warning
+            return resp
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            _rollback_intent(intent_id, session_id)
+            return {"success": False, "error": str(e), "error_code": "LANCE_WRITE_FAILED", "retryable": True}
 
     @server.tool(timeout=settings.timeout_write)
-    def mempalace_delete_drawer(ctx: Context, drawer_id: str) -> dict:
+    def mempalace_delete_drawer(
+        ctx: Context,
+        drawer_id: str,
+        session_id: str | None = None,
+        claim_mode: str = "advisory",
+    ) -> dict:
         col = _get_collection()
         if not col:
             return _no_palace()
@@ -128,18 +223,36 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             return {"success": False, "error": f"Drawer not found: {drawer_id}"}
         deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
         deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-        wal_log_async(
+
+        if claim_mode not in ("advisory", "strict"):
+            claim_mode = "advisory"
+        claim_err = _claim_check(server, drawer_id, session_id, claim_mode)
+        claim_warning = None
+        if claim_err:
+            if "error" in claim_err:
+                return claim_err
+            claim_warning = claim_err.get("message")
+
+        wal_log(
             "delete_drawer",
             {"drawer_id": drawer_id, "deleted_meta": deleted_meta, "content_preview": deleted_content[:200]},
             wal_file=get_wal_path(settings.wal_dir),
         )
+
+        intent_id = _log_intent(session_id, "delete_drawer", "drawer", drawer_id)
+
         try:
             col.delete(ids=[drawer_id])
+            _commit_intent(intent_id, session_id)
             invalidate_query_cache()
             _invalidate_status_cache()
-            return {"success": True, "drawer_id": drawer_id}
+            resp = {"success": True, "drawer_id": drawer_id}
+            if claim_warning:
+                resp["claim_warning"] = claim_warning
+            return resp
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            _rollback_intent(intent_id, session_id)
+            return {"success": False, "error": str(e), "error_code": "LANCE_WRITE_FAILED", "retryable": True}
 
     @server.tool(timeout=settings.timeout_write)
     def mempalace_diary_write(
@@ -147,6 +260,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         agent_name: str,
         entry: str,
         topic: str = "general",
+        session_id: str | None = None,
+        claim_mode: str = "advisory",
     ) -> dict:
         try:
             agent_name = sanitize_name(agent_name, "agent_name")
@@ -160,11 +275,25 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             return _no_palace()
         now = datetime.now()
         entry_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}_{hashlib.sha256(entry[:50].encode()).hexdigest()[:12]}"
-        wal_log_async(
+
+        if claim_mode not in ("advisory", "strict"):
+            claim_mode = "advisory"
+        target_id = f"{settings.palace_path}/{wing}/{room}"
+        claim_err = _claim_check(server, target_id, session_id, claim_mode)
+        claim_warning = None
+        if claim_err:
+            if "error" in claim_err:
+                return claim_err
+            claim_warning = claim_err.get("message")
+
+        wal_log(
             "diary_write",
             {"agent_name": agent_name, "topic": topic, "entry_id": entry_id, "entry_preview": entry[:200]},
             wal_file=get_wal_path(settings.wal_dir),
         )
+
+        intent_id = _log_intent(session_id, "diary_write", "diary_entry", entry_id, {"agent_name": agent_name, "topic": topic})
+
         try:
             col.upsert(
                 ids=[entry_id],
@@ -177,14 +306,26 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     "origin_type": "diary_entry", "is_latest": True, "supersedes_id": "", "chunk_index": 0,
                 }],
             )
+            _commit_intent(intent_id, session_id)
             invalidate_query_cache()
             _invalidate_status_cache()
-            return {"success": True, "entry_id": entry_id, "agent": agent_name, "topic": topic, "timestamp": now.isoformat()}
+            resp = {"success": True, "entry_id": entry_id, "agent": agent_name, "topic": topic, "timestamp": now.isoformat()}
+            if claim_warning:
+                resp["claim_warning"] = claim_warning
+            return resp
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            _rollback_intent(intent_id, session_id)
+            return {"success": False, "error": str(e), "error_code": "LANCE_WRITE_FAILED", "retryable": True}
 
     @server.tool(timeout=settings.timeout_read)
-    def mempalace_diary_read(ctx: Context, agent_name: str, last_n: int = 10) -> dict:
+    def mempalace_diary_read(ctx: Context, agent_name: str, last_n: int = 10, session_id: str | None = None) -> dict:
+        """
+        Read diary entries for an agent.
+
+        session_id is accepted for symmetry with diary_write but is not currently
+        used in the query (diary entries are per-agent, not per-session).
+        Included for future session-scoped diary filtering if needed.
+        """
         wing = f"wing_{agent_name.lower().replace(' ', '_')}"
         col = _get_collection()
         if not col:
@@ -235,6 +376,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         line_start: int | None = None,
         line_end: int | None = None,
         symbol_name: str | None = None,
+        session_id: str | None = None,
+        claim_mode: str = "advisory",
     ) -> dict:
         try:
             wing = sanitize_name(wing, "wing")
@@ -247,15 +390,30 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         if not col:
             return _no_palace()
         drawer_id = f"code_{wing}_{room}_{hashlib.sha256((wing + room + description[:100]).encode()).hexdigest()[:24]}"
-        wal_log_async(
+
+        if claim_mode not in ("advisory", "strict"):
+            claim_mode = "advisory"
+        target_id = f"{settings.palace_path}/{wing}/{room}"
+        claim_err = _claim_check(server, target_id, session_id, claim_mode)
+        claim_warning = None
+        if claim_err:
+            if "error" in claim_err:
+                return claim_err
+            claim_warning = claim_err.get("message")
+
+        wal_log(
             "remember_code",
             {"drawer_id": drawer_id, "wing": wing, "room": room, "added_by": added_by,
              "code_length": len(code), "description_preview": description[:200]},
             wal_file=get_wal_path(settings.wal_dir),
         )
+
+        intent_id = _log_intent(session_id, "remember_code", "drawer", drawer_id, {"wing": wing, "room": room})
+
         try:
             existing = col.get(ids=[drawer_id])
             if existing and existing["ids"]:
+                _rollback_intent(intent_id, session_id)
                 return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
             entities = []
             try:
@@ -285,15 +443,20 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     "symbol_name": symbol_name or "", "chunk_kind": "code_block",
                 }],
             )
+            _commit_intent(intent_id, session_id)
             invalidate_query_cache()
             _invalidate_status_cache()
-            return {
+            resp = {
                 "success": True, "drawer_id": drawer_id, "wing": wing, "room": room,
                 "code_truncated": was_truncated, "original_length": len(code),
                 "stored_length": len(code_stored), "language": language,
             }
+            if claim_warning:
+                resp["claim_warning"] = claim_warning
+            return resp
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            _rollback_intent(intent_id, session_id)
+            return {"success": False, "error": str(e), "error_code": "LANCE_WRITE_FAILED", "retryable": True}
 
     @server.tool(timeout=settings.timeout_embed)
     def mempalace_consolidate(
@@ -301,6 +464,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         topic: str,
         merge: bool = False,
         threshold: float = 0.85,
+        session_id: str | None = None,
+        claim_mode: str = "advisory",
     ) -> dict:
         col = _get_collection()
         if not col:
@@ -330,7 +495,24 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     })
                     seen.add(drawer_id)
             merged_count = 0
+            consolidate_intent_id = None
             if merge and len(duplicates) > 1:
+                # Enforce claim before any write (delete) in merge path.
+                if claim_mode not in ("advisory", "strict"):
+                    claim_mode = "advisory"
+                consolidate_target = f"{settings.palace_path}/_consolidate/{topic}"
+                claim_err = _claim_check(server, consolidate_target, session_id, claim_mode)
+                claim_warning = None
+                if claim_err:
+                    if "error" in claim_err:
+                        return claim_err
+                    claim_warning = claim_err.get("message")
+
+                consolidate_intent_id = _log_intent(
+                    session_id, "consolidate", "consolidate", consolidate_target,
+                    {"topic": topic, "duplicates_count": len(duplicates)}
+                )
+
                 duplicates_with_ts = []
                 for dup in duplicates:
                     try:
@@ -342,9 +524,10 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                 duplicates_with_ts.sort(key=lambda x: x["_timestamp"], reverse=True)
                 keeper = duplicates_with_ts[0]
                 to_remove = duplicates_with_ts[1:]
+                consolidate_failed = False
                 for dup in to_remove:
                     try:
-                        wal_log_async(
+                        wal_log(
                             "consolidate_delete",
                             {"deleted_id": dup["id"], "topic": topic, "keeper_id": keeper["id"]},
                             wal_file=get_wal_path(settings.wal_dir),
@@ -352,9 +535,18 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                         col.delete(ids=[dup["id"]])
                         merged_count += 1
                     except Exception:
-                        pass
+                        consolidate_failed = True
+                        break
+                if consolidate_failed:
+                    _rollback_intent(consolidate_intent_id, session_id)
+                else:
+                    _commit_intent(consolidate_intent_id, session_id)
                 invalidate_query_cache()
                 _invalidate_status_cache()
-            return {"topic": topic, "duplicates": duplicates, "merged": merged_count if merge else None, "total_found": len(duplicates)}
+            resp = {"topic": topic, "duplicates": duplicates, "merged": merged_count if merge else None, "total_found": len(duplicates)}
+            if claim_warning:
+                resp["claim_warning"] = claim_warning
+            return resp
         except Exception as e:
-            return {"error": str(e)}
+            _rollback_intent(consolidate_intent_id, session_id)
+            return {"error": str(e), "error_code": "LANCE_WRITE_FAILED", "retryable": True}

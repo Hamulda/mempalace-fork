@@ -21,6 +21,7 @@ allowed-tools: Read
 
 ## After Each Session
 - Call `mempalace_diary_write` to record key decisions, discoveries, and context
+- For important architectural decisions: also call `mempalace_capture_decision`
 - For important factual changes: also update KG via `mempalace_kg_supersede`
 
 ## Search Strategy (in order of preference)

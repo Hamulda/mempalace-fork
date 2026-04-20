@@ -5,12 +5,13 @@ trigger: when waking up in a project with active sessions
 
 # Repo Wake-Up
 
-When you wake up in a project with active MemPalace sessions, follow this checklist:
+When you wake up in a project with active MemPalace sessions, follow this checklist.
 
 ## Step 1: Get Full Wakeup Context
 
-```
-mempalace_wakeup_context(session_id="your-session-id", project_root="/path/to/project")
+```python
+# Full auto-detection — session_id and project_root from environment
+mempalace_wakeup_context()
 ```
 
 This returns:
@@ -23,10 +24,13 @@ This returns:
 - Relevant decisions (linked to your file context)
 - Next checks (validation steps based on context)
 
+**session_id and project_root are auto-detected** from Claude Code harness context
+and `PROJECT_ROOT` env var respectively. No arguments needed for the common case.
+
 ## Step 2: Check Recent Changes
 
 ```
-mempalace_recent_changes(project_root="/path/to/project", n=10)
+mempalace_recent_changes(n=10)
 ```
 
 This shows:
@@ -47,29 +51,33 @@ See which files are currently claimed by other sessions.
 ## Step 4: Pull Pending Handoffs
 
 ```
-mempalace_pull_handoffs(session_id="your-session-id")
+mempalace_pull_handoffs()
 ```
 
-See what other sessions left for you.
+See what other sessions left for you. **session_id is auto-detected.**
 
 ## Step 5: Symbol Context for Active Claims
 
 If you have active claims, understand what's in those files:
+
 ```
 mempalace_file_symbols(file_path="/path/to/file.py")
 ```
 
 Or find a specific symbol:
+
 ```
 mempalace_find_symbol(symbol_name="function_name")
 ```
 
 ## Step 6: Check for Conflicts
 
-Call `mempalace_conflict_check` on any files you plan to edit:
+```python
+# path is required, session_id is auto-detected
+mempalace_conflict_check(path="/path/to/file.py")
 ```
-mempalace_conflict_check(path="/path/to/file.py", session_id="your-session-id")
-```
+
+Call on any files you plan to edit.
 
 ## Hot Spots in Wakeup Context
 
