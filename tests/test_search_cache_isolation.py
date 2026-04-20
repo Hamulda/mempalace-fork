@@ -112,13 +112,13 @@ class TestQueryCacheInvalidation:
         cache.set("/palace/b", "default", ["query"], 5, {"data": "other"})
         assert cache.get("/palace/b", "default", ["query"], 5) == {"data": "other"}
 
-    def test_raw_key_interface_not_affected_by_invalidate_collection(self):
-        """get_value/set_value (search_memories cache) není ovlivněn invalidate_collection.
+    def test_raw_key_interface_invalidated_by_invalidate_collection(self):
+        """invalidate_collection(palace_path, collection) MAŽE i get_value/set_value entries
+        pro odpovídající palace+collection (prefix match na klíči).
 
-        To je správné chování — search_memories používá palace_path v klíči,
-        takže cross-palace izolace je zajištěna na úrovni klíče.
-        Pro hromadnou invalidaci search cache (všechny palace najednou)
-        se používá invalidate_query_cache() → clear().
+        cross-palace izolace: get_value/set_value klíče obsahují palace_path v sobě,
+        takže různé palace mají různé klíče. invalidate_collection() maže
+        entries matching "{palace_path}|{collection}|" prefix.
         """
         cache = QueryCache(ttl_seconds=60)
 
@@ -128,13 +128,15 @@ class TestQueryCacheInvalidation:
         cache.invalidate_collection("/palace/a", "default")
         time.sleep(0.001)
 
-        # get_value/set_value entries are NOT invalidated by invalidate_collection
-        # because they use raw string keys (no palace_path/collection in _last_write lookup)
-        assert cache.get_value(key) == {"data": "test"}
-
-        # But clear() does invalidate them (used by invalidate_query_cache in searcher)
-        cache.clear()
+        # invalidate_collection now evicts raw-key entries with matching prefix
         assert cache.get_value(key) is None
+
+        # Different palace+collection is NOT affected
+        cache.set_value("/palace/b|default|query|None|None|None|None|5|False|None|None",
+                        {"data": "other"})
+        cache.invalidate_collection("/palace/a", "default")
+        time.sleep(0.001)
+        assert cache.get_value("/palace/b|default|query|None|None|None|None|5|False|None|None") == {"data": "other"}
 
 
 class TestQueryCacheThreadSafety:

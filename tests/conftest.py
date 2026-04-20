@@ -12,6 +12,7 @@ throwaway location instead of the real user profile.
 import os
 import shutil
 import tempfile
+import threading
 import unittest.mock
 
 # ── Isolate HOME before any mempalace imports ──────────────────────────
@@ -115,14 +116,30 @@ def _isolate_home():
     shutil.rmtree(_session_tmp, ignore_errors=True)
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="function", autouse=True)
 def _cleanup_resources():
-    """Clean up singleton resources after test session."""
+    """
+    Clean up singleton resources after each test function.
+
+    Runs after every test to prevent cross-test contamination:
+    - MemoryGuard daemon thread stopped and singleton reset
+    - SymbolIndex instances closed and cleared
+    - QueryCache cleared
+    """
     yield
-    # Stop MemoryGuard daemon thread
+    # Stop MemoryGuard daemon thread and reset singleton
     try:
         from mempalace.memory_guard import MemoryGuard
         MemoryGuard.get().stop()
+    except Exception:
+        pass
+    # Reset class-level singleton state
+    try:
+        from mempalace.memory_guard import MemoryGuard
+        MemoryGuard._instance = None
+        MemoryGuard._started.clear()
+        # Fresh _stop event for next test's get()
+        MemoryGuard._stop = threading.Event()
     except Exception:
         pass
     # Close all SymbolIndex instances

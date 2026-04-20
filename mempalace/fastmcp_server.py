@@ -15,6 +15,17 @@ from .server._infrastructure import wal_executor, bg_executor, wal_log_async, wa
 from .server._infrastructure import wal_executor as _wal_executor
 from .server._infrastructure import bg_executor as _bg_executor
 
+# Backward-compat: module-level _status_cache for legacy code/tests that
+# access the old module-level cache directly. Production code should use
+# server._status_cache (per-server-instance StatusCache).
+_status_cache = {"data": None, "ts": 0.0}
+
+
+def _get_status_cache() -> dict:
+    """Return the legacy module-level status cache dict for backward compat."""
+    return _status_cache
+
+
 # Re-export public symbols for backward compatibility
 __all__ = [
     "create_server",
@@ -26,4 +37,5 @@ __all__ = [
     "wal_log_async",
     "wal_log",
     "get_wal_path",
+    "_status_cache",
 ]

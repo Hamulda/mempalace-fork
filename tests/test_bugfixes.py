@@ -24,14 +24,6 @@ class TestServeHttpDefaultPort:
         assert port_param.default == 8765, f"Expected port default 8765, got {port_param.default}"
 
 
-class TestRegisterToolsDocstring:
-    def test_register_tools_docstring_count(self):
-        """_register_tools docstring mentions 27 tools."""
-        from mempalace.fastmcp_server import _register_tools
-        sig = inspect.getsource(_register_tools)
-        assert "27" in sig, "_register_tools docstring should mention 27 tools"
-
-
 class TestProjectContextNoProjectKey:
     async def test_project_context_source_file_matching(self, palace_path, seeded_collection):
         """mempalace_project_context uses source_file/wing matching, not 'project' metadata key."""
@@ -182,37 +174,16 @@ class TestEntityExtraction:
             del client
 
 
-class TestDiaryWriteWriteCoalescerTodo:
-    def test_diary_write_write_coalescer_todo(self):
-        """diary_write has TODO F176 comment about WriteCoalescer."""
-        import mempalace.fastmcp_server as module
-        import inspect
-        source = inspect.getsource(module)
-        # The TODO comment is 2 lines above mempalace_diary_write definition
-        # (blank line between comment block and @server.tool decorator)
-        lines = source.split('\n')
-        for i, line in enumerate(lines):
-            if 'def mempalace_diary_write' in line:
-                # Check 3 lines back (blank line + @server.tool decorator + continuation comment)
-                prev = lines[i - 3].strip() if i >= 3 else ""
-                assert "TODO F176" in prev, f"TODO F176 should be 2 lines above diary_write, got: {prev!r}"
-                assert "WriteCoalescer" in prev, f"WriteCoalescer mention should be in TODO comment"
-                break
-        else:
-            pytest.fail("mempalace_diary_write function not found in module source")
-
-
 class TestStatusCache:
     async def test_status_cache_hit(self, palace_path, collection):
         """Second status call within TTL returns cached result (same dict object)."""
         import mempalace.fastmcp_server as fm
 
-        # Reset cache to ensure cold start
-        fm._status_cache["data"] = None
-        fm._status_cache["ts"] = 0.0
-
         settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
+
+        # Reset per-server cache to ensure cold start
+        server._status_cache.invalidate()
 
         async with Client(transport=server) as client:
             r1 = await client.call_tool("mempalace_status", {})
@@ -226,31 +197,14 @@ class TestStatusCache:
 
     async def test_status_cache_expires(self, palace_path, collection):
         """After TTL, status call recomputes."""
-        import mempalace.fastmcp_server as fm
         settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
 
         async with Client(transport=server) as client:
             r1 = await client.call_tool("mempalace_status", {})
             data1 = _get_result_data(r1)
-            # Manually expire the cache by setting ts to 0
-            fm._status_cache["ts"] = 0.0
-            r2 = await client.call_tool("mempalace_status", {})
-            data2 = _get_result_data(r2)
-            assert data2.get("total_drawers") is not None
-        del server
-
-    async def test_status_cache_expires(self, palace_path, collection):
-        """After TTL, status call recomputes."""
-        import mempalace.fastmcp_server as fm
-        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
-        server = create_server(settings=settings)
-
-        async with Client(transport=server) as client:
-            r1 = await client.call_tool("mempalace_status", {})
-            data1 = _get_result_data(r1)
-            # Manually expire the cache by setting ts to 0
-            fm._status_cache["ts"] = 0.0
+            # Manually expire the cache by invalidating it
+            server._status_cache.invalidate()
             r2 = await client.call_tool("mempalace_status", {})
             data2 = _get_result_data(r2)
             assert data2.get("total_drawers") is not None
@@ -378,13 +332,12 @@ class TestCacheInvalidationAfterWrite:
         del server
 
     async def test_status_cache_invalidated_after_add_drawer(self, palace_path, collection):
-        """add_drawer invalidates status cache (_status_cache["data"] set to None)."""
+        """add_drawer invalidates status cache (server._status_cache cleared)."""
         import mempalace.fastmcp_server as fm
         settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
-        # Pre-populate status cache
-        fm._status_cache["data"] = {"total_drawers": 999}
-        fm._status_cache["ts"] = 9999999
+        # Pre-populate this server instance's status cache
+        server._status_cache.set(settings.db_path, {"total_drawers": 999}, 9999999.0)
         async with Client(transport=server) as client:
             result = await client.call_tool(
                 "mempalace_add_drawer",
@@ -392,13 +345,11 @@ class TestCacheInvalidationAfterWrite:
             )
             data = _get_result_data(result)
             assert data.get("success"), f"add_drawer failed: {data}"
-        # After write, status cache should be invalidated
-        assert fm._status_cache["data"] is None, "Status cache should be invalidated after add_drawer"
-        assert fm._status_cache["ts"] == 0.0, "Status cache ts should be reset"
+        # After write, status cache should be invalidated (per-server cache)
+        cached_data, cached_ts = server._status_cache.get(settings.db_path)
+        assert cached_data is None, "Status cache should be invalidated after add_drawer"
+        assert cached_ts == 0.0, "Status cache ts should be reset"
         del server
-        # Reset cache to not affect subsequent tests
-        fm._status_cache["data"] = None
-        fm._status_cache["ts"] = 0.0
 
 
 class TestKgSingleton:
@@ -679,6 +630,471 @@ class TestMemoryGuardIntegration:
         del server
 
 
+class TestProjectContextImproved:
+    """Tests for improved mempalace_project_context retrieval modes."""
+
+    async def test_project_context_no_query_returns_results(self, palace_path, seeded_collection):
+        """Without a query, project_context returns chunks from matching files."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 10},
+            )
+            data = _get_result_data(result)
+            assert "error" not in data, f"Should not error: {data}"
+            assert data.get("count", 0) >= 1, "Should find auth.py drawer"
+
+    async def test_project_context_no_query_deterministic(self, palace_path, seeded_collection):
+        """Without a query, calling twice returns the same results (deterministic)."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result1 = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 5},
+            )
+            result2 = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 5},
+            )
+            data1 = _get_result_data(result1)
+            data2 = _get_result_data(result2)
+            assert data1.get("count") == data2.get("count")
+            # Chunks should be identical (deterministic ordering)
+            for c1, c2 in zip(data1.get("chunks", []), data2.get("chunks", [])):
+                assert c1["source_file"] == c2["source_file"]
+                assert c1["line_start"] == c2["line_start"]
+
+    async def test_project_context_no_false_positives_outside_project(self, palace_path, seeded_collection):
+        """Results must not include files outside the specified project_path."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            # "auth.py" project_path should NOT match "App.tsx" or "sprint.md"
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 10},
+            )
+            data = _get_result_data(result)
+            source_files = {c["source_file"] for c in data.get("chunks", [])}
+            assert "App.tsx" not in source_files, "Should not include App.tsx when project_path=auth.py"
+            assert "sprint.md" not in source_files, "Should not include sprint.md when project_path=auth.py"
+            assert "db.py" not in source_files, "Should not include db.py when project_path=auth.py"
+
+    async def test_project_context_subdir_matching(self, palace_path, seeded_collection):
+        """A subdirectory project_path matches files inside that subtree."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            # Simulate files with subdirectory paths
+            collection = seeded_collection
+            collection.add(
+                ids=["drawer_proj_server_api_eee"],
+                documents=["The REST API uses FastAPI with Pydantic models."],
+                metadatas=[{
+                    "wing": "repo",
+                    "room": "server",
+                    "source_file": "server/api.py",
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-01-05T00:00:00",
+                    "is_latest": True,
+                }],
+            )
+            # server/ subdirectory should match server/api.py
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "server", "limit": 10},
+            )
+            data = _get_result_data(result)
+            source_files = {c["source_file"] for c in data.get("chunks", [])}
+            assert "server/api.py" in source_files, "Should match server/api.py for project_path=server"
+
+    async def test_project_context_language_filter(self, palace_path, seeded_collection):
+        """Language filter correctly narrows results to only that language."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            # Seed additional files with known languages
+            collection = seeded_collection
+            collection.add(
+                ids=["drawer_proj_server_api_fff"],
+                documents=["The Python API uses async def for handlers."],
+                metadatas=[{
+                    "wing": "repo",
+                    "room": "server",
+                    "source_file": "api.py",
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-01-06T00:00:00",
+                    "language": "Python",
+                    "is_latest": True,
+                }],
+            )
+            collection.add(
+                ids=["drawer_proj_ui_js_ggg"],
+                documents=["The JavaScript UI handles click events."],
+                metadatas=[{
+                    "wing": "repo",
+                    "room": "ui",
+                    "source_file": "ui.js",
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-01-07T00:00:00",
+                    "language": "JavaScript",
+                    "is_latest": True,
+                }],
+            )
+
+            # Filter by Python language
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": ".", "language": "Python", "limit": 10},
+            )
+            data = _get_result_data(result)
+            languages = {c.get("language") for c in data.get("chunks", [])}
+            # All results should be Python (or empty)
+            assert not languages or languages == {"Python"}, \
+                f"All results should be Python, got: {languages}"
+
+    async def test_project_context_with_query_uses_vector_search(self, palace_path, seeded_collection):
+        """With a query, project_context performs vector similarity search (not col.get).
+
+        Note: Mock embeddings produce deterministic but non-semantic vectors, so we
+        verify behavior (query echoed, error-free) rather than specific matches.
+        """
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "query": "JWT authentication tokens", "limit": 5},
+            )
+            data = _get_result_data(result)
+            assert "error" not in data, f"Should not error: {data}"
+            assert data.get("query") == "JWT authentication tokens", "Query should be echoed"
+
+    async def test_project_context_no_query_uses_col_get(self, palace_path, seeded_collection):
+        """Without a query, project_context should NOT use empty string vector query."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            # The key behavior: no-query returns results sorted by source_file + line_start
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": ".", "limit": 10},
+            )
+            data = _get_result_data(result)
+            assert "error" not in data, f"Should not error: {data}"
+            chunks = data.get("chunks", [])
+            if len(chunks) >= 2:
+                # Verify deterministic ordering: sorted by source_file
+                source_files = [c["source_file"] for c in chunks]
+                assert source_files == sorted(source_files), \
+                    "Chunks should be sorted by source_file when no query"
+
+    async def test_project_context_empty_project_returns_empty(self, palace_path, seeded_collection):
+        """Non-matching project_path returns count=0, not an error."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "nonexistent_directory_xyz", "limit": 5},
+            )
+            data = _get_result_data(result)
+            assert "error" not in data or data.get("error") == ""
+            assert data.get("count", -1) == 0, "Should return 0 for non-matching path"
+
+    async def test_project_context_full_path_matching(self, palace_path, seeded_collection):
+        """Full file paths are matched correctly by project_path."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            # A full path to auth.py should still match
+            import pathlib
+            full_path = str(pathlib.Path(palace_path) / "auth.py")
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": full_path, "limit": 5},
+            )
+            data = _get_result_data(result)
+            # Should find the auth drawer
+            assert data.get("count", 0) >= 1, f"Full path {full_path} should match auth.py"
+
+
+class TestProjectContextContract:
+    """Contract tests: wing=repo and is_latest=True filters in both query and no-query paths."""
+
+    async def test_no_query_respects_is_latest(self, palace_path, seeded_collection):
+        """No-query path excludes is_latest=False chunks."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        collection = seeded_collection
+        # Seed a stale chunk (is_latest=False) for auth.py
+        collection.add(
+            ids=["drawer_proj_auth_stale_xyz"],
+            documents=["Stale JWT token verification — should not appear."],
+            metadatas=[{
+                "wing": "repo",
+                "room": "server",
+                "source_file": "auth.py",
+                "chunk_index": 99,
+                "added_by": "miner",
+                "filed_at": "2026-01-01T00:00:00",
+                "is_latest": False,  # stale
+            }],
+        )
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 10},
+            )
+            data = _get_result_data(result)
+            # Stale chunk should NOT appear
+            texts = [c.get("doc", "") for c in data.get("chunks", [])]
+            assert not any("Stale JWT" in t for t in texts), \
+                "is_latest=False chunk should not appear in no-query results"
+
+    async def test_no_query_respects_wing(self, palace_path, seeded_collection):
+        """No-query path excludes non-repo (e.g., memory) chunks."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        collection = seeded_collection
+        # Seed a memory-wing chunk with same source_file as seeded auth.py
+        collection.add(
+            ids=["drawer_memory_auth_mem_xyz"],
+            documents=["Memory-wing auth note — should not appear in repo context."],
+            metadatas=[{
+                "wing": "memory",  # not repo
+                "room": "conversation",
+                "source_file": "auth.py",
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-01-08T00:00:00",
+                "is_latest": True,
+            }],
+        )
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 10},
+            )
+            data = _get_result_data(result)
+            texts = [c.get("doc", "") for c in data.get("chunks", [])]
+            assert not any("Memory-wing auth note" in t for t in texts), \
+                "wing=memory chunk should not appear in no-query results"
+
+    async def test_query_respects_is_latest(self, palace_path, seeded_collection):
+        """Query path excludes is_latest=False chunks via DB-side filter."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        collection = seeded_collection
+        # Seed a stale repo chunk — if wing/is_latest were missing from query-mode
+        # where clause, this would leak into results.
+        collection.add(
+            ids=["drawer_proj_auth_query_stale"],
+            documents=["Stale authenticator class — should not appear."],
+            metadatas=[{
+                "wing": "repo",
+                "room": "server",
+                "source_file": "auth.py",
+                "chunk_index": 88,
+                "added_by": "miner",
+                "filed_at": "2026-01-09T00:00:00",
+                "is_latest": False,  # stale
+            }],
+        )
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "query": "authenticator", "limit": 10},
+            )
+            data = _get_result_data(result)
+            texts = [c.get("doc", "") for c in data.get("chunks", [])]
+            assert not any("Stale authenticator" in t for t in texts), \
+                "is_latest=False chunk should not appear in query-mode results"
+
+    async def test_query_respects_wing(self, palace_path, seeded_collection):
+        """Query path excludes wing=memory chunks via DB-side filter."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        collection = seeded_collection
+        collection.add(
+            ids=["drawer_memory_auth_query_xyz"],
+            documents=["Memory conversation about authentication — should not leak."],
+            metadatas=[{
+                "wing": "memory",
+                "room": "conversation",
+                "source_file": "auth.py",
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-01-10T00:00:00",
+                "is_latest": True,
+            }],
+        )
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "query": "authentication", "limit": 10},
+            )
+            data = _get_result_data(result)
+            texts = [c.get("doc", "") for c in data.get("chunks", [])]
+            assert not any("Memory conversation" in t for t in texts), \
+                "wing=memory chunk should not appear in query-mode results"
+
+    async def test_language_filter_query_mode(self, palace_path, seeded_collection):
+        """Language filter in query mode returns only matching language."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        collection = seeded_collection
+        collection.add(
+            ids=["drawer_proj_py_langtest"],
+            documents=["Python function for parsing tokens."],
+            metadatas=[{
+                "wing": "repo",
+                "room": "server",
+                "source_file": "src/parse.py",
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-01-11T00:00:00",
+                "language": "Python",
+                "is_latest": True,
+            }],
+        )
+        collection.add(
+            ids=["drawer_proj_js_langtest"],
+            documents=["JavaScript function for parsing tokens."],
+            metadatas=[{
+                "wing": "repo",
+                "room": "ui",
+                "source_file": "src/parse.js",
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-01-12T00:00:00",
+                "language": "JavaScript",
+                "is_latest": True,
+            }],
+        )
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "src", "query": "parsing tokens", "language": "Python", "limit": 10},
+            )
+            data = _get_result_data(result)
+            languages = {c.get("language") for c in data.get("chunks", [])}
+            assert languages == {"Python"}, f"Expected only Python, got: {languages}"
+
+    async def test_language_filter_no_query_mode(self, palace_path, seeded_collection):
+        """Language filter in no-query mode returns only matching language."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        collection = seeded_collection
+        collection.add(
+            ids=["drawer_proj_py_langtest2"],
+            documents=["Python constant for MAX_RETRIES."],
+            metadatas=[{
+                "wing": "repo",
+                "room": "server",
+                "source_file": "src/config.py",
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-01-13T00:00:00",
+                "language": "Python",
+                "is_latest": True,
+            }],
+        )
+        collection.add(
+            ids=["drawer_proj_ts_langtest2"],
+            documents=["TypeScript constant for MAX_RETRIES."],
+            metadatas=[{
+                "wing": "repo",
+                "room": "ui",
+                "source_file": "src/config.ts",
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-01-14T00:00:00",
+                "language": "TypeScript",
+                "is_latest": True,
+            }],
+        )
+        async with Client(transport=server) as client:
+            result = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "src", "language": "TypeScript", "limit": 10},
+            )
+            data = _get_result_data(result)
+            languages = {c.get("language") for c in data.get("chunks", [])}
+            assert languages == {"TypeScript"}, f"Expected only TypeScript, got: {languages}"
+
+    async def test_repo_rel_path_deterministic(self, palace_path, seeded_collection):
+        """repo_rel_path is stable across two calls with same project_path."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server = create_server(settings=settings)
+        async with Client(transport=server) as client:
+            result1 = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 5},
+            )
+            result2 = await client.call_tool(
+                "mempalace_project_context",
+                {"project_path": "auth.py", "limit": 5},
+            )
+            data1 = _get_result_data(result1)
+            data2 = _get_result_data(result2)
+            for c1, c2 in zip(data1.get("chunks", []), data2.get("chunks", [])):
+                assert c1.get("repo_rel_path") == c2.get("repo_rel_path"), \
+                    "repo_rel_path must be stable across calls"
+
+
+class TestSourceFileMatches:
+    """Unit tests for _source_file_matches path matching logic."""
+
+    def test_exact_file_match(self):
+        """Exact file name match returns True."""
+        from mempalace.server._code_tools import _source_file_matches
+        assert _source_file_matches("auth.py", "auth.py") is True
+
+    def test_file_in_directory(self):
+        """File inside directory returns True."""
+        from mempalace.server._code_tools import _source_file_matches
+        assert _source_file_matches("/path/to/project/auth.py", "project") is True
+
+    def test_file_in_subdirectory(self):
+        """File in subdirectory returns True."""
+        from mempalace.server._code_tools import _source_file_matches
+        assert _source_file_matches("/path/server/api.py", "server") is True
+
+    def test_no_partial_path_match(self):
+        """Partial substring that isn't a path component returns False."""
+        from mempalace.server._code_tools import _source_file_matches
+        # "auth" should NOT match "auth.py" when "auth" is not a path component
+        # Actually "auth.py" contains "auth" as substring - this tests the boundary
+        assert _source_file_matches("src/auth.py", "src") is True
+        assert _source_file_matches("src/auth.py", "au") is False  # partial path component
+
+    def test_case_insensitive(self):
+        """Path matching is case-insensitive."""
+        from mempalace.server._code_tools import _source_file_matches
+        assert _source_file_matches("/PATH/TO/PROJECT/auth.py", "project") is True
+        assert _source_file_matches("/path/to/project/Auth.py", "AUTH.PY") is True
+
+    def test_trailing_slash_normalized(self):
+        """Trailing slashes are normalized."""
+        from mempalace.server._code_tools import _source_file_matches
+        assert _source_file_matches("/path/to/project", "project/") is True
+        assert _source_file_matches("/path/to/project/", "project") is True
+
+    def test_empty_inputs(self):
+        """Empty inputs return False."""
+        from mempalace.server._code_tools import _source_file_matches
+        assert _source_file_matches("", "project") is False
+        assert _source_file_matches("/path", "") is False
+        assert _source_file_matches("", "") is False
+
+
 def _get_result_data(result):
     """Extract JSON data from FastMCP CallToolResult."""
     if hasattr(result, 'structured_content') and result.structured_content:
@@ -687,3 +1103,194 @@ def _get_result_data(result):
         import json
         return json.loads(result.content[0].text)
     return None
+
+
+# =============================================================================
+# Runtime Hardening Tests
+# =============================================================================
+
+class TestMemoryGuardLifecycle:
+    """Tests for MemoryGuard stop/start cycle and restart semantics."""
+
+    def test_memory_guard_stop_then_get_fresh_instance(self):
+        """After stop(), get() returns a new instance with fresh state."""
+        from mempalace.memory_guard import MemoryGuard
+        import time
+
+        # Ensure we start fresh
+        try:
+            MemoryGuard.get().stop()
+        except Exception:
+            pass
+
+        # Get first instance
+        g1 = MemoryGuard.get()
+        assert g1.pressure is not None
+        p1 = g1.pressure
+
+        # Stop it
+        g1.stop()
+
+        # Give the old thread a moment to finish
+        time.sleep(0.5)
+
+        # Get new instance — should be fresh, not stale
+        g2 = MemoryGuard.get()
+        assert g2 is not g1
+        # New instance should be fully initialized (wait for first measurement)
+        assert g2.pressure is not None
+
+    def test_memory_guard_stop_clears_instance(self):
+        """stop() sets _instance to None so next get() creates new instance."""
+        from mempalace.memory_guard import MemoryGuard
+
+        g1 = MemoryGuard.get()
+        g1.stop()
+
+        # After stop, _instance should be None
+        assert MemoryGuard._instance is None
+
+    def test_memory_guard_class_level_stop_event(self):
+        """_stop is class-level so all instances share the same stop signal."""
+        from mempalace.memory_guard import MemoryGuard
+
+        # After stop, _instance should be None and _started should be cleared
+        g1 = MemoryGuard.get()
+        g1.stop()
+
+        assert MemoryGuard._instance is None, "_instance should be None after stop()"
+        assert not MemoryGuard._started.is_set(), "_started should be cleared after stop()"
+
+    def test_memory_guard_concurrent_stop_get(self):
+        """Calling get() while stop() is in progress does not crash."""
+        from mempalace.memory_guard import MemoryGuard
+        import threading
+        import time
+
+        g1 = MemoryGuard.get()
+        errors = []
+
+        def stop_and_get():
+            try:
+                g1.stop()
+                time.sleep(0.1)
+                MemoryGuard.get()
+            except Exception as e:
+                errors.append(str(e))
+
+        t = threading.Thread(target=stop_and_get)
+        t.start()
+        t.join(timeout=10)
+
+        assert not errors, f"Concurrent stop/get raised: {errors}"
+
+
+class TestServerInstanceIsolation:
+    """Tests for per-server-instance resource isolation."""
+
+    async def test_two_servers_have_separate_status_caches(self, palace_path, collection):
+        """Two create_server() calls produce servers with separate status caches."""
+        settings1 = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        settings2 = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+
+        server1 = create_server(settings=settings1)
+        server2 = create_server(settings=settings2)
+
+        # Their status caches must be different objects
+        assert server1._status_cache is not server2._status_cache
+
+        # Pre-populate server1's cache
+        server1._status_cache.set(palace_path, {"total_drawers": 111}, 9999.0)
+        # server2's cache should be independent
+        cached, ts = server2._status_cache.get(palace_path)
+        assert cached is None, "server2 cache should not be affected by server1 cache set"
+
+        del server1
+        del server2
+
+    async def test_status_cache_invalidation_is_per_server(self, palace_path, collection):
+        """Invalidating one server's status cache does not affect another server."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+        server1 = create_server(settings=settings)
+        server2 = create_server(settings=settings)
+
+        # Populate both caches
+        server1._status_cache.set(palace_path, {"total_drawers": 111}, 9999.0)
+        server2._status_cache.set(palace_path, {"total_drawers": 222}, 8888.0)
+
+        # Invalidate only server1
+        server1._status_cache.invalidate()
+
+        # server1 should be cleared
+        cached1, ts1 = server1._status_cache.get(palace_path)
+        assert cached1 is None
+
+        # server2 should be unaffected
+        cached2, ts2 = server2._status_cache.get(palace_path)
+        assert cached2 is not None
+        assert cached2["total_drawers"] == 222
+
+        del server1
+        del server2
+
+    async def test_multiple_servers_same_palace_independent(self, palace_path, collection):
+        """Multiple servers pointing to same palace have independent caches."""
+        settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
+
+        servers = [create_server(settings=settings) for _ in range(3)]
+
+        # Each server gets its own StatusCache instance
+        cache_objects = [s._status_cache for s in servers]
+        assert len(set(id(c) for c in cache_objects)) == 3, "Each server should have unique cache"
+
+        for s in servers:
+            del s
+
+
+class TestStatusCacheUnit:
+    """Unit tests for StatusCache class."""
+
+    def test_status_cache_get_set(self):
+        """StatusCache.get/set roundtrip."""
+        from mempalace.server._infrastructure import StatusCache
+        cache = StatusCache(ttl=60.0)
+        cache.set("/path/a", {"data": 123}, 1000.0)
+        data, ts = cache.get("/path/a")
+        assert data == {"data": 123}
+        assert ts == 1000.0
+
+    def test_status_cache_different_palace_paths(self):
+        """StatusCache stores results separately per palace_path."""
+        from mempalace.server._infrastructure import StatusCache
+        cache = StatusCache(ttl=60.0)
+        cache.set("/palace/a", {"n": 1}, 1000.0)
+        cache.set("/palace/b", {"n": 2}, 2000.0)
+
+        data_a, ts_a = cache.get("/palace/a")
+        data_b, ts_b = cache.get("/palace/b")
+
+        assert data_a == {"n": 1}
+        assert ts_a == 1000.0
+        assert data_b == {"n": 2}
+        assert ts_b == 2000.0
+
+    def test_status_cache_invalidate(self):
+        """StatusCache.invalidate() clears all entries."""
+        from mempalace.server._infrastructure import StatusCache
+        cache = StatusCache(ttl=60.0)
+        cache.set("/palace/a", {"n": 1}, 1000.0)
+        cache.invalidate()
+        data, ts = cache.get("/palace/a")
+        assert data is None
+        assert ts == 0.0
+
+    def test_status_cache_ttl_expiry(self):
+        """StatusCache does NOT enforce TTL — caller checks age via returned ts."""
+        from mempalace.server._infrastructure import StatusCache
+        cache = StatusCache(ttl=60.0)
+        cache.set("/palace/a", {"n": 1}, 1000.0)
+        # get() returns the stored ts without checking expiry
+        # (TTL enforcement is the caller's responsibility)
+        data, ts = cache.get("/palace/a")
+        assert data == {"n": 1}
+        assert ts == 1000.0

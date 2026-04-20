@@ -142,19 +142,19 @@ def get_hot_spots(project_path: str, n: int = 10) -> list[dict]:
     for line in output.split("\n"):
         stripped = line.strip()
         if not stripped:
+            # Blank line between commits — reset state but don't exit early
             in_commit_block = False
             continue
-        # Indented line = filename (git --name-only indents with tab/space)
-        if line.startswith(" ") or line.startswith("\t"):
-            if in_commit_block and stripped:
-                if _is_code_file(stripped):
-                    counts[stripped] += 1
-        elif _GIT_HASH_RE.match(stripped):
-            # Non-indented non-blank = commit hash
+        if _GIT_HASH_RE.match(stripped):
+            # Non-indented 40-hex line = commit hash → new commit block starts
             in_commit_block = True
-        else:
-            # Non-indented non-hash non-blank: reset (e.g., commit message line if format changes)
-            in_commit_block = False
+        elif in_commit_block:
+            # Inside a commit block, non-hash line = filename
+            # (indentation no longer required — hash detection is primary trigger)
+            if _is_code_file(stripped):
+                counts[stripped] += 1
+        # Non-hash, non-blank, outside commit block: ignore silently
+        # This handles unexpected git output wrappers without corrupting state
 
     sorted_files = sorted(counts.items(), key=lambda x: x[1], reverse=True)
 

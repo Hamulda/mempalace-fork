@@ -3,18 +3,17 @@ LRU cache pro MemPalace query výsledky.
 TTL 5s zajišťuje čerstvost bez zbytečných redundantních searchů.
 
 Canonical cache story:
-- search_memories používá get_value/set_value s klíčem
-  "{palace_path}|{collection_name}|{query}|{filters}..."
-  (palace_path je vždy součástí klíče → cross-palace izolace)
-- get/set (pro interní LanceBackend query caching) používá
-  palace_path + collection_name pro správnou cross-palace invalidaci
-- invalidate_collection(palace_path, collection_name) zapisuje timestamp
-  do _last_write[(palace_path, collection_name)] — tento timestamp
-  pak zneplatní get/set cache entries i get_value/set_value entries
-  (protože search_memories volá invalidate_query_cache → clear())
-- write invalidace: LanceDB add/upsert/delete volá
-  get_query_cache().invalidate_collection(palace_path, collection_name)
-  → fastmcp_server volá invalidate_query_cache() = clear() pro search cache
+- DVA oddělené přístupy ke stejnému _cache slovníku:
+  1. get()/set() — strukturovaný klíč (palace_path, collection, query_texts, n_results),
+     chráněno _last_write timestampem (invalidate_collection nastaví timestamp,
+     get() zkontroluje při každém čtení)
+  2. get_value()/set_value() — raw string klíč s embedded palace_path|collection|
+     v klíči; cross-palace izolace je přes klíč sám; invalidace přes invalidate_collection()
+     (která maže položky s odpovídajícím prefixem) NEBO přes clear() (maže vše)
+- invalidate_query_cache() (searcher.py) → cache.clear() po write operacích
+  (všechny palace najednou, infrequent operace)
+- invalidate_collection(palace_path, collection) → maže přímo entries z _cache
+  pro obě rozhraní najednou
 """
 import time
 import threading
@@ -125,31 +124,74 @@ class QueryCache:
 
     def invalidate_collection(self, palace_path: str, collection: str) -> None:
         """
-        Zaznamenej write event pro (palace_path, collection) pár.
-        Nezahazuj cache hned – TTL to vyřeší lazily.
-        Cross-palace izolace: jen tento konkrétní palace+collection je označen.
-        Pro hromadnou invalidaci (všechny palace) použij clear().
+        Invalidate ALL cache entries for (palace_path, collection).
+        Removes entries from both interfaces:
+        - get()/set(): tuple-keyed entries matching this palace+collection
+        - get_value()/set_value(): raw-string-keyed entries whose key starts with
+          "{palace_path}|{collection}|" (the format used by search_memories)
+        For full cross-palace flush (all palace+collection), use clear().
         """
         with self._lock:
             self._last_write[(palace_path, collection)] = time.monotonic()
+            # Evict structured-key entries (get/set interface)
+            # Tuple key format: (palace_path, collection, query_texts, n_results)
+            to_remove = [k for k in self._cache
+                         if isinstance(k, tuple)
+                         and len(k) >= 2
+                         and k[0] == palace_path
+                         and k[1] == collection]
+            for k in to_remove:
+                del self._cache[k]
+            # Evict raw-string-key entries (get_value/set_value interface)
+            # String key format used by search_memories:
+            # f"{palace_path}|{collection_name}|{query}|{wing}|{room}|..."
+            prefix = f"{palace_path}|{collection}|"
+            to_remove_str = [k for k in self._cache
+                             if isinstance(k, str) and k.startswith(prefix)]
+            for k in to_remove_str:
+                del self._cache[k]
 
-    def get_value(self, key: str) -> Optional[Any]:
-        """Return cached value by key string, or None if missing/expired. Used by search_memories."""
+    def get_value(self, key: str, palace_path: str = "", collection: str = "") -> Optional[Any]:
+        """
+        Return cached value by raw string key, or None if missing/expired.
+
+        palace_path + collection are used only for _last_write staleness check
+        (invalidate_collection sets _last_write; entries cached before that
+        timestamp are evicted). TTL always applies. For raw-key entries,
+        cross-palace isolation is provided by palace_path being embedded
+        in the key string itself.
+        """
         with self._lock:
             try:
                 value, ts = self._cache[key]
                 if time.monotonic() - ts < self._ttl:
+                    # _last_write staleness check for this palace+collection
+                    if palace_path and collection:
+                        last_write = self._last_write.get((palace_path, collection), 0.0)
+                        if last_write > ts:
+                            del self._cache[key]
+                            self._misses += 1
+                            return None
                     return value
                 del self._cache[key]
             except (KeyError, TypeError, AttributeError):
                 pass
             return None
 
-    def set_value(self, key: str, value: Any) -> None:
-        """Store value by key string with TTL. Used by search_memories."""
+    def set_value(self, key: str, value: Any, palace_path: str = "", collection: str = "") -> None:
+        """
+        Store value by raw string key with TTL. Used by search_memories.
+
+        palace_path + collection are stored alongside the entry so get_value()
+        can check _last_write for staleness (via invalidate_collection).
+        NOTE: set_value does NOT update _last_write — only invalidate_collection()
+        does. Staleness for raw-key entries is handled by invalidate_collection()
+        scanning for matching prefix keys, not by _last_write timestamp comparison.
+        """
         with self._lock:
             try:
-                self._cache[key] = (value, time.monotonic())
+                now = time.monotonic()
+                self._cache[key] = (value, now)
                 self._cache.move_to_end(key)
                 while len(self._cache) > self._maxsize:
                     self._cache.popitem(last=False)

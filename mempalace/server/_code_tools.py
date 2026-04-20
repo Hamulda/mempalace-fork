@@ -6,12 +6,78 @@ from pathlib import Path
 from fastmcp import Context
 
 
+# =============================================================================
+# PATH MATCHING UTILITIES (module-level for testability)
+# =============================================================================
+
+
+def _source_file_matches(source_file: str, project_path: str) -> bool:
+    """Check if source_file is inside or matches the project path.
+
+    Matches:
+    - source_file is the project_path itself (single file project)
+    - source_file starts with project_path + "/" (subdirectory/file in project)
+    - project_path ends with source_file basename (full path to file matches relative)
+    - project_path is a path component of source_file (partial dir names)
+
+    Case-insensitive path comparison.
+    """
+    if not source_file or not project_path:
+        return False
+    sf_lower = source_file.lower()
+    pp_lower = project_path.lower()
+    pp_norm = pp_lower.rstrip("/")
+    sf_norm = sf_lower.rstrip("/")
+
+    if sf_norm == pp_norm:
+        return True
+
+    if sf_norm.startswith(pp_norm + "/"):
+        return True
+
+    sf_basename = sf_norm.split("/")[-1] if "/" in sf_norm else sf_norm
+    if pp_norm.endswith("/" + sf_basename) or pp_norm == sf_basename:
+        return True
+
+    parts = sf_norm.split("/")
+    pp_parts = pp_norm.split("/")
+    if len(pp_parts) <= len(parts):
+        for i in range(len(parts) - len(pp_parts) + 1):
+            if "/".join(parts[i:i + len(pp_parts)]) == pp_norm:
+                return True
+    return False
+
+
+def _filter_by_project_path(docs: list, metas: list, project_path: str) -> list:
+    """Filter documents to those within project_path, preserving order."""
+    result = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else {}
+        sf = meta.get("source_file", "")
+        if sf and _source_file_matches(sf, project_path):
+            result.append({
+                "source_file": sf,
+                "language": meta.get("language", ""),
+                "line_start": meta.get("line_start", 0),
+                "line_end": meta.get("line_end", 0),
+                "symbol_name": meta.get("symbol_name", ""),
+                "chunk_kind": meta.get("chunk_kind", ""),
+                "doc": doc,
+            })
+    return result
+
+
+# =============================================================================
+# TOOL REGISTRATION
+# =============================================================================
+
+
 def register_code_tools(server, backend, config, settings):
     """
     Register all code-intel @mcp.tool() as closures.
     Called by factory._register_tools().
     """
-    from ..searcher import code_search_async, auto_search, is_code_query, hybrid_search_async
+    from ..searcher import code_search_async, auto_search, is_code_query, hybrid_search_async, _compute_repo_rel_path
 
     def _get_collection(create=False):
         try:
@@ -83,27 +149,65 @@ def register_code_tools(server, backend, config, settings):
         language: str | None = None,
         limit: int = 20,
     ) -> dict:
+        """
+        Retrieve project-scoped code context.
+
+        Two distinct retrieval modes:
+
+        WITH QUERY: Uses vector similarity search to find semantically relevant
+        code chunks within the project. Best for "how does X work" style questions.
+
+        WITHOUT QUERY: Uses deterministic metadata retrieval (col.get) ordered by
+        source_file and line_start. Best for "what files exist in this project"
+        or "show me the current code structure" style requests.
+
+        Args:
+            project_path: File path or directory to scope retrieval to.
+                          Can be a file ("auth.py"), directory ("src/"), or
+                          full path ("/Users/me/project/src").
+            query: Optional semantic search query. If None, uses deterministic
+                   metadata retrieval instead of vector search.
+            language: Optional language filter (e.g., "Python", "JavaScript").
+            limit: Maximum number of chunks to return (default 20).
+
+        Returns:
+            dict with project_path, query, language, chunks list, and count.
+            Each chunk contains: source_file, language, line_start, line_end,
+            symbol_name, chunk_kind, doc (content).
+        """
         col = _get_collection()
         if not col:
             return _no_palace()
-        matched = []
+
         try:
-            n_fetch = min(limit * 4, 200)
             if query:
-                where = {}
-                if language:
-                    where["language"] = language
+                # Mode 1: Vector similarity search with project filtering.
+                # ChromaDB 0.6.x col.query() only supports a SINGLE equality filter in
+                # the where clause. We skip DB-level filtering entirely and apply all
+                # filters (wing, is_latest, language, project_path) in Python to support
+                # both wing="repo" (canonical) and wing="project" (legacy seeded data).
+                n_fetch = min(limit * 3, 150)
                 q_result = col.query(
-                    query_texts=[query], n_results=n_fetch,
-                    where=where if where else None,
+                    query_texts=[query],
+                    n_results=n_fetch,
                     include=["documents", "metadatas"],
                 )
                 docs = q_result.get("documents", [[]])[0] or []
                 metas = q_result.get("metadatas", [[]])[0] or []
+
+                # Python-side post-filters: wing, is_latest, language, project_path
+                matched = []
                 for i, doc in enumerate(docs):
                     meta = metas[i] if i < len(metas) else {}
+                    if meta.get("is_latest") is False:
+                        continue
+                    wing = meta.get("wing", "")
+                    if wing not in ("repo", "project"):
+                        continue
+                    if language and meta.get("language") != language:
+                        continue
                     sf = meta.get("source_file", "")
-                    if sf and project_path in sf:
+                    if sf and _source_file_matches(sf, project_path):
                         matched.append({
                             "source_file": sf,
                             "language": meta.get("language", ""),
@@ -113,36 +217,75 @@ def register_code_tools(server, backend, config, settings):
                             "chunk_kind": meta.get("chunk_kind", ""),
                             "doc": doc,
                         })
-                        if len(matched) >= limit:
-                            break
+                matched = matched[:limit]
+
             else:
-                where = {}
-                if language:
-                    where["language"] = language
-                q_result = col.query(
-                    query_texts=[""], n_results=n_fetch,
-                    where=where if where else None,
-                    include=["documents", "metadatas"],
-                )
-                docs = q_result.get("documents", [[]])[0] or []
-                metas = q_result.get("metadatas", [[]])[0] or []
-                for i, doc in enumerate(docs):
-                    meta = metas[i] if i < len(metas) else {}
-                    sf = meta.get("source_file", "")
-                    if sf and project_path in sf:
-                        matched.append({
-                            "source_file": sf,
-                            "language": meta.get("language", ""),
-                            "line_start": meta.get("line_start", 0),
-                            "line_end": meta.get("line_end", 0),
-                            "symbol_name": meta.get("symbol_name", ""),
-                            "chunk_kind": meta.get("chunk_kind", ""),
-                            "doc": doc,
-                        })
-                        if len(matched) >= limit:
-                            break
-            return {"project_path": project_path, "language": language, "query": query,
-                    "chunks": matched, "count": len(matched)}
+                # Mode 2: Deterministic metadata retrieval (no vector search).
+                # ChromaDB 0.6.x only supports single-equality where clause, so we
+                # fetch without DB-level filtering and apply all filters in Python:
+                # wing=repo, is_latest=True, language, project_path.
+                matched = []
+                offset = 0
+                _BATCH = 100
+
+                while len(matched) < limit:
+                    batch_result = col.get(
+                        limit=_BATCH,
+                        offset=offset,
+                        include=["documents", "metadatas"],
+                    )
+                    batch_docs = batch_result.get("documents", [])
+                    batch_metas = batch_result.get("metadatas", [])
+
+                    if not batch_docs:
+                        break
+
+                    for i, doc in enumerate(batch_docs):
+                        meta = batch_metas[i] if i < len(batch_metas) else {}
+                        # Accept both wing="repo" (canonical) and wing="project" (legacy)
+                        wing = meta.get("wing", "")
+                        if wing not in ("repo", "project"):
+                            continue
+                        # Canonical filter: is_latest=True (excludes tombstoned chunks)
+                        if meta.get("is_latest") is False:
+                            continue
+                        # Language filter
+                        if language and meta.get("language") != language:
+                            continue
+                        # project_path filter
+                        sf = meta.get("source_file", "")
+                        if sf and _source_file_matches(sf, project_path):
+                            matched.append({
+                                "source_file": sf,
+                                "language": meta.get("language", ""),
+                                "line_start": meta.get("line_start", 0),
+                                "line_end": meta.get("line_end", 0),
+                                "symbol_name": meta.get("symbol_name", ""),
+                                "chunk_kind": meta.get("chunk_kind", ""),
+                                "doc": doc,
+                            })
+
+                    if len(batch_docs) < _BATCH:
+                        break
+                    offset += len(batch_docs)
+
+                # Take limit and sort deterministically by source_file, then line_start
+                matched = matched[:limit]
+                matched.sort(key=lambda x: (x["source_file"], x["line_start"]))
+
+            # Add repo_rel_path to each chunk using project_path as common prefix
+            for chunk in matched:
+                sf = chunk.get("source_file", "")
+                if sf:
+                    chunk["repo_rel_path"] = _compute_repo_rel_path(sf, project_path)
+
+            return {
+                "project_path": project_path,
+                "language": language,
+                "query": query,
+                "chunks": matched,
+                "count": len(matched),
+            }
         except Exception as e:
             return {"error": str(e), "project_path": project_path}
 

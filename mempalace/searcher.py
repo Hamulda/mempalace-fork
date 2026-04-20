@@ -9,6 +9,7 @@ Returns verbatim text — the actual words, never summaries.
 import functools
 import hashlib
 import logging
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -22,6 +23,76 @@ _search_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp_sear
 
 _reranker = None
 _reranker_lock = threading.Lock()
+
+
+def _path_contains(haystack: str, needle: str) -> bool:
+    """Check if needle is a path component of haystack (path-aware, case-insensitive).
+
+    Matches when:
+    - haystack ends with needle (needle is the filename or final dir)
+    - haystack contains /needle/ as a path segment (needle is a dir)
+    - haystack contains /needle/ at any position (needle is a path component)
+
+    Does NOT match partial path segments (e.g., 'til' does not match '/src/utils.py').
+    """
+    if not haystack or not needle:
+        return False
+    hl = haystack.lower()
+    nl = needle.lower()
+    # Normalize needle: strip leading/trailing slashes for comparison
+    nl_norm = nl.strip("/")
+    # Exact suffix match (needle is filename or final path component)
+    if hl.endswith(nl) or hl.endswith(nl_norm):
+        return True
+    # /needle/ as path component (needle is a directory name)
+    return ("/" + nl_norm + "/") in hl
+
+
+def _compute_repo_rel_path(source_file: str, common_prefix: str) -> str:
+    """Compute repo-relative path from source_file given a common prefix.
+
+    Returns the portion of source_file that is relative to common_prefix.
+    If source_file doesn't start with common_prefix, returns source_file unchanged.
+    """
+    if not source_file or not common_prefix:
+        return source_file
+    # Ensure common_prefix ends with /
+    prefix = common_prefix if common_prefix.endswith("/") else common_prefix + "/"
+    if source_file.startswith(prefix):
+        return source_file[len(prefix):]
+    return source_file
+
+
+def _add_repo_rel_path(hits: list[dict], source_files: list[str]) -> list[dict]:
+    """Add repo_rel_path to hits if a common project prefix can be determined.
+
+    Computes the longest common directory prefix among source_files.
+    If that prefix is not "~" or "/" (i.e., it's a real project root), adds repo_rel_path.
+    """
+    if not hits or not source_files:
+        return hits
+
+    # Find common prefix
+    if len(source_files) == 1:
+        paths_to_check = [source_files[0]]
+    else:
+        paths_to_check = source_files[:20]  # limit for perf
+
+    # Find longest common directory prefix (handle mixed absolute/relative)
+    try:
+        common = os.path.commonpath(paths_to_check) if paths_to_check else ""
+    except ValueError:
+        # Mixed absolute/relative paths - can't compute common path
+        return hits
+
+    # commonpath returns "" for empty or single path starting with /
+    # Only use if it's a meaningful project root (not just "/" or "~")
+    if common and common not in ("/", "~") and not common.startswith("~"):
+        for hit in hits:
+            sf = hit.get("source_file", "")
+            if sf:
+                hit["repo_rel_path"] = _compute_repo_rel_path(sf, common)
+    return hits
 
 def _get_query_cache():
     """Return the canonical query cache singleton.
@@ -139,7 +210,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
     for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
         similarity = round(1 - dist, 3)
-        source = Path(meta.get("source_file", "?")).name
+        source = meta.get("source_file", "?")
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
 
@@ -189,7 +260,7 @@ def search_memories(
         cache = _get_query_cache()
         collection_name = cfg.collection_name
         cache_key = f"{palace_path}|{collection_name}|{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
-        cached_result = cache.get_value(cache_key)
+        cached_result = cache.get_value(cache_key, palace_path=palace_path, collection=collection_name)
         if cached_result is not None:
             return cached_result
     except Exception:
@@ -243,13 +314,14 @@ def search_memories(
 
     hits = []
     for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists)):
+        raw_source = meta.get("source_file", "?")
         hits.append(
             {
                 "id": ids[i],
                 "text": doc,
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
-                "source_file": Path(meta.get("source_file", "?")).name,
+                "source_file": raw_source,
                 "similarity": round(1 - dist, 3),
             }
         )
@@ -269,6 +341,10 @@ def search_memories(
             except Exception as e:
                 logger.warning("Reranking failed, cosine order preserved: %s", e)
 
+    # Add repo_rel_path if a common project prefix can be determined
+    source_files = [h.get("source_file", "") for h in hits]
+    hits = _add_repo_rel_path(hits, source_files)
+
     result_dict = {
         "query": query,
         "filters": {
@@ -284,7 +360,7 @@ def search_memories(
         try:
             cache = _get_query_cache()
             cache_key = f"{palace_path}|{cfg.collection_name}|{query}|{wing}|{room}|{is_latest}|{agent_id}|{n_results}|{rerank}|{priority_gte}|{priority_lte}"
-            cache.set_value(cache_key, result_dict)
+            cache.set_value(cache_key, result_dict, palace_path=palace_path, collection=cfg.collection_name)
         except Exception:
             pass
 
@@ -361,13 +437,29 @@ def _get_kg(palace_path: str):
 
 
 def invalidate_query_cache() -> None:
-    """Clear all cached search results — call after any write."""
+    """
+    Clear ALL query cache entries (full cross-palace flush).
+
+    Called after write operations: add_drawer, delete_drawer, diary_write,
+    remember_code, consolidate. These are infrequent enough that a full
+    clear is acceptable and avoids cross-palace stale data.
+
+    NOTE: This is a brute-force clear (removes every entry from the cache).
+    invalidate_collection(palace_path, collection) does targeted removal for
+    only those palace+collection entries (both get/set and get_value/set_value
+    interfaces) — use it when you need per-palace granularity and know the
+    palace_path+collection of the write.
+    """
     try:
         cache = _get_query_cache()
         cache.clear()
     except Exception:
         pass
     logger.debug("Query cache cleared")
+
+
+# Alias for callers that use the older name
+invalidate_all_caches = invalidate_query_cache
 
 
 def _rrf_merge(result_lists: list, k: int = 60) -> list:
@@ -628,14 +720,17 @@ def code_search(
         # Apply symbol_name filter
         if symbol_name:
             vector_hits = [h for h in vector_hits if symbol_name.lower() in h.get("text", "").lower()]
-        # Apply file_path filter
+        # Apply file_path filter — path-aware, case-insensitive
         if file_path:
-            vector_hits = [h for h in vector_hits if file_path.lower() in h.get("source_file", "").lower()]
+            vector_hits = [h for h in vector_hits if _path_contains(h.get("source_file", ""), file_path)]
     except Exception as e:
         logger.warning("Vector search in code_search failed: %s", e)
 
     # Merge vector + FTS5 with RRF
     merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
+    # Add repo_rel_path
+    source_files = [h.get("source_file", "") for h in merged]
+    merged = _add_repo_rel_path(merged, source_files)
 
     return {
         "query": query,

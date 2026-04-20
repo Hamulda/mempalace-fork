@@ -4,12 +4,20 @@ symbol_index.py — Cross-reference index for symbol/import/export lookup.
 
 Provides:
 - extract_symbols(): parse source file for defined symbols, imports, exports
-- SymbolIndex: SQLite index mapping symbol_name → file locations
-  - find_symbol(name): exact or partial match
-  - search_symbols(pattern): regex search over symbol names
+- SymbolIndex: SQLite index mapping (symbol_name, file_path, line_start) → metadata
+  - find_symbol(name): exact match, returns all (file, line) pairs
+  - search_symbols(pattern): SQL LIKE pattern search over symbol names
   - get_file_symbols(file_path): all symbols defined in a file
-  - build_index(project_path): full index build from mined files
-  - update_index(file_path): incremental update for one file
+  - get_callers(symbol_name, project_path): import-based caller heuristic
+  - build_index(project_path, file_paths): full index build from file list
+  - update_file(file_path, content): extract and upsert symbols for one file
+
+Symbol identity model:
+- Primary key: (symbol_name, file_path, line_start)
+- Two symbols with the same name at different line numbers in the same file
+  are both preserved (no silent overwrites)
+- Limitations: regex extraction cannot distinguish class scope from global scope,
+  or nested functions with the same name — use tree-sitter/LSP for precise scope
 
 Used by: MCP tools (fastmcp_server.py), wakeup_context for active scope detection.
 """
@@ -30,6 +38,8 @@ from typing import Optional
 # Language-specific patterns for symbol definition extraction
 _PY_DEF_RE = re.compile(r'^(\s*)(def|class|async\s+def)\s+(\w+)', re.MULTILINE)
 _PY_IMPORT_RE = re.compile(r'^(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))', re.MULTILINE)
+_PY_DIRECT_IMPORT_RE = re.compile(r'^from\s+([\w.]+)\s+import\s+([^\n]+)', re.MULTILINE)
+_PY_IMPORT_AS_RE = re.compile(r'^import\s+([\w.]+)(?:\s+as\s+\w+)?', re.MULTILINE)
 _PY_EXPORT_RE = re.compile(r'^(\w+)\s*=', re.MULTILINE)  # top-level assignments (heuristic)
 
 _JS_FN_RE = re.compile(r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)', re.MULTILINE)
@@ -56,6 +66,7 @@ def _line_number(content: str, char_offset: int) -> int:
 def _extract_py_symbols(content: str) -> dict:
     symbols = []
     imports = []
+    direct_imports = []
     exports = []
     file_sig = ""
 
@@ -72,6 +83,24 @@ def _extract_py_symbols(content: str) -> dict:
         mod = match.group(1) or match.group(2)
         if mod:
             imports.append(mod)
+
+    # Extract direct imports: from module import symbol1, symbol2
+    for match in _PY_DIRECT_IMPORT_RE.finditer(content):
+        rest = match.group(2)  # everything after "from module import "
+        # Split by comma, strip whitespace, remove "as alias" parts
+        for part in rest.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            # Remove "as alias" suffix
+            as_idx = part.find(" as ")
+            if as_idx > 0:
+                part = part[:as_idx].strip()
+            # Skip parenthesized forms (like "from x import (a, b)")
+            if part.startswith("(") or part.endswith(")"):
+                part = part.strip("()").strip()
+            if part:
+                direct_imports.append(part)
 
     for match in _PY_EXPORT_RE.finditer(content):
         name = match.group(1)
@@ -91,7 +120,7 @@ def _extract_py_symbols(content: str) -> dict:
     elif first_lines.startswith("#!"):
         file_sig = first_lines.split("\n", 1)[0].lstrip()[2:].strip()
 
-    return {"symbols": symbols, "imports": imports, "exports": exports, "file_signature": file_sig}
+    return {"symbols": symbols, "imports": imports, "direct_imports": direct_imports, "exports": exports, "file_signature": file_sig}
 
 
 def _extract_js_symbols(content: str) -> dict:
@@ -190,25 +219,35 @@ CREATE TABLE IF NOT EXISTS symbol_index (
     symbol_name TEXT NOT NULL,
     symbol_type TEXT,
     file_path TEXT NOT NULL,
-    line_start INTEGER,
+    line_start INTEGER NOT NULL,
     line_end INTEGER,
     file_signature TEXT,
     imports TEXT,
+    direct_imports TEXT,
     exports TEXT,
     indexed_at TEXT,
-    UNIQUE(symbol_name, file_path)
+    UNIQUE(symbol_name, file_path, line_start)
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_name ON symbol_index(symbol_name);
 CREATE INDEX IF NOT EXISTS idx_file_path ON symbol_index(file_path);
+CREATE INDEX IF NOT EXISTS idx_symbol_file_line ON symbol_index(symbol_name, file_path, line_start);
+CREATE INDEX IF NOT EXISTS idx_direct_imports ON symbol_index(direct_imports);
 """
 
 
 class SymbolIndex:
     """
     SQLite-backed cross-reference index for symbol/import/export lookup.
-    Thread-safe: all operations use per-instance lock to serialize access.
+
+    Thread-safe: all operations use a per-instance RLock to serialize access.
+    The lock is reentrant so nested calls (e.g. get_callers → find_symbol)
+    are safe within the same thread.
 
     DB file: {palace_path}/symbol_index.sqlite3
+
+    Symbol identity: (symbol_name, file_path, line_start) is the unique key.
+    This means two symbols with the same name at different line numbers in
+    the same file are both preserved — no silent overwrites.
     """
 
     _instances: dict[str, "SymbolIndex"] = {}
@@ -218,7 +257,7 @@ class SymbolIndex:
         self.palace_path = palace_path
         self.db_path = str(Path(palace_path).expanduser().resolve() / "symbol_index.sqlite3")
         self._conn: Optional[sqlite3.Connection] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -247,20 +286,36 @@ class SymbolIndex:
                     pass
                 self._conn = None
 
-    def find_symbol(self, symbol_name: str) -> list[dict]:
+    def find_symbol(self, symbol_name: str, exact: bool = False) -> list[dict]:
         """
-        Find all definitions of symbol_name (exact match).
-        Returns list of dicts with file_path, line_start, line_end, symbol_type, file_signature.
+        Find all definitions of symbol_name (exact, case-sensitive match by default).
+
+        Args:
+            symbol_name: name of the symbol to find
+            exact: if True, uses COLLATE BINARY for guaranteed case-sensitive
+                   comparison; if False (default), uses case-sensitive '='
+                   which is also case-sensitive in SQLite for ASCII strings.
+
+        Returns one entry per unique (symbol_name, file_path, line_start) triple.
+        Multiple definitions with the same name in the same file at different
+        line numbers are all preserved — this is the key improvement over the
+        old (symbol_name, file_path) uniqueness model.
+
+        Returns list of dicts with: file_path, line_start, line_end, symbol_type,
+        file_signature, imports, exports.
         """
         with self._lock:
             if not self._conn:
                 return []
             try:
+                # exact=True uses COLLATE BINARY for guaranteed case-sensitive match
+                # exact=False (default) uses '=' which is case-sensitive for ASCII
+                collation = "COLLATE BINARY" if exact else ""
                 cur = self._conn.execute(
-                    """SELECT symbol_name, symbol_type, file_path, line_start, line_end,
+                    f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end,
                               file_signature, imports, exports
                        FROM symbol_index
-                       WHERE symbol_name = ?
+                       WHERE symbol_name {collation} = ?
                        ORDER BY file_path""",
                     (symbol_name,),
                 )
@@ -281,35 +336,65 @@ class SymbolIndex:
             except Exception:
                 return []
 
-    def search_symbols(self, pattern: str) -> list[dict]:
+    def search_symbols(self, pattern: str, limit: int = 100) -> list[dict]:
         """
-        Search symbol names matching regex pattern.
-        Returns list of dicts with symbol_name, file_path, symbol_type.
+        Search symbol names matching a SQL LIKE pattern.
+
+        Behavior:
+        - No wildcards: wraps pattern in %% (contains match)
+        - Starts with ^: treated as prefix match (LIKE 'pattern%')
+        - Ends with $: treated as suffix match (LIKE '%pattern')
+        - Contains % or _: used as SQL LIKE wildcards directly
+        - Scoped pattern "ClassName.method" or "Module.ClassName.method":
+            searches for symbol named "method" whose file also contains
+            a symbol named "ClassName" (heuristic: method belongs to class)
+
+        Args:
+            pattern: search pattern with optional ^/$ anchors
+            limit: maximum results to return (default 100)
+
+        Returns list of dicts with symbol_name, file_path, symbol_type, line_start, line_end.
         """
         with self._lock:
             if not self._conn:
                 return []
             try:
-                if pattern.startswith("^"):
+                # Auto-detect scoped search: "ClassName.method" or "Module.ClassName.method"
+                scope_filter = None
+                search_pattern = pattern
+                if "." in pattern and not pattern.startswith("^") and "%" not in pattern:
+                    parts = pattern.rsplit(".", 1)
+                    if len(parts) == 2 and parts[1]:
+                        scope_filter = parts[0]  # e.g., "ClassName" or "Module.ClassName"
+                        search_pattern = parts[1]  # the symbol name to search
+
+                # Build LIKE clause for symbol name
+                if search_pattern.startswith("^") and search_pattern.endswith("$"):
                     where_clause = "symbol_name LIKE ?"
-                    like_pattern = pattern[1:] + "%"
-                elif "%" in pattern or "_" in pattern:
+                    like_pattern = search_pattern[1:-1] + "%"
+                elif search_pattern.startswith("^"):
                     where_clause = "symbol_name LIKE ?"
-                    like_pattern = pattern
+                    like_pattern = search_pattern[1:] + "%"
+                elif search_pattern.endswith("$"):
+                    where_clause = "symbol_name LIKE ?"
+                    like_pattern = "%" + search_pattern[:-1]
+                elif "%" in search_pattern or "_" in search_pattern:
+                    where_clause = "symbol_name LIKE ?"
+                    like_pattern = search_pattern
                 else:
                     where_clause = "symbol_name LIKE ?"
-                    like_pattern = f"%{pattern}%"
+                    like_pattern = f"%{search_pattern}%"
 
                 cur = self._conn.execute(
                     f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end
                        FROM symbol_index
                        WHERE {where_clause}
                        ORDER BY symbol_name
-                       LIMIT 100""",
+                       LIMIT {limit}""",
                     (like_pattern,),
                 )
                 rows = cur.fetchall()
-                return [
+                results = [
                     {
                         "symbol_name": r[0],
                         "symbol_type": r[1],
@@ -319,13 +404,37 @@ class SymbolIndex:
                     }
                     for r in rows
                 ]
+
+                # Apply scope filter by checking if the containing file
+                # has a symbol matching the scope name (heuristic)
+                if scope_filter:
+                    scope_parts = scope_filter.split(".")
+                    target_scope = scope_parts[-1]  # the class name to look for
+                    filtered = []
+                    for r in results:
+                        file_syms = self.get_file_symbols(r["file_path"])
+                        file_symbol_names = {s["name"] for s in file_syms.get("symbols", [])}
+                        if target_scope in file_symbol_names:
+                            filtered.append(r)
+                    return filtered
+
+                return results
             except Exception:
                 return []
 
     def get_file_symbols(self, file_path: str) -> dict:
         """
         Get all symbols defined in a file.
-        Returns dict with symbols, imports, exports, file_signature.
+
+        Returns dict with keys:
+        - symbols: list of {name, type, line_start, line_end} for each distinct
+          (name, line_start) pair. Multiple definitions with the same name at
+          different lines are all included.
+        - imports: list of module/package names imported by this file
+        - exports: list of public names (uppercase-first assignments, heuristic)
+        - file_signature: module-level docstring or shebang
+
+        Note: line_start is 1-based (matching editor convention).
         """
         with self._lock:
             if not self._conn:
@@ -361,8 +470,16 @@ class SymbolIndex:
 
     def get_callers(self, symbol_name: str, project_path: str) -> list[dict]:
         """
-        Find files that reference a symbol (via import statement or text occurrence).
-        Returns list of dicts with file_path, line, context.
+        Find files that reference a symbol, using import-based heuristics.
+
+        This is a BEST-EFFORT heuristic that:
+        1. Resolves symbol's file to a module name (relative to project_path)
+        2. Searches for files that:
+           - directly import the symbol (direct_imports LIKE %symbol_name%) — checked FIRST
+           - import the symbol's module (imports LIKE %module%) — checked SECOND
+
+        Returns list of dicts with: file_path, imported_module, called_symbol,
+        import_type ("direct" or "module").
         """
         with self._lock:
             if not self._conn:
@@ -373,6 +490,8 @@ class SymbolIndex:
             return []
 
         callers = []
+        seen = set()
+
         for def_ in defs:
             def_file = def_["file_path"]
             try:
@@ -382,28 +501,63 @@ class SymbolIndex:
 
             module_name = str(Path(rel).with_suffix("")).replace("/", ".").replace("\\", ".")
 
-            with self._lock:
-                if not self._conn:
-                    break
-                try:
-                    cur = self._conn.execute(
-                        """SELECT file_path, imports FROM symbol_index WHERE imports LIKE ? LIMIT 50""",
-                        (f"%{module_name}%",),
-                    )
-                    for row in cur.fetchall():
-                        if row[0] != def_file:
+            if not self._conn:
+                break
+
+            # Search 2 FIRST: direct imports (from module import symbol)
+            # More specific than module-level, check first for import_type accuracy
+            try:
+                cur = self._conn.execute(
+                    """SELECT file_path, direct_imports FROM symbol_index
+                       WHERE direct_imports LIKE ? LIMIT 50""",
+                    (f"%{symbol_name}%",),
+                )
+                for row in cur.fetchall():
+                    if row[0] != def_file:
+                        key = row[0]
+                        if key not in seen:
+                            seen.add(key)
                             callers.append({
                                 "file_path": row[0],
                                 "imported_module": module_name,
                                 "called_symbol": symbol_name,
+                                "import_type": "direct",
                             })
-                except Exception:
-                    break
+            except Exception:
+                pass
+
+            # Search 1 SECOND: module-level imports (import module, from package import module)
+            # Only add files not already found via direct import
+            if not self._conn:
+                break
+            try:
+                cur = self._conn.execute(
+                    """SELECT file_path, imports FROM symbol_index WHERE imports LIKE ? LIMIT 50""",
+                    (f"%{module_name}%",),
+                )
+                for row in cur.fetchall():
+                    if row[0] != def_file:
+                        key = row[0]
+                        if key not in seen:
+                            seen.add(key)
+                            callers.append({
+                                "file_path": row[0],
+                                "imported_module": module_name,
+                                "called_symbol": symbol_name,
+                                "import_type": "module",
+                            })
+            except Exception:
+                pass
+
         return callers[:20]
 
     def update_file(self, file_path: str, content: str):
         """
         Extract symbols from content and upsert into index.
+
+        Handles files with no symbol definitions (import-only files) by
+        storing a single placeholder row so imports are preserved for
+        get_callers lookups.
         """
         with self._lock:
             if not self._conn:
@@ -415,22 +569,52 @@ class SymbolIndex:
 
                 self._conn.execute("DELETE FROM symbol_index WHERE file_path = ?", (file_path,))
 
-                for sym in extracted.get("symbols", []):
-                    imports_str = ",".join(extracted.get("imports", []))
-                    exports_str = ",".join(extracted.get("exports", []))
+                symbols = extracted.get("symbols", [])
+                imports_str = ",".join(extracted.get("imports", []))
+                direct_imports_str = ",".join(extracted.get("direct_imports", []))
+                exports_str = ",".join(extracted.get("exports", []))
+                file_sig = extracted.get("file_signature", "")
+
+                if symbols:
+                    for sym in symbols:
+                        line_start = sym.get("line", 0)
+                        line_end = sym.get("line_end", line_start + 1)
+                        self._conn.execute(
+                            """INSERT OR REPLACE INTO symbol_index
+                               (symbol_name, symbol_type, file_path, line_start, line_end,
+                                file_signature, imports, direct_imports, exports, indexed_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                sym["name"],
+                                sym.get("type", "definition"),
+                                file_path,
+                                line_start,
+                                line_end,
+                                file_sig,
+                                imports_str,
+                                direct_imports_str,
+                                exports_str,
+                                now,
+                            ),
+                        )
+                elif imports_str:
+                    # Import-only file: insert a placeholder row with empty symbol_name
+                    # so the imports column is preserved for get_callers lookups.
+                    # line_start=0 indicates this is a file-level import marker.
                     self._conn.execute(
                         """INSERT OR REPLACE INTO symbol_index
                            (symbol_name, symbol_type, file_path, line_start, line_end,
-                            file_signature, imports, exports, indexed_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            file_signature, imports, direct_imports, exports, indexed_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
-                            sym["name"],
-                            sym.get("type", "definition"),
+                            "",  # empty symbol_name = import-only file marker
+                            "imports",
                             file_path,
-                            sym.get("line", 0),
                             0,
-                            extracted.get("file_signature", ""),
+                            0,
+                            file_sig,
                             imports_str,
+                            direct_imports_str,
                             exports_str,
                             now,
                         ),

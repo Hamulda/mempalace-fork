@@ -69,17 +69,22 @@ class MemoryGuard:
     _instance = None
     _lock = threading.Lock()
     _started = threading.Event()
+    # Class-level _stop ensures all instances share the same stop signal.
+    # Using instance-level _stop caused old monitor threads to miss the stop
+    # signal when a new instance was created via get() after stop().
+    _stop = threading.Event()
 
     def __init__(self, check_interval: float = 10.0):
         self._pressure = MemoryPressure.NOMINAL
         self._used_ratio = 0.0
         self._interval = check_interval
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._monitor_loop, daemon=True
-        )
+        # Bind _monitor_loop to self while the thread is alive so the correct
+        # pressure/used_ratio are updated regardless of how many restarts occur.
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
-        self._started.wait(timeout=5.0)  # wait for first measurement before returning
+        # Wait for first measurement before returning so callers always see
+        # a fully initialized instance (not just the NOMINAL default).
+        self._started.wait(timeout=5.0)
         logger.info("MemoryGuard started (check interval: %ss)", check_interval)
 
     @classmethod
@@ -138,10 +143,25 @@ class MemoryGuard:
             self._used_ratio = ratio
 
     def stop(self) -> None:
-        """Stop the background monitor thread. Call on application shutdown."""
+        """
+        Stop the background monitor thread and reset singleton state.
+
+        After stop() a subsequent get() will block until the new instance's
+        first measurement completes (fresh-start semantics).
+        """
         self._stop.set()
         with type(self)._lock:
             type(self)._instance = None
+            # Reset _started so the next get() blocks until first measurement.
+            # Without this, a subsequent get() after stop() returns immediately
+            # (since _started was already set by the previous instance) without
+            # waiting for the new instance's first measurement.
+            type(self)._started.clear()
+            # Create a fresh _stop event so that when the next get() creates
+            # a new instance, its _monitor_loop blocks on a clean event (not
+            # one that is already set by this stop() call).
+            type(self)._stop = threading.Event()
+        # Use self._thread directly — no lock needed for join target resolution.
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)
         logger.info("MemoryGuard stopped")

@@ -3,7 +3,6 @@ Shared helpers for tool functions: collection access, sanitization, cache.
 """
 import os
 from pathlib import Path
-from ._infrastructure import invalidate_status_cache
 from ..config import sanitize_name, sanitize_content
 
 
@@ -29,7 +28,6 @@ def no_palace():
 __all__ = [
     "make_collection_getter",
     "no_palace",
-    "invalidate_status_cache",
     "sanitize_name",
     "sanitize_content",
 ]

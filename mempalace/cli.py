@@ -129,6 +129,7 @@ def cmd_search(args):
     from .searcher import search, search_memories, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    path_format = getattr(args, "path_format", "full")
     try:
         if getattr(args, "format", "pretty") == "lines":
             # Lines format: output one result per line for hook consumption
@@ -145,6 +146,44 @@ def cmd_search(args):
                     wing_name = hit.get("wing", "?")
                     room_name = hit.get("room", "?")
                     print(f"[{wing_name}/{room_name}] {text}")
+        elif path_format == "rel":
+            # Pretty format with repo-relative paths
+            result = search_memories(
+                query=args.query,
+                palace_path=palace_path,
+                wing=args.wing,
+                room=args.room,
+                n_results=args.results,
+            )
+            if "error" in result:
+                print(f"\n  Search error: {result['error']}")
+                raise SearchError(result["error"])
+            hits = result.get("results", [])
+            if not hits:
+                print(f'\n  No results found for: "{args.query}"')
+                return
+            print(f"\n{'=' * 60}")
+            print(f'  Results for: "{args.query}"')
+            if args.wing:
+                print(f"  Wing: {args.wing}")
+            if args.room:
+                print(f"  Room: {args.room}")
+            print(f"{'=' * 60}\n")
+            for i, hit in enumerate(hits, 1):
+                source = hit.get("repo_rel_path") or hit.get("source_file", "?")
+                wing_name = hit.get("wing", "?")
+                room_name = hit.get("room", "?")
+                similarity = hit.get("similarity", 0)
+                doc = hit.get("text", "")
+                print(f"  [{i}] {wing_name} / {room_name}")
+                print(f"      Source: {source}")
+                print(f"      Match:  {similarity}")
+                print()
+                for line in doc.strip().split("\n"):
+                    print(f"      {line}")
+                print()
+                print(f"  {'─' * 56}")
+            print()
         else:
             search(
                 query=args.query,
@@ -283,6 +322,15 @@ def cmd_status(args):
             backend_label = "lance" if backend_type == "lance" else "chroma"
             print(f"Backend: {backend_label}")
             print(f"Memories: {count:,}")
+            try:
+                from .symbol_index import SymbolIndex
+                from .lexical_index import KeywordIndex
+                si_stats = SymbolIndex.get(palace_path).stats()
+                ki_count = KeywordIndex.get(palace_path).count()
+                print(f"Symbol index: {si_stats.get('total_symbols', 0):,} symbols in {si_stats.get('total_files', 0):,} files")
+                print(f"FTS5 index:   {ki_count:,} documents")
+            except Exception:
+                pass
             print(f"Last optimize: check logs")
         except FileNotFoundError:
             print(f"Palace not initialized at {palace_path}")
@@ -923,6 +971,192 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
+def cmd_diag(args):
+    """Run all diagnostics on palace indexes and runtime state."""
+    from .diagnostics import (
+        validate_symbol_index,
+        validate_keyword_index,
+        validate_runtime_state,
+        validate_skills_registration,
+    )
+
+    config = MempalaceConfig()
+    palace_path = os.path.expanduser(args.palace) if args.palace else config.palace_path
+    project_path = os.path.expanduser(args.project) if args.project else os.path.dirname(config.palace_path)
+
+    skills_dir = os.path.join(os.path.dirname(__file__), "skills")
+
+    print("MemPalace Diagnostics")
+    print("=" * 50)
+    print(f"Palace:  {palace_path}")
+    print(f"Project: {project_path}")
+    print()
+
+    all_passed = True
+
+    # Symbol index validation
+    if os.path.isdir(project_path):
+        print("[symbol_index]")
+        try:
+            result = validate_symbol_index(palace_path, project_path)
+            stats = result.get("stats", {})
+            orphaned = result.get("orphaned_files", [])
+            missing = result.get("missing_from_index", [])
+
+            print(f"  Total symbols: {stats.get('total_symbols', '?')}")
+            print(f"  Total files:   {stats.get('total_files', '?')}")
+            print(f"  Orphaned (in index, missing on disk): {len(orphaned)}")
+            if orphaned:
+                for fp in orphaned[:5]:
+                    print(f"    - {fp}")
+                if len(orphaned) > 5:
+                    print(f"    ... and {len(orphaned) - 5} more")
+            print(f"  Missing from index (on disk, not indexed): {len(missing)}")
+            if missing:
+                for fp in missing[:5]:
+                    print(f"    - {fp}")
+                if len(missing) > 5:
+                    print(f"    ... and {len(missing) - 5} more")
+
+            if orphaned or missing:
+                all_passed = False
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            all_passed = False
+        print()
+    else:
+        print("[symbol_index]  SKIPPED (project path not accessible)")
+        print()
+
+    # Keyword index validation
+    print("[keyword_index / FTS5]")
+    try:
+        result = validate_keyword_index(palace_path)
+        print(f"  FTS5 documents:  {result.get('fts5_count', '?')}")
+        print(f"  LanceDB count:   {result.get('lance_count', '?')}")
+        if result.get("counts_match"):
+            print("  Status: ✅ counts match")
+        else:
+            mismatch = abs(result.get("fts5_count", 0) - result.get("lance_count", 0))
+            print(f"  Status: ❌ MISMATCH (difference: {mismatch})")
+            all_passed = False
+        if result.get("sample_errors"):
+            for err in result["sample_errors"]:
+                print(f"  Sample check error: {err}")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        all_passed = False
+    print()
+
+    # Runtime state
+    print("[runtime_state]")
+    try:
+        result = validate_runtime_state(palace_path)
+        cache_size = result.get("query_cache_size", 0)
+        daemon = result.get("daemon_running", False)
+        pressure = result.get("memory_pressure", "unknown")
+        initialized = result.get("palace_initialized", False)
+
+        print(f"  Palace initialized: {initialized}")
+        print(f"  Query cache size:   {cache_size}")
+        print(f"  Embedding daemon:  {'✅ running' if daemon else '❌ not running'}")
+        print(f"  Memory pressure:    {pressure}")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        all_passed = False
+    print()
+
+    # Skills validation
+    print("[skills_registration]")
+    try:
+        result = validate_skills_registration(skills_dir)
+        total = result.get("total_expected", 0)
+        found = result.get("total_found", 0)
+        missing = result.get("missing", [])
+        empty = result.get("empty", [])
+
+        print(f"  Skills: {found}/{total} found")
+        if missing:
+            print(f"  Missing: {', '.join(sorted(missing))}")
+            all_passed = False
+        if empty:
+            print(f"  Empty files: {', '.join(sorted(empty))}")
+            all_passed = False
+
+        if not missing and not empty:
+            print("  Status: ✅ all skills present")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        all_passed = False
+    print()
+
+    print("=" * 50)
+    if all_passed:
+        print("Result: ✅ All diagnostics passed")
+    else:
+        print("Result: ❌ Issues found")
+
+    if not all_passed:
+        raise SystemExit(1)
+
+
+def cmd_repair_index(args):
+    """Rebuild symbol or keyword indexes."""
+    from .diagnostics import rebuild_symbol_index, rebuild_keyword_index
+
+    config = MempalaceConfig()
+    palace_path = os.path.expanduser(args.palace) if args.palace else config.palace_path
+    project_path = os.path.expanduser(args.project) if args.project else os.path.dirname(config.palace_path)
+
+    rebuild_symbol = args.symbol or not (args.symbol or args.keyword)
+    rebuild_keyword = args.keyword or not (args.symbol or args.keyword)
+
+    print("MemPalace Index Repair")
+    print("=" * 50)
+    print(f"Palace:  {palace_path}")
+    print(f"Project: {project_path}")
+    print(f"Symbol index:  {'rebuild' if rebuild_symbol else 'skip'}")
+    print(f"Keyword index: {'rebuild' if rebuild_keyword else 'skip'}")
+    print()
+
+    if not os.path.isdir(palace_path):
+        print(f"  Palace not found at {palace_path}")
+        raise SystemExit(1)
+
+    if rebuild_symbol:
+        if not os.path.isdir(project_path):
+            print(f"  Project path not accessible: {project_path}")
+            raise SystemExit(1)
+        print("[symbol_index] Rebuilding...")
+        try:
+            result = rebuild_symbol_index(palace_path, project_path)
+            backup = result.get("backup_path", "none")
+            print(f"  ✅ Done: {result.get('symbols_indexed', 0)} symbols in {result.get('files_indexed', 0)} files")
+            print(f"  Backup: {backup}")
+        except Exception as e:
+            print(f"  ❌ ERROR: {e}")
+            all_passed = False
+        print()
+
+    if rebuild_keyword:
+        print("[keyword_index] Rebuilding from LanceDB...")
+        try:
+            result = rebuild_keyword_index(palace_path)
+            backup = result.get("backup_path", "none")
+            docs = result.get("documents_indexed", 0)
+            if "error" in result:
+                print(f"  ❌ ERROR: {result['error']}")
+            else:
+                print(f"  ✅ Done: {docs} documents indexed")
+                print(f"  Backup: {backup}")
+        except Exception as e:
+            print(f"  ❌ ERROR: {e}")
+        print()
+
+    print("=" * 50)
+    print("Repair complete.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
@@ -990,6 +1224,10 @@ def main():
     p_search.add_argument(
         "--format", choices=["pretty", "lines"], default="pretty",
         help="Output format: pretty (default) or lines (one result per line)"
+    )
+    p_search.add_argument(
+        "--path-format", choices=["full", "rel"], default="full",
+        help="Path display: full shows absolute source_file, rel shows repo_rel_path (pretty format only)"
     )
 
     # compress
@@ -1183,6 +1421,25 @@ def main():
     # status
     sub.add_parser("status", help="Show what's been filed")
 
+    # diag
+    p_diag = sub.add_parser("diag", help="Run diagnostics on palace indexes and runtime state")
+    p_diag.add_argument("--palace", default=None, help="Palace path (default: from config)")
+    p_diag.add_argument("--project", default=None, help="Project path (default: palace parent)")
+
+    # repair-index
+    p_repair_index = sub.add_parser(
+        "repair-index",
+        help="Rebuild symbol or keyword indexes",
+    )
+    p_repair_index.add_argument("--palace", default=None, help="Palace path (default: from config)")
+    p_repair_index.add_argument("--project", default=None, help="Project path (default: palace parent)")
+    p_repair_index.add_argument(
+        "--symbol", action="store_true", help="Rebuild symbol index only"
+    )
+    p_repair_index.add_argument(
+        "--keyword", action="store_true", help="Rebuild keyword/FTS5 index only"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1222,6 +1479,8 @@ def main():
         "optimize": cmd_optimize,
         "cleanup": cmd_cleanup,
         "setup": cmd_setup,
+        "diag": cmd_diag,
+        "repair-index": cmd_repair_index,
     }
     dispatch[args.command](args)
 

@@ -13,7 +13,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
     Register all write @mcp.tool() as closures over backend/config/kg.
     Called by factory._register_tools().
     """
-    from ._infrastructure import wal_log_async, get_wal_path, bg_executor, invalidate_status_cache
+    from ._infrastructure import wal_log_async, get_wal_path, bg_executor
     from ..searcher import invalidate_query_cache
     from ..entity_detector import extract_candidates
     from ..config import sanitize_name, sanitize_content
@@ -30,7 +30,9 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         return {"error": "No palace found", "hint": "Run: mempalace init <dir> && mempalace mine <dir>"}
 
     def _invalidate_status_cache():
-        invalidate_status_cache()
+        # Invalidate this server instance's status cache only.
+        # Uses per-server StatusCache attached to server in create_server().
+        server._status_cache.invalidate()
 
     @server.tool(timeout=settings.timeout_write)
     def mempalace_add_drawer(

@@ -148,10 +148,21 @@ def build_wakeup_context(
             from .recent_changes import get_recent_changes, get_hot_spots
             result["recent_changes"] = get_recent_changes(project_root, n=20)
             result["hot_spots"] = get_hot_spots(project_root, n=5)
+            # Normalize: add canonical path fields (source_file=absolute, repo_rel_path=git-relative)
+            _pr = os.path.abspath(project_root)
+            for entry in result["recent_changes"]:
+                entry["abs_path"] = os.path.normpath(os.path.join(_pr, entry["file_path"]))
+                entry["source_file"] = entry["abs_path"]  # canonical identity (absolute)
+                entry["repo_rel_path"] = entry["file_path"]  # user-friendly (git-relative)
+            for entry in result["hot_spots"]:
+                entry["abs_path"] = os.path.normpath(os.path.join(_pr, entry["file_path"]))
+                entry["source_file"] = entry["abs_path"]  # canonical identity (absolute)
+                entry["repo_rel_path"] = entry["file_path"]  # user-friendly (git-relative)
         except Exception:
             pass
 
     # Phase 6: Symbols from active scope (files from active claims)
+    # Enriched with caller context for better Claude Code workflow
     try:
         if result["active_claims"] and palace_path:
             from .symbol_index import SymbolIndex
@@ -165,12 +176,24 @@ def build_wakeup_context(
                 seen_files.add(target)
                 file_syms = si.get_file_symbols(target)
                 for sym in file_syms.get("symbols", [])[:5]:  # limit to 5 per file
-                    symbols.append({
+                    sym_entry = {
                         "name": sym["name"],
                         "type": sym.get("type", "definition"),
                         "file_path": target,
                         "line_start": sym.get("line_start", 0),
-                    })
+                    }
+                    # Add caller context (files that import this symbol's module)
+                    if project_root:
+                        callers = si.get_callers(sym["name"], project_root)
+                        if callers:
+                            sym_entry["callers"] = [
+                                {
+                                    "file_path": c["file_path"],
+                                    "import_type": c.get("import_type", "module"),
+                                }
+                                for c in callers[:3]  # max 3 callers per symbol
+                            ]
+                    symbols.append(sym_entry)
             result["active_symbols"] = symbols[:20]  # cap at 20 total
     except Exception:
         pass

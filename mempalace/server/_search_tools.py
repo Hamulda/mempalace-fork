@@ -45,7 +45,7 @@ def register_search_tools(server, backend, config, settings, memory_guard):
         code_search_async, auto_search, is_code_query,
     )
     from ..palace_graph import traverse, find_tunnels, graph_stats
-    from ._infrastructure import status_cache, STATUS_CACHE_TTL, invalidate_status_cache
+    from ._infrastructure import STATUS_CACHE_TTL
 
     def _get_collection(create=False):
         try:
@@ -64,8 +64,9 @@ def register_search_tools(server, backend, config, settings, memory_guard):
     def mempalace_status(ctx: Context) -> dict:
         import time
         now = time.time()
-        if status_cache["data"] and (now - status_cache["ts"]) < STATUS_CACHE_TTL:
-            return status_cache["data"]
+        cached_data, cached_ts = server._status_cache.get(settings.db_path)
+        if cached_data is not None and (now - cached_ts) < STATUS_CACHE_TTL:
+            return cached_data
 
         col = _get_collection()
         if not col:
@@ -113,8 +114,7 @@ def register_search_tools(server, backend, config, settings, memory_guard):
             "aaak_dialect": AAAK_SPEC,
             "memory_guard": guard_stats if guard_stats else "inactive",
         }
-        status_cache["data"] = result
-        status_cache["ts"] = now
+        server._status_cache.set(settings.db_path, result, now)
         return result
 
     # ── List tools ───────────────────────────────────────────────────────────

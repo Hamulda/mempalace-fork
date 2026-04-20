@@ -20,8 +20,8 @@ from collections import defaultdict
 
 from .config import MempalaceConfig
 from .backends import get_backend
-from .palace import SKIP_DIRS, file_already_mined  # Only SKIP_DIRS and file_already_mined remain from palace.py
-from .symbol_index import SymbolIndex, extract_symbols
+from .palace import SKIP_DIRS
+from .symbol_index import SymbolIndex
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -74,63 +74,6 @@ LANGUAGE_MAP = {
     ".xml": "XML", ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS",
     ".less": "Less", ".md": "Markdown", ".rst": "reStructuredText", ".txt": "Text",
     ".csv": "CSV", ".tf": "HCL", ".hcl": "HCL", ".dockerfile": "Dockerfile",
-}
-
-# Language detection from file extension
-LANGUAGE_MAP = {
-    ".py": "Python",
-    ".pyi": "Python",
-    ".js": "JavaScript",
-    ".jsx": "JavaScript",
-    ".mjs": "JavaScript",
-    ".cjs": "JavaScript",
-    ".ts": "TypeScript",
-    ".tsx": "TypeScript",
-    ".mts": "TypeScript",
-    ".cts": "TypeScript",
-    ".java": "Java",
-    ".go": "Go",
-    ".rs": "Rust",
-    ".rb": "Ruby",
-    ".php": "PHP",
-    ".c": "C",
-    ".h": "C",
-    ".cpp": "C++",
-    ".cc": "C++",
-    ".cxx": "C++",
-    ".hpp": "C++",
-    ".cs": "C#",
-    ".swift": "Swift",
-    ".kt": "Kotlin",
-    ".scala": "Scala",
-    ".r": "R",
-    ".R": "R",
-    ".lua": "Lua",
-    ".pl": "Perl",
-    ".sh": "Shell",
-    ".bash": "Shell",
-    ".zsh": "Shell",
-    ".fish": "Shell",
-    ".ps1": "PowerShell",
-    ".sql": "SQL",
-    ".yaml": "YAML",
-    ".yml": "YAML",
-    ".json": "JSON",
-    ".toml": "TOML",
-    ".xml": "XML",
-    ".html": "HTML",
-    ".htm": "HTML",
-    ".css": "CSS",
-    ".scss": "SCSS",
-    ".less": "Less",
-    ".md": "Markdown",
-    ".rst": "reStructuredText",
-    ".txt": "Text",
-    ".csv": "CSV",
-    ".tf": "HCL",
-    ".hcl": "HCL",
-    ".dockerfile": "Dockerfile",
-    ".toml": "TOML",
 }
 
 
@@ -538,7 +481,7 @@ _GENERIC_CODE_PATTERNS = [
     (r'^(?:def|class)\s+(\w+)', 'generic_def'),
 ]
 
-import re as _re
+import re
 
 _PATTERNS_BY_LANG = {
     "Python": _PYTHON_PATTERNS,
@@ -617,7 +560,7 @@ def split_code_structurally(content: str, source_file: str, max_chunk_chars: int
     # Build regex for this language (numbered groups, not named)
     # Each pattern gets its own group for the whole match, plus inner group for symbol name
     all_patterns = "|".join(f"({p})" for i, (p, _) in enumerate(patterns))
-    pattern_re = _re.compile(all_patterns, _re.MULTILINE)
+    pattern_re = re.compile(all_patterns, re.MULTILINE)
 
     # Find all structural split points
     lines = content.split("\n")
@@ -942,15 +885,13 @@ def process_file(
 
         # Tombstone: find old chunk(s) with same content_hash.
         # ALL matching old chunks are superseded by this new chunk.
-        # We track all superseded IDs in a list so the supersession set is complete,
-        # while storing only the last one in supersedes_id (single-string contract).
+        # We store all superseded IDs as pipe-separated string (single-string contract).
         superseded_ids_for_chunk = []
         if content_hash in old_chunks_by_hash:
             for old_id, old_meta in old_chunks_by_hash[content_hash]:
                 superseded_ids_for_chunk.append(old_id)
-            # Store last ID in supersedes_id (single-string field); the complete
-            # supersession set is built from all metadatas below.
-            metadata["supersedes_id"] = superseded_ids_for_chunk[-1]
+            # Store all IDs as pipe-separated string; parse during tombstoning.
+            metadata["supersedes_id"] = "|".join(superseded_ids_for_chunk)
             metadata["is_latest"] = True
 
         documents.append(chunk["content"])
@@ -968,11 +909,15 @@ def process_file(
         for old_id, _ in old_list:
             all_old_ids.add(old_id)
 
-    # Superseded IDs are those referenced by new chunks via supersedes_id
+    # Superseded IDs are those referenced by new chunks via supersedes_id.
+    # supersedes_id is pipe-separated when multiple old chunks share the same hash.
     superseded_ids = set()
     for meta in metadatas:
-        if meta.get("supersedes_id"):
-            superseded_ids.add(meta["supersedes_id"])
+        raw = meta.get("supersedes_id", "")
+        if raw:
+            for sid in raw.split("|"):
+                if sid:
+                    superseded_ids.add(sid)
 
     # Tombstone every old chunk that was NOT superseded
     for old_hash, old_list in old_chunks_by_hash.items():
@@ -986,13 +931,6 @@ def process_file(
                     )
                 except Exception:
                     pass  # Best-effort tombstone
-
-    # Update cross-reference symbol index
-    try:
-        si = SymbolIndex.get(palace_path)
-        si.update_file(source_file, content)
-    except Exception:
-        pass  # Best-effort, non-critical
 
     return len(documents), room
 

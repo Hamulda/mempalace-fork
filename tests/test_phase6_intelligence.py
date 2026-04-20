@@ -290,6 +290,63 @@ class TestHotSpotsParser:
         assert counts.get("src/file1.py", 0) == 1
         assert counts.get("src/file2.py", 0) == 1
 
+    def test_hot_spots_hash_not_indentation(self, monkeypatch, tmp_path):
+        """
+        Parser must use hash detection (not indentation) as the state-machine trigger.
+        A non-indented line that is NOT a hash should NOT be treated as a filename.
+        Only lines following a hash commit line are filenames.
+        """
+        # Non-hash, non-indented line between commits (e.g., unexpected format/wrapper)
+        # must NOT be treated as a filename — only indented lines AFTER a hash count.
+        git_output = (
+            "4ba10998a6ebceb06ecf1a94bb2970c91ff19a67\n"
+            "\tsrc/main.py\n"
+            "some unexpected wrapper text\n"      # not indented, not a hash → should be ignored
+            "\tsrc/util.py\n"
+            "\n"
+            "b9469a95e64ad83017429739bd95b527100cdfec\n"
+            "\tsrc/main.py\n"
+        )
+
+        def mock_run_git(project_path, args):
+            return git_output
+
+        import mempalace.recent_changes as rc
+        monkeypatch.setattr(rc, "_run_git", mock_run_git)
+
+        spots = get_hot_spots(str(tmp_path), n=10)
+        counts = {s["file_path"]: s["change_count"] for s in spots}
+
+        # Both src files are correctly counted despite unexpected non-indented text
+        assert counts.get("src/main.py", 0) == 2
+        assert counts.get("src/util.py", 0) == 1
+        # "some unexpected wrapper text" must NOT appear as a file
+        unexpected = [s for s in spots if "unexpected" in s["file_path"]]
+        assert len(unexpected) == 0, "Non-indented non-hash lines must not be treated as filenames"
+
+    def test_hot_spots_only_counted_after_hash(self, monkeypatch, tmp_path):
+        """
+        Files listed before any hash line must NOT be counted.
+        Verifies state machine enters commit block ONLY after seeing a hash.
+        """
+        git_output = (
+            "\tsrc/before.py\n"    # before any hash → should NOT be counted
+            "4ba10998a6ebceb06ecf1a94bb2970c91ff19a67\n"
+            "\tsrc/main.py\n"
+        )
+
+        def mock_run_git(project_path, args):
+            return git_output
+
+        import mempalace.recent_changes as rc
+        monkeypatch.setattr(rc, "_run_git", mock_run_git)
+
+        spots = get_hot_spots(str(tmp_path), n=10)
+        counts = {s["file_path"]: s["change_count"] for s in spots}
+
+        assert counts.get("src/before.py", 0) == 0, "Files before first hash must not be counted"
+        assert counts.get("src/main.py", 0) == 1
+
 
 class TestSymbolIndexThreadSafety:
     """Verify SymbolIndex operations are serialized with per-instance lock."""
