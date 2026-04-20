@@ -828,3 +828,314 @@ class TestErrorContract:
 
 
 import os
+
+
+# ---------------------------------------------------------------------------
+# Test: shared server mode default strict enforcement
+# ---------------------------------------------------------------------------
+
+class TestSharedServerModeDefaults:
+    """
+    Verify that in shared server mode, the effective default is strict
+    enforcement (writes blocked on conflict) without caller needing to pass
+    claim_mode='strict'. Advisory mode is still available via explicit opt-out.
+    """
+
+    @pytest.fixture
+    def shared_mock_server(self):
+        """Create mock server with _shared_server_mode=True + ClaimsManager."""
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = _pp()
+        settings = _MockSettings(tmp)
+        settings.db_path = tmp
+        settings.palace_path = tmp
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._shared_server_mode = True  # KEY: shared mode flag
+
+        claims_mgr = _MockClaimsManager()
+        server._claims_manager = claims_mgr
+
+        fake_col = MagicMock()
+        fake_col.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+        fake_col.upsert.return_value = None
+        fake_col.delete.return_value = None
+
+        return server, claims_mgr, fake_col, settings
+
+    def test_shared_mode_default_is_strict(self, shared_mock_server):
+        """Shared mode + default claim_mode (not passed) → strict enforcement."""
+        server, claims_mgr, fake_col, settings = shared_mock_server
+
+        # session-a claims the path
+        target = f"{settings.palace_path}/wing_s/room_s"
+        claims_mgr.claim("file", target, "session-a", ttl_seconds=600)
+
+        # Capture registered tools
+        captured = {}
+        _orig = server.tool
+        def capture(**kw):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        from mempalace.server._write_tools import register_write_tools
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+        config = MagicMock()
+        config.palace_path = settings.palace_path
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_add_drawer"]
+
+        # session-b writes WITHOUT specifying claim_mode → default "advisory" in signature
+        # but shared mode should upgrade to strict
+        result = tool(
+            dummy_ctx,
+            wing="wing_s", room="room_s", content="test",
+            source_file=None, added_by="test",
+            session_id="session-b",
+            # claim_mode NOT passed → defaults to "advisory" in function signature
+            # but _claim_check should treat it as strict in shared mode
+        )
+        assert result.get("error") == "claim_conflict"
+        assert result.get("owner") == "session-a"
+        assert not fake_col.upsert.called
+
+    def test_shared_mode_explicit_advisory_allows_write(self, shared_mock_server):
+        """Shared mode + explicit claim_mode='advisory' → allows write with warning."""
+        server, claims_mgr, fake_col, settings = shared_mock_server
+
+        target = f"{settings.palace_path}/wing_s/room_s"
+        claims_mgr.claim("file", target, "session-a", ttl_seconds=600)
+
+        captured = {}
+        _orig = server.tool
+        def capture(**kw):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        from mempalace.server._write_tools import register_write_tools
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+        config = MagicMock()
+        config.palace_path = settings.palace_path
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_add_drawer"]
+
+        result = tool(
+            dummy_ctx,
+            wing="wing_s", room="room_s", content="test",
+            source_file=None, added_by="test",
+            session_id="session-b",
+            claim_mode="advisory",  # explicit opt-out
+        )
+        assert result.get("success") is True
+        assert "claim_warning" in result
+        assert fake_col.upsert.called
+
+    def test_shared_mode_explicit_strict_blocks(self, shared_mock_server):
+        """Shared mode + explicit claim_mode='strict' → blocks write."""
+        server, claims_mgr, fake_col, settings = shared_mock_server
+
+        target = f"{settings.palace_path}/wing_s/room_s"
+        claims_mgr.claim("file", target, "session-a", ttl_seconds=600)
+
+        captured = {}
+        _orig = server.tool
+        def capture(**kw):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        from mempalace.server._write_tools import register_write_tools
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+        config = MagicMock()
+        config.palace_path = settings.palace_path
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_add_drawer"]
+
+        result = tool(
+            dummy_ctx,
+            wing="wing_s", room="room_s", content="test",
+            source_file=None, added_by="test",
+            session_id="session-b",
+            claim_mode="strict",
+        )
+        assert result.get("error") == "claim_conflict"
+        assert not fake_col.upsert.called
+
+    def test_non_shared_mode_default_is_advisory(self, tmp_path):
+        """Non-shared mode (no _shared_server_mode) → advisory default, conflict allowed."""
+        from mempalace.server._write_tools import register_write_tools
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = str(tmp_path)
+        settings = _MockSettings(tmp)
+        settings.db_path = tmp
+        settings.palace_path = tmp
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        # NO _shared_server_mode attribute — non-shared mode
+
+        claims_mgr = _MockClaimsManager()
+        server._claims_manager = claims_mgr
+
+        fake_col = MagicMock()
+        fake_col.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+        fake_col.upsert.return_value = None
+
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+
+        config = MagicMock()
+        config.palace_path = tmp
+
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        captured = {}
+        _orig = server.tool
+        def capture(**kw):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig
+
+        # session-a claims
+        target = f"{tmp}/wing_n/room_n"
+        claims_mgr.claim("file", target, "session-a", ttl_seconds=600)
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_add_drawer"]
+
+        # session-b calls WITHOUT claim_mode → default "advisory" in signature
+        # Non-shared mode → stays advisory (backward compatible)
+        result = tool(
+            dummy_ctx,
+            wing="wing_n", room="room_n", content="test",
+            source_file=None, added_by="test",
+            session_id="session-b",
+            # claim_mode not passed → defaults to "advisory"
+        )
+        assert result.get("success") is True
+        assert "claim_warning" in result
+        assert fake_col.upsert.called
+
+    def test_self_claim_allowed_in_shared_mode(self, shared_mock_server):
+        """Shared mode + self holds the claim → write succeeds."""
+        server, claims_mgr, fake_col, settings = shared_mock_server
+
+        target = f"{settings.palace_path}/wing_s/room_s"
+        claims_mgr.claim("file", target, "session-a", ttl_seconds=600)
+
+        captured = {}
+        _orig = server.tool
+        def capture(**kw):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        from mempalace.server._write_tools import register_write_tools
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+        config = MagicMock()
+        config.palace_path = settings.palace_path
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_add_drawer"]
+
+        # session-a writes to its own claim — should succeed in any mode
+        result = tool(
+            dummy_ctx,
+            wing="wing_s", room="room_s", content="test",
+            source_file=None, added_by="test",
+            session_id="session-a",  # self
+            # claim_mode not passed — shared mode defaults to strict, but self is always allowed
+        )
+        assert result.get("success") is True
+        assert fake_col.upsert.called
+
+    def test_conflict_response_contract_fields(self, shared_mock_server):
+        """Strict conflict response has all Claude-Code actionable fields."""
+        server, claims_mgr, fake_col, settings = shared_mock_server
+
+        target = f"{settings.palace_path}/w_c/room_c"
+        claims_mgr.claim("file", target, "session-a", ttl_seconds=600)
+
+        captured = {}
+        _orig = server.tool
+        def capture(**kw):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        from mempalace.server._write_tools import register_write_tools
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+        config = MagicMock()
+        config.palace_path = settings.palace_path
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_add_drawer"]
+        result = tool(
+            dummy_ctx,
+            wing="w_c", room="room_c", content="test",
+            source_file=None, added_by="test",
+            session_id="session-b",  # conflicting session
+        )
+
+        assert result.get("error") == "claim_conflict"
+        assert "owner" in result
+        assert "target_id" in result
+        assert "conflict_type" in result
+        assert "suggested_action" in result
+        assert "hint" in result
+        # hint must be human-readable
+        assert "session" in result["hint"].lower() or "claim" in result["hint"].lower()

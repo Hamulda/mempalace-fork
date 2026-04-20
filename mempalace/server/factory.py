@@ -21,6 +21,7 @@ from ._kg_tools import register_kg_tools
 from ._code_tools import register_code_tools
 from ._session_tools import register_session_tools
 from ._symbol_tools import register_symbol_tools
+from ._workflow_tools import register_workflow_tools
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
@@ -84,6 +85,10 @@ def create_server(settings=None, shared_server_mode=False):
         setattr(server, "_claims_manager", claims_mgr)
         setattr(server, "_handoff_manager", handoff_mgr)
         setattr(server, "_decision_tracker", decision_tracker)
+        # Strict claim enforcement is the default for shared/HTTP server mode.
+        # This makes 6 parallel Claude Code sessions safe by default.
+        # Callers can still override via claim_mode="advisory" on individual calls.
+        setattr(server, "_shared_server_mode", True)
 
     # ── Health check ────────────────────────────────────────────────────────
     @server.custom_route("/health", methods=["GET"], name="health")
@@ -121,6 +126,7 @@ def create_server(settings=None, shared_server_mode=False):
     register_code_tools(server, backend, config, settings)
     register_session_tools(server, backend, config, settings)
     register_symbol_tools(server, backend, config, settings)
+    register_workflow_tools(server, backend, config, settings)
 
     # ── Optional reranker warmup (disabled by default — saves ~90MB RAM + ~3s startup) ──
     if settings.reranker_warmup:

@@ -9,6 +9,8 @@ crash recovery.
 
 from __future__ import annotations
 
+import atexit
+import hashlib
 import json
 import os
 import sqlite3
@@ -73,6 +75,51 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ─── Striped Lock Implementation ────────────────────────────────────────────────
+
+class _StripedLock:
+    """
+    Per-(target_type, target_id) lock for fine-grained write coordination.
+
+    Reduces contention vs. one global lock: concurrent writes to different
+    targets don't block each other. Targets on the same stripe share a lock.
+
+    M1/8GB note: only N stripe locks exist (N << number of targets), so
+    memory overhead is bounded regardless of active target count.
+    """
+
+    # Stripe count: power-of-2 so slot selection uses bitwise AND, not modulo.
+    # 16 slots gives good concurrency for 6 sessions with minimal overhead.
+    _NUM_STRIPES = 16
+
+    def __init__(self) -> None:
+        self._stripe = [threading.Lock() for _ in range(self._NUM_STRIPES)]
+
+    def _slot(self, target_type: str, target_id: str) -> int:
+        """Select lock slot from target namespace."""
+        key = f"{target_type}:{target_id}".encode("utf-8")
+        h = hashlib.sha256(key).digest()
+        return int.from_bytes(h[:4], "little") & (self._NUM_STRIPES - 1)
+
+    def lock(self, target_type: str, target_id: str) -> threading.Lock:
+        """Return the lock for a given target."""
+        return self._stripe[self._slot(target_type, target_id)]
+
+    @contextmanager
+    def hold(self, target_type: str, target_id: str):
+        """Context manager: acquire and hold the lock for the target."""
+        lock = self.lock(target_type, target_id)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WriteCoordinator
+# ─────────────────────────────────────────────────────────────────────────────
+
 class WriteCoordinator:
     """SQLite WAL-based write coordinator with claim semantics and intent journaling."""
 
@@ -81,6 +128,7 @@ class WriteCoordinator:
             palace_path = os.environ.get("MEMPALACE_PATH", ".mempalace")
         self._db_path = str(Path(palace_path) / "write_coordinator.sqlite3")
         self._write_lock = threading.Lock()
+        self._stripe_lock = _StripedLock()
         self._conn: sqlite3.Connection | None = None
         self._local = threading.local()
         self._connect()
@@ -147,7 +195,7 @@ class WriteCoordinator:
         expires = None
         if ttl_seconds is not None:
             expires = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
-        with self._write_lock:
+        with self._stripe_lock.hold(target_type, target_id):
             with self._conn_ctx() as conn:
                 cursor = conn.execute(
                     "SELECT session_id FROM claims WHERE target_type=? AND target_id=?",
@@ -179,7 +227,7 @@ class WriteCoordinator:
         self, target_type: str, target_id: str, session_id: str
     ) -> bool:
         """Release a claim. Only the owning session can release. Returns True if released."""
-        with self._write_lock:
+        with self._stripe_lock.hold(target_type, target_id):
             with self._conn_ctx() as conn:
                 cursor = conn.execute(
                     "SELECT session_id FROM claims WHERE target_type=? AND target_id=?",
@@ -266,8 +314,21 @@ class WriteCoordinator:
 
     def commit_intent(self, intent_id: int, session_id: str) -> bool:
         """Mark intent as committed. Only the originating session can commit."""
-        with self._write_lock:
+        # Read target for stripe selection — no lock held during SELECT.
+        with self._conn_ctx() as conn:
+            cursor = conn.execute(
+                "SELECT target_type, target_id FROM write_intents WHERE id=?",
+                (intent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            target_type, target_id = row[0], row[1]
+
+        # Stripe-lock to reduce contention vs. global lock.
+        with self._stripe_lock.hold(target_type, target_id):
             with self._conn_ctx() as conn:
+                # Re-check ownership inside stripe lock (double-checked locking).
                 cursor = conn.execute(
                     "SELECT session_id FROM write_intents WHERE id=?",
                     (intent_id,),
@@ -284,8 +345,21 @@ class WriteCoordinator:
 
     def rollback_intent(self, intent_id: int, session_id: str) -> bool:
         """Mark intent as rolled back. Only the originating session can rollback."""
-        with self._write_lock:
+        # Read target for stripe selection — no lock held during SELECT.
+        with self._conn_ctx() as conn:
+            cursor = conn.execute(
+                "SELECT target_type, target_id FROM write_intents WHERE id=?",
+                (intent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            target_type, target_id = row[0], row[1]
+
+        # Stripe-lock to reduce contention vs. global lock.
+        with self._stripe_lock.hold(target_type, target_id):
             with self._conn_ctx() as conn:
+                # Re-check ownership inside stripe lock.
                 cursor = conn.execute(
                     "SELECT session_id FROM write_intents WHERE id=?",
                     (intent_id,),
@@ -407,7 +481,11 @@ class WriteCoordinator:
                 return {"intents_removed": intents_removed, "claims_removed": claims_removed}
 
     def close(self) -> None:
-        """Close the connection."""
+        """Close all connections and unregister atexit."""
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            pass
         with self._write_lock:
             if self._conn is not None:
                 self._conn.close()
@@ -422,7 +500,7 @@ class WriteCoordinator:
     def __repr__(self) -> str:
         return (
             f"<WriteCoordinator db_path={self._db_path!r} "
-            f"write_lock={self._write_lock!r}>"
+            f"write_lock={self._write_lock!r} stripes={self._stripe_lock._NUM_STRIPES}>"
         )
 
     def __del__(self):
@@ -430,3 +508,15 @@ class WriteCoordinator:
             self.close()
         except Exception:
             pass
+
+    def __init__(self, palace_path: str = None):
+        if palace_path is None:
+            palace_path = os.environ.get("MEMPALACE_PATH", ".mempalace")
+        self._db_path = str(Path(palace_path) / "write_coordinator.sqlite3")
+        self._write_lock = threading.Lock()
+        self._stripe_lock = _StripedLock()
+        self._conn: sqlite3.Connection | None = None
+        self._local = threading.local()
+        self._connect()
+        self._initialize()
+        atexit.register(self.close)

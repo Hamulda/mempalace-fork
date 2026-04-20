@@ -336,8 +336,9 @@ def search_memories(
             }
         )
 
-    # Rerank: re-order using cross-encoder if query has >3 words
-    if rerank and len(hits) > 1 and len(query.split()) > 3:
+    # Rerank: re-order using cross-encoder only for complex semantic queries.
+    # Budget-aware: skip rerank for simple/path/code queries; cap shortlist size.
+    if rerank and _should_rerank(query, len(hits)):
         reranker = _get_reranker()
         if reranker is not None:
             try:
@@ -612,9 +613,78 @@ _CODE_QUERY_PATTERNS = [
 _CODE_QUERY_RE = _re.compile("|".join(_CODE_QUERY_PATTERNS), _re.IGNORECASE)
 
 
+# Query complexity tiers — used to gate expensive operations (rerank, deep retrieval).
+# Budget-aware defaults for M1 Air 8GB under concurrent sessions.
+_QUERY_COMPLEXITY_RE = _re.compile(
+    r"(?:\bdef\s+\w+|\bclass\s+\w+|\bfunction\s+\w+|\bimport\s+\w+|"
+    r"^from\s+\w+\s+import\b|\brequire\s*\(|\bexport\s+|\blet\s+\w+|"
+    r"\bconst\s+\w+|=>|\.py\b|\.js\b|\.ts\b|\.go\b|\.rs\b|\.java\b|"
+    r"\w+\(\)|\w+\.\w+\(|\b[A-Z][a-zA-Z0-9]+\s*\(|\bself\.|\bthis\.|::)",
+    _re.IGNORECASE,
+)
+
+# Path-like patterns: /component/file or file.ext — FTS5-exact, no vector needed
+_PATH_LIKE_RE = _re.compile(
+    r"(?:^|/)\.?[\w\-]+/\.?(?:[\w\-]+/?)*\.([\w\-]+)$|"  # /path/to/file.ext or file.ext
+    r"^[\w\-]+[/\\][\w\-]",                               # relative/path or relative\path
+    _re.IGNORECASE,
+)
+
+# Shortlist ceiling for rerank — keep small on M1 Air 8GB under concurrent pressure
+_RERANK_SHORTLIST_MAX = 10
+
+
+def _query_complexity(query: str) -> str:
+    """
+    Classify query into complexity tiers for retrieval budgeting.
+
+    Returns:
+      path    — path literal or file reference (e.g. src/utils/auth.py, *.py)
+      code    — code pattern detected (def, class, import, etc.)
+      simple  — short, <=3 words, no strong code signal
+      complex — semantic, >=4 words, no code signal  [rerank candidate]
+    """
+    if _PATH_LIKE_RE.search(query):
+        return "path"
+    if _CODE_QUERY_RE.search(query):
+        return "code"
+    if len(query.split()) <= 3:
+        return "simple"
+    return "complex"
+
+
+def _should_rerank(query: str, n_results: int) -> bool:
+    """
+    Decide whether to rerank for a given query + top_k.
+
+    Budget-aware: M1 Air 8GB + 6 concurrent sessions means conservative.
+    Rerank only when:
+      1. Complexity is "complex" (semantic, >=4 words)
+      2. We have enough hits to justify cross-encoder pass (> 1)
+      3. Requested shortlist fits within budget ceiling
+    """
+    if _query_complexity(query) != "complex":
+        return False
+    if n_results <= 1:
+        return False
+    if n_results > _RERANK_SHORTLIST_MAX:
+        return False
+    return True
+
+
 def is_code_query(query: str) -> bool:
     """Detect if a query looks like a code search (vs prose/memory search)."""
     return bool(_CODE_QUERY_RE.search(query))
+
+
+def is_path_query(query: str) -> bool:
+    """Detect if a query is a path literal or file reference."""
+    return bool(_PATH_LIKE_RE.search(query))
+
+
+def query_complexity(query: str) -> str:
+    """Public API for query complexity classification."""
+    return _query_complexity(query)
 
 
 def _fts5_search(
@@ -767,7 +837,6 @@ def code_search_async(
             n_results=n_results, language=language, symbol_name=symbol_name,
             file_path=file_path, include_prose=include_prose)
     )
-
 # Auto-routing: detect query type and route to appropriate specialized search
 def auto_search(
     query: str,
@@ -778,12 +847,37 @@ def auto_search(
     Automatically detect query type and route to appropriate search path.
 
     Detection rules:
-    - code-like query pattern → code_search()
-    - Otherwise → hybrid_search() (general search)
+    - path-like query &rarr; FTS5-only path lookup (no vector, no rerank)
+    - code-like query pattern &rarr; code_search() (vector + FTS5)
+    - Otherwise &rarr; hybrid_search() (semantic + FTS5 + KG)
 
-    This is the recommended entry point for Claude Code — it handles routing automatically.
+    Rerank is only applied to complex semantic queries via _should_rerank().
+
+    This is the recommended entry point for Claude Code &mdash; it handles routing automatically.
     """
-    if is_code_query(query):
+    complexity = _query_complexity(query)
+    if complexity == "path":
+        # Path queries get FTS5-only (exact, no vector, no rerank)
+        try:
+            cfg = MempalaceConfig()
+            backend = get_backend(cfg.backend)
+            collection_name = cfg.collection_name
+            col = backend.get_collection(palace_path, collection_name, create=False)
+            fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results)
+            if fts5_hits:
+                return {
+                    "query": query,
+                    "filters": {"complexity": complexity},
+                    "results": fts5_hits[:n_results],
+                    "sources": {"fts5": len(fts5_hits)},
+                }
+        except Exception:
+            pass
+        # Fall back to code_search if FTS5 finds nothing
+        return code_search(query, palace_path, n_results=n_results)
+    elif complexity == "code":
         return code_search(query, palace_path, n_results=n_results)
     else:
+        # simple or complex &mdash; use hybrid_search, rerank decision deferred there
         return hybrid_search(query, palace_path, n_results=n_results)
+

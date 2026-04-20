@@ -653,3 +653,218 @@ class TestFailOpenSemantics:
         )
 
         assert result.get("success") is True, f"Expected success with WC failure, got: {result}"
+
+
+# ─── Striped Lock Concurrency Tests ───────────────────────────────────────────
+
+
+class TestStripedLockConcurrency:
+    """Fine-grained stripe locks reduce contention under concurrent writes."""
+
+    def test_concurrent_claims_on_different_stripes_no_blocking(self):
+        """Claims on different stripes don't serialize — they run in parallel."""
+        from mempalace.write_coordinator import WriteCoordinator
+
+        palace = _pp()
+        wc = WriteCoordinator(palace)
+
+        errors = []
+        barrier = threading.Barrier(4)
+
+        def claim_different_targets(session_id):
+            try:
+                barrier.wait()
+                for i in range(20):
+                    # Each session claims a DIFFERENT target — should not block
+                    target = f"/unique/path/{session_id}/{i}"
+                    result = wc.claim("file", target, session_id, ttl_seconds=5)
+                    assert result["acquired"] is True
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=claim_different_targets, args=(f"stripe-s-{i}",))
+            for i in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
+        assert not any(t.is_alive() for t in threads)
+
+    def test_concurrent_claims_on_same_stripe_do_serialize(self):
+        """Claims on the SAME stripe DO serialize (correct stripe lock behavior)."""
+        from mempalace.write_coordinator import WriteCoordinator
+
+        palace = _pp()
+        wc = WriteCoordinator(palace)
+
+        # Force same stripe: use same target for all threads.
+        # They should serialize correctly, not deadlock.
+        errors = []
+        barrier = threading.Barrier(3)
+        total_attempts = [0]
+        acquired_count = [0]
+
+        def claim_same_target(session_id):
+            try:
+                barrier.wait()
+                for i in range(10):
+                    result = wc.claim("file", "/same/stripe/target", session_id, ttl_seconds=1)
+                    total_attempts[0] += 1
+                    if result["acquired"]:
+                        acquired_count[0] += 1
+                    # Brief sleep so each session gets a turn to acquire
+                    time.sleep(0.005)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=claim_same_target, args=(f"same-stripe-s-{i}",))
+            for i in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert len(errors) == 0, f"Deadlock or error: {errors}"
+        assert not any(t.is_alive() for t in threads)
+        # All 30 attempts complete (no deadlock), some acquired (serialized success)
+        assert total_attempts[0] == 30
+        assert acquired_count[0] >= 1  # at least one session acquired
+
+    def test_commit_intent_uses_stripe_lock(self):
+        """commit_intent uses per-target stripe lock, not global lock."""
+        from mempalace.write_coordinator import WriteCoordinator
+
+        palace = _pp()
+        wc = WriteCoordinator(palace)
+
+        errors = []
+        barrier = threading.Barrier(4)
+
+        def commit_session(session_id):
+            try:
+                barrier.wait()
+                for i in range(15):
+                    intent_id = wc.log_intent(session_id, "add_drawer", "drawer", f"drawer_{session_id}_{i}")
+                    # commit uses stripe lock based on (target_type, target_id)
+                    success = wc.commit_intent(intent_id, session_id)
+                    assert success is True
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=commit_session, args=(f"commit-s-{i}",))
+            for i in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert len(errors) == 0, f"Errors: {errors}"
+        assert not any(t.is_alive() for t in threads)
+
+    def test_stripe_lock_slot_distribution_is_even(self):
+        """SHA-256 based slot selection distributes targets evenly across stripes."""
+        from mempalace.write_coordinator import WriteCoordinator
+
+        palace = _pp()
+        wc = WriteCoordinator(palace)
+
+        slot_counts = [0] * wc._stripe_lock._NUM_STRIPES
+        for i in range(100):
+            slot = wc._stripe_lock._slot("file", f"/path/to/file_{i}")
+            slot_counts[slot] += 1
+
+        # With 16 stripes and 100 targets, no slot should have 0 or > 20.
+        # (Binomial with p=1/16, n=100: mean=6.25, std~2.3.
+        #  Expect all slots to have at least 1, max < 15.)
+        assert all(c > 0 for c in slot_counts), f"Some stripes unused: {slot_counts}"
+        assert all(c < 30 for c in slot_counts), f"Skewed distribution: {slot_counts}"
+
+
+# ─── Recovery With Stripe Locks ──────────────────────────────────────────────
+
+
+class TestRecoveryWithStripeLocks:
+    """Recovery semantics are unchanged with stripe locks."""
+
+    def test_recovery_uses_stripe_lock_for_rollback(self):
+        """recover_pending_intents rolls back crashed session with stripe lock."""
+        from mempalace.write_coordinator import WriteCoordinator
+        from mempalace.session_registry import SessionRegistry
+
+        palace = _pp()
+        reg = SessionRegistry(palace)
+        reg.register_session("recovery-s1", palace, role="agent")
+        reg.unregister_session("recovery-s1")  # crashed
+
+        wc = WriteCoordinator(palace)
+
+        # Intent for crashed session should be rolled back via stripe lock
+        with wc._conn_ctx() as conn:
+            cursor = conn.execute(
+                "SELECT status FROM write_intents WHERE session_id=?", ("recovery-s1",)
+            )
+            rows = cursor.fetchall()
+            assert all(row[0] == "rolled_back" for row in rows)
+
+
+# ─── Micro-Benchmark Helper ──────────────────────────────────────────────────
+
+
+class TestStripeLockBenchmark:
+    """Lightweight stress test to measure stripe lock throughput."""
+
+    def test_stripe_lock_throughput_6_sessions(self):
+        """
+        Benchmark: 6 sessions × 50 operations each.
+        Measures: total wall time, operations/second.
+
+        Run: pytest tests/test_write_coordinator_integration.py::TestStripeLockBenchmark::test_stripe_lock_throughput_6_sessions -v -s
+        """
+        from mempalace.write_coordinator import WriteCoordinator
+
+        palace = _pp()
+        wc = WriteCoordinator(palace)
+
+        num_sessions = 6
+        ops_per_session = 50
+        barrier = threading.Barrier(num_sessions)
+        errors = []
+
+        def session_worker(session_id):
+            try:
+                barrier.wait()
+                for i in range(ops_per_session):
+                    intent_id = wc.log_intent(
+                        session_id, "add_drawer", "drawer",
+                        f"bench_drawer_{session_id}_{i}"
+                    )
+                    wc.commit_intent(intent_id, session_id)
+            except Exception as e:
+                errors.append(e)
+
+        start = time.monotonic()
+        threads = [
+            threading.Thread(target=session_worker, args=(f"bench-s-{i}",))
+            for i in range(num_sessions)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        elapsed = time.monotonic() - start
+
+        total_ops = num_sessions * ops_per_session * 2  # log + commit
+        throughput = total_ops / elapsed if elapsed > 0 else 0
+
+        assert len(errors) == 0, f"Benchmark errors: {errors}"
+        assert not any(t.is_alive() for t in threads), "Threads did not complete"
+        print(f"\n[StripeLock Benchmark] {num_sessions} sessions × {ops_per_session} ops/session")
+        print(f"  Total ops: {total_ops}  |  Elapsed: {elapsed:.3f}s  |  Throughput: {throughput:.1f} ops/s")

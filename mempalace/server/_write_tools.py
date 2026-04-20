@@ -8,35 +8,70 @@ from pathlib import Path
 from fastmcp import Context
 
 
-def _claim_check(server, target_id: str, session_id: str | None, mode: str = "advisory") -> dict | None:
+def _is_shared_server_mode(server) -> bool:
+    """Check if shared server mode is enabled.
+
+    Uses isinstance(bool) to distinguish actual True from MagicMock auto-created
+    attributes (which are MagicMock instances, not bool). This matters in tests
+    where MagicMock auto-creates attributes on access.
+    """
+    val = getattr(server, "_shared_server_mode", False)
+    return isinstance(val, bool) and val is True
+
+
+def _claim_check(server, target_id: str, session_id: str | None, mode: str | None = None) -> dict | None:
     """
     Check claim before a write operation.
 
     Returns None (proceed) if:
       - no ClaimsManager available (non-shared mode) — fail open
-      - session_id is None — advisory only, no session identity
-      - mode=advisory — warn on conflict but allow write
-      - session_id owns the target — proceed
+      - session_id is None — fail open, no session identity to correlate
+      - no active conflict on the target
+      - session_id owns the target claim — proceed
 
     Returns an error dict (block) only when:
-      - mode=strict AND another session holds an active claim on target_id
+      - mode=strict AND another session holds an active claim
+
+    SHARED SERVER MODE DEFAULT: In shared server mode (HTTP transport or
+    shared_server_mode=True), the effective default is strict enforcement.
+    This makes 6 parallel Claude Code sessions safe by default. Callers can
+    still override with claim_mode="advisory" on individual calls to get the
+    old advisory behavior (warn but allow write).
     """
     if session_id is None:
         return None  # No session identity — fail open
     claims_mgr = getattr(server, "_claims_manager", None)
     if claims_mgr is None:
         return None  # Non-shared mode — no coordination available
+
     conflict = claims_mgr.check_conflicts("file", target_id, session_id)
     if not conflict.get("has_conflict"):
         return None  # No active conflict
     if conflict.get("is_self"):
         return None  # Self holds the claim — proceed
-    if mode == "strict":
+
+    # Determine effective enforcement mode:
+    # - In shared server mode: strict by default, advisory opt-out only when explicitly passed
+    # - Non-shared mode: advisory default (backward compatible)
+    shared_mode = _is_shared_server_mode(server)
+    if shared_mode:
+        # Shared mode: strict unless caller explicitly said advisory
+        effective_mode = "strict" if mode != "advisory" else "advisory"
+    elif mode == "strict":
+        effective_mode = "strict"
+    else:
+        effective_mode = "advisory"
+
+    if effective_mode == "strict":
         return {
             "error": "claim_conflict",
             "owner": conflict["owner"],
             "target_id": target_id,
-            "hint": "Another session holds an active claim. Wait for TTL expiry or request handoff.",
+            "conflict_type": "active_claim",
+            "suggested_action": "wait_for_handoff_or_expiry",
+            "retry_after_seconds": 60,
+            "hint": f"Session '{conflict['owner']}' holds an active claim on {target_id}. "
+                    f"Wait ~60s for TTL expiry or request a handoff from that session.",
         }
     # advisory — warn but allow write; return warning dict so caller surfaces it
     return {
@@ -44,6 +79,8 @@ def _claim_check(server, target_id: str, session_id: str | None, mode: str = "ad
         "owner": conflict["owner"],
         "target_id": target_id,
         "message": f"Proceeding with write despite active claim by {conflict['owner']} on {target_id}.",
+        "conflict_type": "active_claim",
+        "suggested_action": "surface_warning_to_user",
     }
 
 
@@ -112,7 +149,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         source_file: str | None = None,
         added_by: str = "mcp",
         session_id: str | None = None,
-        claim_mode: str = "advisory",
+        claim_mode: str | None = None,
     ) -> dict:
         try:
             wing = sanitize_name(wing, "wing")
@@ -127,10 +164,15 @@ def register_write_tools(server, backend, config, settings, memory_guard):
 
         drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content[:100]).encode()).hexdigest()[:24]}"
 
-        if claim_mode not in ("advisory", "strict"):
-            claim_mode = "advisory"
+        # None = caller didn't specify; shared mode will upgrade to strict
+        if claim_mode is None and _is_shared_server_mode(server):
+            effective_mode = "strict"
+        elif claim_mode is not None:
+            effective_mode = claim_mode
+        else:
+            effective_mode = "advisory"
         target_id = f"{settings.palace_path}/{wing}/{room}"
-        claim_err = _claim_check(server, target_id, session_id, claim_mode)
+        claim_err = _claim_check(server, target_id, session_id, effective_mode)
         claim_warning = None
         if claim_err:
             if "error" in claim_err:
@@ -213,7 +255,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         ctx: Context,
         drawer_id: str,
         session_id: str | None = None,
-        claim_mode: str = "advisory",
+        claim_mode: str | None = None,
     ) -> dict:
         col = _get_collection()
         if not col:
@@ -224,9 +266,13 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
         deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
 
-        if claim_mode not in ("advisory", "strict"):
-            claim_mode = "advisory"
-        claim_err = _claim_check(server, drawer_id, session_id, claim_mode)
+        if claim_mode is None and _is_shared_server_mode(server):
+            effective_mode = "strict"
+        elif claim_mode is not None:
+            effective_mode = claim_mode
+        else:
+            effective_mode = "advisory"
+        claim_err = _claim_check(server, drawer_id, session_id, effective_mode)
         claim_warning = None
         if claim_err:
             if "error" in claim_err:
@@ -261,7 +307,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         entry: str,
         topic: str = "general",
         session_id: str | None = None,
-        claim_mode: str = "advisory",
+        claim_mode: str | None = None,
     ) -> dict:
         try:
             agent_name = sanitize_name(agent_name, "agent_name")
@@ -276,10 +322,14 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         now = datetime.now()
         entry_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}_{hashlib.sha256(entry[:50].encode()).hexdigest()[:12]}"
 
-        if claim_mode not in ("advisory", "strict"):
-            claim_mode = "advisory"
+        if claim_mode is None and _is_shared_server_mode(server):
+            effective_mode = "strict"
+        elif claim_mode is not None:
+            effective_mode = claim_mode
+        else:
+            effective_mode = "advisory"
         target_id = f"{settings.palace_path}/{wing}/{room}"
-        claim_err = _claim_check(server, target_id, session_id, claim_mode)
+        claim_err = _claim_check(server, target_id, session_id, effective_mode)
         claim_warning = None
         if claim_err:
             if "error" in claim_err:
@@ -377,7 +427,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         line_end: int | None = None,
         symbol_name: str | None = None,
         session_id: str | None = None,
-        claim_mode: str = "advisory",
+        claim_mode: str | None = None,
     ) -> dict:
         try:
             wing = sanitize_name(wing, "wing")
@@ -391,10 +441,14 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             return _no_palace()
         drawer_id = f"code_{wing}_{room}_{hashlib.sha256((wing + room + description[:100]).encode()).hexdigest()[:24]}"
 
-        if claim_mode not in ("advisory", "strict"):
-            claim_mode = "advisory"
+        if claim_mode is None and _is_shared_server_mode(server):
+            effective_mode = "strict"
+        elif claim_mode is not None:
+            effective_mode = claim_mode
+        else:
+            effective_mode = "advisory"
         target_id = f"{settings.palace_path}/{wing}/{room}"
-        claim_err = _claim_check(server, target_id, session_id, claim_mode)
+        claim_err = _claim_check(server, target_id, session_id, effective_mode)
         claim_warning = None
         if claim_err:
             if "error" in claim_err:
@@ -465,7 +519,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         merge: bool = False,
         threshold: float = 0.85,
         session_id: str | None = None,
-        claim_mode: str = "advisory",
+        claim_mode: str | None = None,
     ) -> dict:
         col = _get_collection()
         if not col:
@@ -498,10 +552,14 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             consolidate_intent_id = None
             if merge and len(duplicates) > 1:
                 # Enforce claim before any write (delete) in merge path.
-                if claim_mode not in ("advisory", "strict"):
-                    claim_mode = "advisory"
+                if claim_mode is None and _is_shared_server_mode(server):
+                    effective_mode = "strict"
+                elif claim_mode is not None:
+                    effective_mode = claim_mode
+                else:
+                    effective_mode = "advisory"
                 consolidate_target = f"{settings.palace_path}/_consolidate/{topic}"
-                claim_err = _claim_check(server, consolidate_target, session_id, claim_mode)
+                claim_err = _claim_check(server, consolidate_target, session_id, effective_mode)
                 claim_warning = None
                 if claim_err:
                     if "error" in claim_err:
