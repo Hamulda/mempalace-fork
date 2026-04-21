@@ -3,94 +3,75 @@ skill: after-edit
 trigger: after completing an edit
 ---
 
-# After Edit — Release, Log, and Update Index
+# After Edit — Use finish_work or publish_handoff
 
-After completing an edit, follow this protocol:
-
-## Step 1: Release the Claim
-
-When done editing, release the claim:
-```
-mempalace_release_claim(path="/path/to/file.py", session_id="your-session-id")
-```
-
-Note: Claims do NOT auto-expire at TTL — you must release explicitly.
-
-## Step 2: Re-index Symbols (if file changed)
-
-If the file contains new or modified functions/classes, update the symbol index:
-```
-# The symbol index is automatically updated on mine,
-# but for immediate clarity:
-mempalace_file_symbols(file_path="/path/to/file.py")
-```
-
-This ensures other sessions can find the new symbols immediately.
-
-## Step 3: Log to Diary
-
-Record what was changed:
-```
-mempalace_diary_write(
-  agent_name="YourName",
-  entry="Fixed session expiry bug in auth.py. Changed token refresh from 30min to 24h.",
-  topic="bug-fix"
+For single-file changes:
+```python
+mempalace_finish_work(
+    path="/src/auth.py",
+    diary_entry="Fixed session expiry bug. Changed token refresh from 30min to 24h.",
+    topic="bug-fix",
+    agent_name="Claude"
 )
 ```
 
-## Step 4: Check Recent Changes Impact
-
-If the file is a hot spot (frequently changed), note it:
-```
-mempalace_recent_changes(project_root="/path", n=5)
-```
-This helps you track change frequency for future context.
-
-## Step 5: Check Architectural Decisions
-
-If the change was architectural (not just a bug fix), capture the decision:
-```
-mempalace_capture_decision(
-  session_id="your-session-id",
-  decision="Changed token refresh from 30min to 24h for security",
-  rationale="Shorter refresh windows reduce token theft window",
-  alternatives=["Keep 30min with rotation", "Use hardware keys"],
-  category="security",
-  confidence=4
+For multi-file changes or when handing off to another session:
+```python
+mempalace_publish_handoff(
+    summary="Refactored auth module to use JWT instead of sessions",
+    touched_paths=["/src/auth.py", "/src/token.py", "/src/middleware.py"],
+    blockers=["Need to update API docs for new token format"],
+    next_steps=["Update API docs", "Add integration tests for JWT rotation"],
+    priority="high"
 )
 ```
 
-## Step 6: Push Handoff if Scope > Single File
+## Why not the low-level steps?
 
-If the change affects multiple files or requires context for the next session:
+- `finish_work` **writes the diary immediately** — no separate `mempalace_diary_write` call needed
+- `publish_handoff` is **atomic** — claims are released ONLY if the handoff is created successfully
+- The low-level sequence (`release_claim` then `diary_write`) leaves orphaned claims if the diary write fails
+- Both workflow tools return structured `workflow_state` with `next_tool` and `handoff_pending`
+
+## When finish_work succeeds
+
+```json
+{
+  "ok": true,
+  "workflow_state": {
+    "current_phase": "finished",
+    "next_phase": null,
+    "next_tool": null,
+    "conflict_status": "none",
+    "handoff_pending": false
+  },
+  "claim_released": true,
+  "diary_id": "diary_wing_claude_20260420_193000_abc123"
+}
 ```
-mempalace_push_handoff(
-  from_session_id="your-session-id",
-  summary="Refactored auth module — moved token handling to separate class",
-  touched_paths=["src/auth.py", "src/token.py", "tests/test_auth.py"],
-  blockers=[],
-  next_steps=["Update API docs", "Add integration tests for token rotation"],
-  confidence=4,
-  priority="normal"
-)
+
+**Diary is written immediately** — no follow-up call needed. The `diary_id` is returned in the result.
+
+## When publish_handoff succeeds
+
+```json
+{
+  "ok": true,
+  "workflow_state": {
+    "current_phase": "published",
+    "next_phase": null,
+    "next_tool": "mempalace_diary_write",
+    "handoff_pending": false
+  },
+  "handoff_id": "handoff_42",
+  "released_claims": [...]
+}
 ```
 
-## Decision Relevance for Next Sessions
+**Next step**: write a diary entry with `mempalace_diary_write` to log the completed work.
 
-When you capture a decision, include file context:
-```
-rationale="Changed token refresh from 30min to 24h — affects /src/auth.py token handling"
-```
+## Only use low-level tools when:
 
-This makes `mempalace_list_decisions` more useful for takeover sessions.
-
-## When NOT to Push Handoff
-- Single file, isolated change
-- Bug fix with no context needed
-- Trivial refactor (renaming, formatting)
-
-## When TO Push Handoff
-- Multi-file refactor
-- Architectural change requiring explanation
-- Work that another session should continue
-- Knowledge that would be lost if session dies
+- You need to **release without diary or decision capture** (use `mempalace_release_claim` directly)
+- You want **manual control over claim release ordering** for multi-file changes
+- You need to **diagnose** which step in the workflow failed

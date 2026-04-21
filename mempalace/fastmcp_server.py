@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
 """
-MemPalace FastMCP Server — backward-compatibility shim.
-=======================================================
-All tools are now in mempalace/server/. This file re-exports the public API
+MemPalace FastMCP Server — canonical entry point.
+==================================================
+All tools live in mempalace/server/. This file re-exports the public API
 so existing imports (e.g. from mempalace.fastmcp_server import create_server)
 continue to work without changes.
+
+TRANSPORT CONTRACT
+-------------------
+Canonical multi-session HTTP path (6× Claude Code parallel sessions):
+    mcp = create_server(shared_server_mode=True)
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=8765)
+
+Stdio path (single-session / dev):
+    mcp = create_server()
+    mcp.run()   # stdio transport
+
+DEPRECATED serve_http():
+    serve_http() is a backward-compat shim that redirects to the canonical
+    streamable-http path above. The legacy Starlette+Uvicorn wrapper it once
+    contained is removed — it was NOT FastMCP's streamable-http protocol.
+    Do NOT use serve_http() in new code.
 
 Install: claude mcp add mempalace -- python -m mempalace.fastmcp_server [--palace /path/to/palace]
 """

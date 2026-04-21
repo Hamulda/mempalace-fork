@@ -29,10 +29,34 @@ logger = logging.getLogger("mempalace_mcp")
 
 def create_server(settings=None, shared_server_mode=False):
     """
-    Factory — vytvoří izolovanou FastMCP instanci.
+    Canonical server factory — creates an isolated FastMCP instance.
 
-    Použití v produkci: mcp = create_server()
-    Použití v testech:  mcp = create_server(settings=test_settings)
+    TRANSPORT CONTRACT
+    ------------------
+    HTTP / multi-session (canonical for 6× parallel Claude Code):
+        mcp = create_server(shared_server_mode=True)
+        mcp.run(transport="streamable-http", host="127.0.0.1", port=8765)
+
+        shared_server_mode=True OR settings.transport="http" activates:
+        - SessionRegistry, WriteCoordinator, ClaimsManager,
+          HandoffManager, DecisionTracker
+        - These make 6 parallel sessions safe (claim enforcement, WAL-coordinated writes)
+
+    Stdio / single-session (dev / one-shot):
+        mcp = create_server()
+        mcp.run()
+
+        No session coordinators are initialized. Tools that require shared
+        server mode return an error with an actionable hint.
+
+    Parameters
+    ----------
+    settings : MemPalaceSettings, optional
+        Defaults to MemPalaceSettings() with env-var overrides.
+    shared_server_mode : bool, optional
+        Force session coordinators on regardless of settings.transport.
+        Use this when starting the HTTP server from CLI (cmd_serve) to ensure
+        coordinators are available even if settings.transport is misconfigured.
     """
     from ..settings import MemPalaceSettings
     from ..config import MempalaceConfig
@@ -63,7 +87,10 @@ def create_server(settings=None, shared_server_mode=False):
     # ── Status cache — per-server-instance ──────────────────────────────────
     server._status_cache = make_status_cache()
 
-    # ── Session coordinators (shared_server_mode or HTTP transport) ──────
+    # ── Session coordinators (shared_server_mode=True OR transport='http') ─
+    # Both gates activate the same coordinators. shared_server_mode is the
+    # explicit flag; settings.transport=="http" covers the __main__ path when
+    # the user sets MEMPALACE_TRANSPORT=http.
     if shared_server_mode or settings.transport == "http":
         from ..session_registry import SessionRegistry
         from ..write_coordinator import WriteCoordinator
@@ -108,6 +135,17 @@ def create_server(settings=None, shared_server_mode=False):
                 pattern="*.md",
                 uri="mempalace://skills/",
             ))
+            # Workflow guide as a dedicated entry point (first doc to read)
+            workflow_guide_path = skills_path / "workflow-guide.md"
+            if workflow_guide_path.exists():
+                from fastmcp.resources import FileResource
+                server.add_resource(FileResource(
+                    name="workflow_guide",
+                    title="Workflow-First Guide",
+                    description="Start here: recommended tool sequence for editing, handoff, and takeover",
+                    path=str(workflow_guide_path),
+                    uri="mempalace://workflow-guide",
+                ))
     except Exception:
         pass
 

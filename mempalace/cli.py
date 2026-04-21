@@ -566,12 +566,19 @@ def _run_embed_benchmark():
 
 
 def cmd_serve(args):
-    """Run MemPalace MCP server over HTTP."""
-    os.environ["MEMPALACE_TRANSPORT"] = "http"
-    os.environ["MEMPALACE_HTTP_HOST"] = args.host
-    os.environ["MEMPALACE_HTTP_PORT"] = str(args.port)
-    from .server.factory import serve_http
-    serve_http(host=args.host, port=args.port)
+    """Run MemPalace MCP server over HTTP — canonical streamable-http transport.
+
+    Single-session / dev mode: omit --serve or use stdio.
+    Multi-session (Claude Code coordination): use --serve, which activates
+    SessionRegistry, WriteCoordinator, ClaimsManager, HandoffManager, and
+    DecisionTracker on a shared streamable-http server.
+
+    Canonical transport: FastMCP streamable-http (NOT a custom Starlette wrapper).
+    All sessions connect to the same /mcp endpoint on the shared server.
+    """
+    from .server.factory import create_server
+    mcp = create_server(shared_server_mode=True)
+    mcp.run(transport="streamable-http", host=args.host, port=args.port)
 
 
 def cmd_optimize(args):
@@ -783,7 +790,7 @@ def cmd_setup(args):
             _install_launchd_plist(
                 label="ai.mempalace.mcp-server",
                 program=[sys.executable, "-m", "mempalace", "serve", "--port", port],
-                env={"MEMPALACE_TRANSPORT": "http", "MEMPALACE_HTTP_PORT": port},
+                env={"MEMPALACE_TRANSPORT": "http"},
                 log_prefix="mempalace-mcp",
             )
             print(f"HTTP MCP server installed on port {port}")
@@ -1337,7 +1344,7 @@ def main():
     # serve (HTTP MCP server)
     p_serve = sub.add_parser(
         "serve",
-        help="Run MemPalace MCP server over HTTP (requires MEMPALACE_TRANSPORT=http)",
+        help="Run MemPalace MCP server over HTTP (canonical streamable-http transport)",
     )
     p_serve.add_argument(
         "--host",

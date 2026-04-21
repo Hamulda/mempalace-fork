@@ -5,7 +5,20 @@ trigger: when doing a handoff to another session
 
 # Handoff Protocol
 
-When you need to hand off work to another session, use this protocol.
+## When to Use Which
+
+**Primary (use almost always):**
+- `mempalace_publish_handoff` — atomic handoff + release all claims in one call
+
+**Expert (only when primary won't do):**
+- `mempalace_push_handoff` — create handoff without releasing claims
+- `mempalace_release_claim` — release individual claims separately
+- `mempalace_complete_handoff` — mark handoff done without publish flow
+
+**Why prefer publish_handoff?**
+- Atomic: claims released ONLY if handoff is created
+- Simpler: one call instead of two
+- Structured: returns `workflow_state` with `next_tool = mempalace_diary_write`
 
 ## When to Handoff
 

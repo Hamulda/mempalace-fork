@@ -36,7 +36,8 @@ from ._session_tools import _require_session_id, _optional_session_id, _get_sess
 # ────────────────────────────────────────────────────────────────────────────────
 
 def _ok(phase: str, action: str, data: dict, next_actions: list[dict],
-        context_snippets: dict | None = None, failure_mode: str | None = None) -> dict:
+        context_snippets: dict | None = None, failure_mode: str | None = None,
+        workflow_state: dict | None = None) -> dict:
     """Build a success workflow_result."""
     return {
         "ok": True,
@@ -46,11 +47,14 @@ def _ok(phase: str, action: str, data: dict, next_actions: list[dict],
         "next_actions": next_actions,
         "failure_mode": failure_mode,
         "context_snippets": context_snippets or {},
+        "workflow_state": workflow_state or {},
     }
 
 
 def _fail(phase: str, action: str, reason: str, hint: str,
-          failure_mode: str, details: dict | None = None) -> dict:
+          failure_mode: str, details: dict | None = None,
+          workflow_state: dict | None = None,
+          next_actions: list[dict] | None = None) -> dict:
     """Build an error workflow_result."""
     return {
         "ok": False,
@@ -60,6 +64,8 @@ def _fail(phase: str, action: str, reason: str, hint: str,
         "hint": hint,
         "failure_mode": failure_mode,
         "details": details or {},
+        "workflow_state": workflow_state or {},
+        "next_actions": next_actions or [],
     }
 
 
@@ -93,6 +99,13 @@ def _do_begin_work(
                 reason="session coordination not available",
                 hint="Run with shared_server_mode=True or transport='http'",
                 failure_mode="no_coordination",
+                workflow_state={
+                    "current_phase": "unavailable",
+                    "next_phase": None,
+                    "next_tool": None,
+                    "conflict_status": "unknown",
+                    "handoff_pending": False,
+                },
             ),
             False,
             {},
@@ -116,6 +129,18 @@ def _do_begin_work(
                     "expires_at": conflict.get("expires_at"),
                     "target_id": path,
                 },
+                workflow_state={
+                    "current_phase": "blocked",
+                    "next_phase": "negotiate",
+                    "next_tool": "mempalace_push_handoff",
+                    "conflict_status": "other_claim",
+                    "handoff_pending": False,
+                },
+                next_actions=[{
+                    "action": "mempalace_push_handoff",
+                    "reason": "File claimed by another session — negotiate or wait for TTL expiry",
+                    "priority": "high",
+                }],
             ),
             False,
             conflict,
@@ -134,6 +159,13 @@ def _do_begin_work(
                 hint="Check MEMPALACE_SESSION_ID is set and TTL is valid",
                 failure_mode="claim_acquire_failed",
                 details={"claim_result": claim_result},
+                workflow_state={
+                    "current_phase": "blocked",
+                    "next_phase": "retry",
+                    "next_tool": "mempalace_begin_work",
+                    "conflict_status": "unknown",
+                    "handoff_pending": False,
+                },
             ),
             False,
             conflict,
@@ -151,6 +183,7 @@ def _do_begin_work(
 
     owner = claim_result.get("owner") or session_id
     expires_at = claim_result.get("expires_at", "unknown")
+    is_self = bool(conflict.get("is_self"))
 
     data = {
         "path": path,
@@ -167,6 +200,7 @@ def _do_begin_work(
             "action": "mempalace_prepare_edit",
             "reason": "Get symbol context and recent changes before editing",
             "priority": "high",
+            "skill": "prepare-edit",
         },
     ]
 
@@ -177,6 +211,13 @@ def _do_begin_work(
             data,
             next_actions,
             context_snippets={"path": path, "note": note or ""},
+            workflow_state={
+                "current_phase": "claim_acquired",
+                "next_phase": "prepare",
+                "next_tool": "mempalace_prepare_edit",
+                "conflict_status": "self_claim" if is_self else "none",
+                "handoff_pending": False,
+            },
         ),
         True,
         conflict,
@@ -194,16 +235,54 @@ def _do_prepare_edit(
     palace_path: str,
     project_root: str | None,
     symbol_index,
+    claims_mgr,
 ) -> dict:
     """
-    Internal: get file symbols + recent changes for a path.
+    Internal: file_symbols + recent_changes + auto conflict_check.
 
-    Returns (workflow_result, symbols_data).
+    Combines prepare_edit with conflict_check in one call — the model
+    gets symbol context AND verification that no concurrent edit is in progress,
+    without a separate explicit conflict_check call.
     """
     snippets = {}
     next_actions_list = []
 
-    # Symbols
+    # Step 1: Auto conflict check (critical for hot spots)
+    conflict_info = {}
+    if claims_mgr:
+        conflict_info = claims_mgr.check_conflicts("file", path, session_id or "")
+        if conflict_info.get("has_conflict") and not conflict_info.get("is_self"):
+            # File is actively claimed by another session
+            return (
+                _fail(
+                    _phase("prepare_edit", "conflict_check"),
+                    "prepare_edit",
+                    reason=f"Active claim held by '{conflict_info.get('owner')}'",
+                    hint=f"Wait for TTL expiry ({conflict_info.get('expires_at', 'unknown')}) "
+                         "or negotiate via mempalace_push_handoff before editing",
+                    failure_mode="claim_conflict",
+                    details={
+                        "owner": conflict_info.get("owner"),
+                        "expires_at": conflict_info.get("expires_at"),
+                        "target_id": path,
+                    },
+                    workflow_state={
+                        "current_phase": "blocked",
+                        "next_phase": "negotiate",
+                        "next_tool": "mempalace_push_handoff",
+                        "conflict_status": "other_claim",
+                        "handoff_pending": False,
+                    },
+                    next_actions=[{
+                        "action": "mempalace_push_handoff",
+                        "reason": "File claimed by another session — negotiate or wait for TTL expiry",
+                        "priority": "high",
+                    }],
+                ),
+                {},
+            )
+
+    # Step 2: Symbols
     symbols_data = {}
     try:
         if symbol_index and path:
@@ -214,18 +293,14 @@ def _do_prepare_edit(
                     {"name": s["name"], "type": s.get("type", "?"), "line": s.get("line_start", 0)}
                     for s in sym_entries[:8]
                 ]
-                next_actions_list.append({
-                    "action": "mempalace_search",
-                    "reason": f"Search {path} content before editing",
-                    "priority": "medium",
-                })
             else:
                 snippets["symbols"] = []
     except Exception:
         symbols_data = {}
 
-    # Recent changes for this specific file
+    # Step 3: Recent changes / hot spot detection
     recent_info = {}
+    hotspot_detected = False
     try:
         if project_root:
             from ..recent_changes import get_recent_changes
@@ -233,25 +308,36 @@ def _do_prepare_edit(
             file_changes = [c for c in changes if c.get("file_path") == path or c.get("abs_path") == path]
             if file_changes:
                 recent_info = file_changes[0]
+                hotspot_detected = recent_info.get("change_count", 0) >= 3
                 snippets["recent_change"] = {
                     "file_path": path,
                     "change_count": recent_info.get("change_count", 1),
                     "last_modified": recent_info.get("last_modified"),
                 }
-                next_actions_list.append({
-                    "action": "mempalace_conflict_check",
-                    "reason": f"Hot file changed {recent_info.get('change_count', 1)}x recently — verify no concurrent edit",
-                    "priority": "high",
-                })
     except Exception:
         pass
+
+    # Step 4: Build next_actions
+    if hotspot_detected:
+        next_actions_list.append({
+            "action": "mempalace_search",
+            "reason": f"Hot file (≥3 changes) — understand current content before editing",
+            "priority": "high",
+        })
+    else:
+        next_actions_list.append({
+            "action": "mempalace_search",
+            "reason": f"Search {path} content before editing",
+            "priority": "medium",
+        })
 
     data = {
         "path": path,
         "session_id": session_id,
         "symbols_count": len(snippets.get("symbols", [])),
         "recent_change": recent_info,
-        "hotspot": recent_info.get("change_count", 0) >= 3 if recent_info else False,
+        "hotspot": hotspot_detected,
+        "conflict_verified": True,
     }
 
     return (
@@ -261,6 +347,13 @@ def _do_prepare_edit(
             data,
             next_actions_list,
             context_snippets=snippets,
+            workflow_state={
+                "current_phase": "context_ready",
+                "next_phase": "edit",
+                "next_tool": "MODEL_ACTION:edit",
+                "conflict_status": "hotspot" if hotspot_detected else "none",
+                "handoff_pending": False,
+            },
         ),
         symbols_data,
     )
@@ -283,11 +376,12 @@ def _do_finish_work(
     decision_confidence: int,
     claims_mgr,
     decision_tracker,
+    backend,
 ) -> dict:
     """
-    Internal: release claim + optional diary + optional decision capture.
+    Internal: release claim + optional diary write + optional decision capture.
 
-    Returns workflow_result.
+    diary_entry is written immediately via backend — no separate call needed.
     """
     if claims_mgr is None:
         return _fail(
@@ -296,6 +390,13 @@ def _do_finish_work(
             reason="session coordination not available",
             hint="Run with shared_server_mode=True or transport='http'",
             failure_mode="no_coordination",
+            workflow_state={
+                "current_phase": "unavailable",
+                "next_phase": None,
+                "next_tool": None,
+                "conflict_status": "unknown",
+                "handoff_pending": False,
+            },
         )
     results = []
     errors = []
@@ -309,23 +410,46 @@ def _do_finish_work(
         errors.append(f"claim_release:{e}")
         release_result = {"success": False, "error": str(e)}
 
-    # Step 2: optional diary write
+    # Step 2: optional diary write — write immediately to backend
     diary_id = None
-    if diary_entry:
+    if diary_entry and backend:
         try:
-            # Use wing_{agent_name}/diary as target — same as mempalace_diary_write
             from ..config import sanitize_name, sanitize_content
             agent_name_sanitized = sanitize_name(agent_name, "agent_name")
             entry_sanitized = sanitize_content(diary_entry)
             wing = f"wing_{agent_name_sanitized.lower().replace(' ', '_')}"
             room = "diary"
-            # We can't call the tool directly (it would do its own claim check),
-            # so we write to the backend directly here. But for simplicity,
-            # we return diary_write instruction rather than duplicating the backend call.
-            diary_id = f"diary_{wing}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-            results.append(f"diary_ready:{diary_id}")
+
+            col = backend.get_collection()
+            now = datetime.now(timezone.utc)
+            diary_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}"
+            entry_timestamp = now.isoformat() + "Z"
+
+            col.upsert(
+                ids=[diary_id],
+                documents=[entry_sanitized],
+                metadatas=[{
+                    "wing": wing, "room": room, "source_file": path,
+                    "chunk_index": 0, "added_by": agent_name, "agent_id": agent_name,
+                    "entities": "[]", "timestamp": entry_timestamp,
+                    "origin_type": "diary_entry", "is_latest": True,
+                    "supersedes_id": "", "topic": topic,
+                }],
+            )
+            results.append(f"diary_written:{diary_id}")
         except Exception as e:
-            errors.append(f"diary:{e}")
+            errors.append(f"diary_write:{e}")
+            diary_id = None
+    elif diary_entry:
+        # No backend — prepare diary_id but can't write
+        try:
+            from ..config import sanitize_name, sanitize_content
+            agent_name_sanitized = sanitize_name(agent_name, "agent_name")
+            wing = f"wing_{agent_name_sanitized.lower().replace(' ', '_')}"
+            diary_id = f"diary_{wing}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            results.append(f"diary_prepared:{diary_id}")
+        except Exception as e:
+            errors.append(f"diary_prep:{e}")
 
     # Step 3: optional decision capture
     decision_id = None
@@ -356,17 +480,17 @@ def _do_finish_work(
     }
 
     next_actions = []
-    if diary_entry:
-        next_actions.append({
-            "action": "mempalace_diary_write",
-            "reason": "Write the diary entry prepared above",
-            "priority": "high",
-        })
-    if capture_decision:
+    if capture_decision and not decision_id:
         next_actions.append({
             "action": "mempalace_capture_decision",
             "reason": "Persist the architectural decision",
             "priority": "high",
+        })
+    if diary_entry and not diary_id:
+        next_actions.append({
+            "action": "mempalace_diary_write",
+            "reason": "Write the diary entry prepared above",
+            "priority": "medium",
         })
 
     return _ok(
@@ -375,6 +499,13 @@ def _do_finish_work(
         data,
         next_actions,
         context_snippets={"diary_entry": diary_entry or "", "decision": capture_decision or ""},
+        workflow_state={
+            "current_phase": "finished",
+            "next_phase": None,
+            "next_tool": None,
+            "conflict_status": "none",
+            "handoff_pending": False,
+        },
     )
 
 
@@ -407,6 +538,13 @@ def _do_publish_handoff(
             reason="handoff manager not available",
             hint="Run with shared_server_mode=True or transport='http'",
             failure_mode="no_handoff_manager",
+            workflow_state={
+                "current_phase": "unavailable",
+                "next_phase": None,
+                "next_tool": None,
+                "conflict_status": "unknown",
+                "handoff_pending": False,
+            },
         )
     if claims_mgr is None:
         return _fail(
@@ -415,6 +553,13 @@ def _do_publish_handoff(
             reason="claims manager not available",
             hint="Run with shared_server_mode=True",
             failure_mode="no_claims_manager",
+            workflow_state={
+                "current_phase": "unavailable",
+                "next_phase": None,
+                "next_tool": None,
+                "conflict_status": "unknown",
+                "handoff_pending": False,
+            },
         )
 
     # Push handoff first (atomic — don't release claims if push fails)
@@ -438,6 +583,13 @@ def _do_publish_handoff(
             hint=handoff_result.get("error", "Unknown error from HandoffManager"),
             failure_mode="handoff_push_failed",
             details=handoff_result,
+            workflow_state={
+                "current_phase": "blocked",
+                "next_phase": "retry",
+                "next_tool": "mempalace_publish_handoff",
+                "conflict_status": "none",
+                "handoff_pending": False,
+            },
         )
 
     # Release claims on all touched paths
@@ -474,6 +626,13 @@ def _do_publish_handoff(
         data,
         next_actions,
         context_snippets={"summary": summary[:200], "touched_paths": touched_paths},
+        workflow_state={
+            "current_phase": "published",
+            "next_phase": None,
+            "next_tool": "mempalace_diary_write",
+            "conflict_status": "none",
+            "handoff_pending": False,
+        },
     )
 
 
@@ -504,6 +663,13 @@ def _do_takeover_work(
             reason="handoff manager not available",
             hint="Run with shared_server_mode=True or transport='http'",
             failure_mode="no_handoff_manager",
+            workflow_state={
+                "current_phase": "unavailable",
+                "next_phase": None,
+                "next_tool": None,
+                "conflict_status": "unknown",
+                "handoff_pending": False,
+            },
         )
     if claims_mgr is None:
         return _fail(
@@ -512,6 +678,13 @@ def _do_takeover_work(
             reason="session coordination not available",
             hint="Run with shared_server_mode=True",
             failure_mode="no_coordination",
+            workflow_state={
+                "current_phase": "unavailable",
+                "next_phase": None,
+                "next_tool": None,
+                "conflict_status": "unknown",
+                "handoff_pending": False,
+            },
         )
 
     # Step 1: accept handoff
@@ -524,6 +697,13 @@ def _do_takeover_work(
             hint="Verify the handoff_id is valid and you are the intended recipient",
             failure_mode="handoff_accept_failed",
             details=accept_result,
+            workflow_state={
+                "current_phase": "blocked",
+                "next_phase": "retry",
+                "next_tool": "mempalace_takeover_work",
+                "conflict_status": "none",
+                "handoff_pending": False,
+            },
         )
 
     # Step 2: claim all specified paths
@@ -580,6 +760,13 @@ def _do_takeover_work(
         data,
         next_actions,
         context_snippets={"handoff_summary": handoff_summary[:200]},
+        workflow_state={
+            "current_phase": "takeover",
+            "next_phase": "prepare",
+            "next_tool": "mempalace_wakeup_context",
+            "conflict_status": "none",
+            "handoff_pending": False,
+        },
     )
 
 
@@ -675,28 +862,31 @@ def register_workflow_tools(server, backend, config, settings):
         session_id: str | None = None,
     ) -> dict:
         """
-        Prepare to edit a file — get symbol context and recent change info.
+        Prepare to edit a file — get symbol context, recent changes, AND verify no concurrent edit.
 
         Combines in one call:
-          1. file_symbols  — top-level definitions in the file
-          2. recent_changes — has this file changed recently? (hot spot?)
+          1. conflict_check  — is another session actively editing? (blocks if yes)
+          2. file_symbols   — top-level definitions in the file
+          3. recent_changes — has this file changed recently? (hot spot?)
 
         Returns a workflow_result with:
           - ok / error status
-          - path, symbols_count
+          - path, symbols_count, hotspot, conflict_verified
           - context_snippets.symbols: list of {name, type, line}
           - context_snippets.recent_change: change_count, last_modified
-          - next_actions: search + conflict_check suggestions
-          - hotspot: true if file changed >= 3x recently
+          - next_actions: search suggestions
+          - failure_mode: claim_conflict if another session holds an active claim
 
         Call this BEFORE making edits on hot or complex files.
         """
+        claims_mgr = _get_claims_manager()
         resolved = _optional_session_id(ctx, session_id)
         si = _get_symbol_index()
 
         result, _ = _do_prepare_edit(
             ctx, path, resolved, settings.palace_path,
-            os.environ.get("PROJECT_ROOT"), si
+            os.environ.get("PROJECT_ROOT"), si,
+            claims_mgr,
         )
         return result
 
@@ -720,20 +910,19 @@ def register_workflow_tools(server, backend, config, settings):
 
         Combines in one call:
           1. release_claim  — give up the path claim
-          2. diary_write   — log what was done (if diary_entry provided)
+          2. diary_write   — log what was done (if diary_entry provided, written immediately)
           3. capture_decision — persist an architectural decision (if capture_decision provided)
 
         Returns a workflow_result with:
           - ok / error status
           - path, session_id, claim_released
-          - diary_id (if diary_entry provided, ready to use in mempalace_diary_write)
+          - diary_id (if diary_entry provided, diary IS written — no follow-up call needed)
           - decision_id (if capture_decision provided)
-          - next_actions: diary_write + capture_decision instructions if not completed
+          - next_actions: capture_decision reminder if not completed
           - operations: list of operations performed
           - errors: any errors encountered
 
-        diary_entry is prepared but not written — call mempalace_diary_write separately
-        with the returned diary_id as reference.
+        Unlike before, diary_entry is written immediately — no separate mempalace_diary_write call needed.
         """
         claims_mgr = _get_claims_manager()
         if claims_mgr is None:
@@ -761,6 +950,7 @@ def register_workflow_tools(server, backend, config, settings):
             ctx, path, resolved, diary_entry, topic, agent_name,
             capture_decision, rationale, decision_category, decision_confidence,
             claims_mgr, dt or _EmptyDecisionTracker(),
+            backend,
         )
 
     # ── mempalace_publish_handoff ─────────────────────────────────────────

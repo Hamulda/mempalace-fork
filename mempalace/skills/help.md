@@ -4,6 +4,40 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ---
 
+## Workflow-First (for Claude Code)
+
+**The primary path** (use these tools in this order):
+
+1. `mempalace_file_status` — quick orientation before claiming
+2. `mempalace_begin_work` — claim the file
+3. `mempalace_prepare_edit` — get symbol context
+4. **[make the edit]** — the model does the editing
+5. `mempalace_finish_work` — release + diary + decision (single-file)
+
+For multi-file / context handoff:
+- `mempalace_publish_handoff` — atomic publish + release all claims in one call
+
+For takeover:
+- `mempalace_takeover_work` — accept handoff + claim paths in one call
+
+**Low-level tools** (expert escape-hatch — only when primary won't do):
+- `mempalace_claim_path` — refresh TTL on existing claim
+- `mempalace_release_claim` — manual release without diary
+- `mempalace_conflict_check` — explicit check beyond workflow tools
+- `mempalace_push_handoff` — handoff without atomic claim release
+- `mempalace_pull_handoffs` — list handoffs without accepting
+- `mempalace_accept_handoff` — accept without auto-claiming paths
+- `mempalace_complete_handoff` — mark done without publish flow
+- `mempalace_edit_guidance` — convert any workflow_result → plain guidance
+
+**Every workflow tool returns** `workflow_state` with:
+- `current_phase`: `claim_acquired | context_ready | editing | finished | published | takeover`
+- `next_tool`: the single best next action (never null on success)
+- `conflict_status`: `none | self_claim | other_claim | hotspot`
+- `handoff_pending`: boolean
+
+---
+
 ## Slash Commands
 
 | Command              | Description                    |

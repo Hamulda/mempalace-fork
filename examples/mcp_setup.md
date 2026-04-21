@@ -1,27 +1,68 @@
-# MCP Integration — Claude Code
+# MemPalace MCP Setup
 
-## Setup
+## Quick Start
 
-Run the MCP server:
-
+**Install + start in one line:**
 ```bash
-python -m mempalace.fastmcp_server
+pip install mempalace && python -m mempalace.fastmcp_server &
 ```
 
-Or add it to Claude Code:
+**Verify it's running:**
+```bash
+curl http://127.0.0.1:8766/health
+# → {"status": "ok", "service": "mempalace"}
+```
+
+## Two Ways to Connect
+
+### Option A — Claude Code Plugin (recommended)
+
+```bash
+# Install once
+claude plugin marketplace add hamulda/mempalace-fork  # or your fork URL
+claude plugin install --scope user mempalace
+
+# Restart Claude Code — MemPalace tools appear automatically
+```
+
+The plugin path is recommended because it handles MCP registration persistently and does not require manual `claude mcp add` commands.
+
+### Option B — Manual MCP registration
 
 ```bash
 claude mcp add mempalace -- python -m mempalace.fastmcp_server
 ```
 
-## Available Tools
+Works for any MCP-compatible tool (Cursor, Continue, Zed, etc.).
 
-The server exposes the full MemPalace MCP toolset. Common entry points include:
+## Session Coordination (multi-session)
 
-- **mempalace_status** — palace stats (wings, rooms, drawer counts)
-- **mempalace_search** — semantic search across all memories
-- **mempalace_list_wings** — list all projects in the palace
+When running MemPalace for 6× parallel Claude Code sessions, the server runs in **shared mode** with session coordinators active:
 
-## Usage in Claude Code
+- **SessionRegistry** — tracks active sessions, prevents split-brain
+- **WriteCoordinator** — coalesces concurrent writes via WAL
+- **ClaimsManager** — enforces file-level mutual exclusion
+- **HandoffManager** — atomic handoff between sessions
+- **DecisionTracker** — captures architectural decisions
 
-Once configured, Claude Code can search your memories directly during conversations.
+These are auto-activated when you use `mempalace serve` (CLI) or `python -m mempalace.fastmcp_server` (HTTP transport). Stdio mode (default for development) does not activate coordinators.
+
+## Backend
+
+Default backend is **LanceDB** (local, zero API calls). ChromaDB is available via `MEMPALACE_BACKEND=chroma` but LanceDB is recommended for reliability.
+
+## Troubleshooting
+
+**Port 8766 already in use:**
+```bash
+pkill -f mempalace.fastmcp_server
+python -m mempalace.fastmcp_server &
+```
+
+**Palace not found:**
+```bash
+mempalace init ~/projects/myapp
+python -m mempalace.fastmcp_server
+```
+
+**MCP tools not appearing in Claude Code:** Restart Claude Code after installing the plugin or adding the MCP server.

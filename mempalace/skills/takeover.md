@@ -5,7 +5,19 @@ trigger: when taking over work from another session
 
 # Takeover Protocol
 
-When another session stops and you need to take over their work, follow this protocol.
+## When to Use Which
+
+**Primary (use almost always):**
+- `mempalace_takeover_work` — accept handoff + claim all paths in one call
+
+**Expert:**
+- `mempalace_accept_handoff` + manual `mempalace_claim_path` for each path
+- `mempalace_pull_handoffs` — list handoffs without accepting
+
+**Why prefer takeover_work?**
+- Atomic: accept handoff AND claim paths in one call
+- Simpler: one call instead of two
+- Structured: returns `workflow_state` with `next_tool = mempalace_wakeup_context`
 
 ## Step 1: Pull Pending Handoffs
 

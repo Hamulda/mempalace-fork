@@ -449,14 +449,38 @@ Letta charges $20–200/mo for agent-managed memory. MemPalace does it with a wi
 
 ## MCP Server
 
+### With Claude Code (recommended plugin)
+
 ```bash
-# Via plugin (recommended)
-claude plugin marketplace add milla-jovovich/mempalace
+# Install once — handles MCP registration persistently
+claude plugin marketplace add hamulda/mempalace-fork  # your fork URL
 claude plugin install --scope user mempalace
 
-# Or manually
+# Restart Claude Code — tools appear automatically, no manual registration
+```
+
+### With any MCP-compatible tool (Cursor, Continue, Zed, etc.)
+
+```bash
 claude mcp add mempalace -- python -m mempalace.fastmcp_server
 ```
+
+### Session Coordination
+
+When running with multiple parallel Claude Code sessions (up to 6), the server
+activates shared coordinators automatically via `mempalace serve` or the HTTP
+transport:
+
+| Coordinator | Purpose |
+|-------------|---------|
+| **SessionRegistry** | Tracks active sessions — prevents split-brain |
+| **WriteCoordinator** | WAL-coalesced writes — prevents vector index corruption |
+| **ClaimsManager** | File-level mutual exclusion — prevents concurrent edits |
+| **HandoffManager** | Atomic handoff — transfers work between sessions |
+| **DecisionTracker** | Captures architectural decisions on finish |
+
+These are activated by `shared_server_mode=True` (default for HTTP transport).
+Stdio/dev mode does not activate them — safe for development, not for multi-session.
 
 ### 27 Tools
 
@@ -630,17 +654,22 @@ Plain text. Becomes Layer 0 — loaded every session.
 
 | File | What |
 |------|------|
-| `cli.py` | CLI entry point |
-| `config.py` | Configuration loading and defaults |
-| `normalize.py` | Converts 5 chat formats to standard transcript |
-| `fastmcp_server.py` | MCP server — 27 tools, AAAK auto-teach, memory protocol |
-| `miner.py` | Project file ingest |
-| `convo_miner.py` | Conversation ingest — chunks by exchange pair |
+| `cli.py` | CLI entry point — init, mine, search, serve, status, split, compress, wake-up, hook, repair, cleanup |
+| `fastmcp_server.py` | MCP server module — re-exports `create_server` from `server.factory` |
+| `server/factory.py` | Canonical server factory — `create_server()`, wires all tool groups and session coordinators |
+| `server/http_transport.py` | **DEPRECATED** backward-compat shim — redirects to streamable-http via `create_server()` |
 | `searcher.py` | Semantic search via LanceDB |
-| `layers.py` | 4-layer memory stack |
-| `dialect.py` | AAAK dialect — lossy abbreviation for context loading |
 | `knowledge_graph.py` | Temporal entity-relationship graph (SQLite) |
 | `palace_graph.py` | Room-based navigation graph |
+| `session_registry.py` | SessionRegistry — tracks active sessions for multi-session coordination |
+| `write_coordinator.py` | WriteCoordinator — WAL-coalesced writes, prevents index corruption |
+| `claims_manager.py` | ClaimsManager — file-level mutual exclusion for parallel sessions |
+| `handoff_manager.py` | HandoffManager — atomic work transfer between sessions |
+| `decision_tracker.py` | DecisionTracker — captures architectural decisions |
+| `layers.py` | 4-layer memory stack (L0 identity → L3 deep search) |
+| `dialect.py` | AAAK dialect — lossy abbreviation for context loading |
+| `miner.py` | Project file ingest |
+| `convo_miner.py` | Conversation ingest — chunks by exchange pair |
 | `onboarding.py` | Guided setup — generates AAAK bootstrap + wing config |
 | `entity_registry.py` | Entity code registry |
 | `entity_detector.py` | Auto-detect people and projects from content |

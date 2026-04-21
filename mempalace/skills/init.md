@@ -47,10 +47,17 @@ If this fails, report the error and stop.
 
 ## Step 6: Configure MCP server
 
-Run the following command to register the MemPalace MCP server with Claude:
+**Recommended — via Claude Code plugin:**
+```bash
+claude plugin marketplace add hamulda/mempalace-fork
+claude plugin install --scope user mempalace
+```
+Restart Claude Code after installing. MemPalace tools appear automatically — no manual MCP registration needed.
 
-    claude mcp add mempalace -- python -m mempalace.fastmcp_server
-
+**Alternative — manual MCP registration:**
+```bash
+claude mcp add mempalace -- python -m mempalace.fastmcp_server
+```
 If this fails, report the error but continue to the next step (MCP
 configuration can be done manually later).
 

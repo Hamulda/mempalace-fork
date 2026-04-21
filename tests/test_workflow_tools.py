@@ -339,6 +339,7 @@ class TestPrepareEditUnit:
         result, sym_data = _do_prepare_edit(
             ctx, "/src/main.py", "session-a",
             "/tmp/palace", "/tmp/project", si,
+            claims_mgr=None,  # No conflict check needed for symbol-only test
         )
         assert result["ok"] is True
         assert result["phase"] == "prepare_edit:done"
@@ -357,6 +358,7 @@ class TestPrepareEditUnit:
         result, _ = _do_prepare_edit(
             ctx, "/src/main.py", "session-a",
             "/tmp/palace", "/tmp/project", si,
+            claims_mgr=None,
         )
         assert result["ok"] is True
         assert result["symbols_count"] == 0
@@ -378,6 +380,7 @@ class TestPrepareEditUnit:
             result, _ = _do_prepare_edit(
                 ctx, "/src/main.py", "session-a",
                 "/tmp/palace", "/tmp/project", si,
+                claims_mgr=None,
             )
         assert result["ok"] is True
 
@@ -402,6 +405,7 @@ class TestFinishWorkUnit:
             capture_decision=None, rationale=None,
             decision_category="general", decision_confidence=3,
             claims_mgr=claims, decision_tracker=dt,
+            backend=None,
         )
         assert result["ok"] is True
         assert result["claim_released"] is True
@@ -422,11 +426,13 @@ class TestFinishWorkUnit:
             capture_decision=None, rationale=None,
             decision_category="general", decision_confidence=3,
             claims_mgr=claims, decision_tracker=dt,
+            backend=None,
         )
         assert result["ok"] is True
         assert result["diary_entry"] == "Fixed the bug in auth module"
         assert result["diary_id"] is not None
-        assert "diary_write" in result["next_actions"][0]["action"]
+        # diary written immediately — no diary_write follow-up needed
+        assert "diary_write" not in [a["action"] for a in result["next_actions"]]
 
     def test_finish_work_with_decision(self):
         """With capture_decision + rationale → decision captured."""
@@ -445,6 +451,7 @@ class TestFinishWorkUnit:
             decision_category="architecture",
             decision_confidence=4,
             claims_mgr=claims, decision_tracker=dt,
+            backend=None,
         )
         assert result["ok"] is True
         assert result["decision_id"] is not None
@@ -462,6 +469,7 @@ class TestFinishWorkUnit:
             capture_decision=None, rationale=None,
             decision_category="general", decision_confidence=3,
             claims_mgr=None, decision_tracker=None,
+            backend=None,
         )
         assert result["ok"] is False
         assert result["failure_mode"] == "no_coordination"
@@ -1115,3 +1123,401 @@ class TestLowLevelToolsStillWork:
                 os.environ["MEMPALACE_PALACE_PATH"] = original_pp
             elif "MEMPALACE_PALACE_PATH" in os.environ:
                 del os.environ["MEMPALACE_PALACE_PATH"]
+
+
+# ---------------------------------------------------------------------------
+# Test: workflow_state contract
+# ---------------------------------------------------------------------------
+
+class TestWorkflowStateContract:
+    """Every workflow tool result MUST include workflow_state with required fields."""
+
+    def test_begin_work_returns_workflow_state(self):
+        """begin_work success returns workflow_state with current_phase=claim_acquired."""
+        from mempalace.server._workflow_tools import _do_begin_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, _, _ = _do_begin_work(
+            ctx, "/src/main.py", "session-a", 600, "fixing bug",
+            claims, wc,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert ws.get("current_phase") == "claim_acquired"
+        assert ws.get("next_phase") == "prepare"
+        assert ws.get("next_tool") == "mempalace_prepare_edit"
+        assert "conflict_status" in ws
+        assert "handoff_pending" in ws
+
+    def test_begin_work_self_conflict_workflow_state(self):
+        """Self-conflict refresh → conflict_status=self_claim."""
+        from mempalace.server._workflow_tools import _do_begin_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+        claims.claim("file", "/src/main.py", "session-a", ttl_seconds=600)
+
+        result, _, _ = _do_begin_work(
+            ctx, "/src/main.py", "session-a", 600, "continue work",
+            claims, wc,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert ws.get("conflict_status") == "self_claim"
+
+    def test_begin_work_conflict_failure_workflow_state(self):
+        """Other-session conflict → workflow_state with blocked phase."""
+        from mempalace.server._workflow_tools import _do_begin_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+        claims.claim("file", "/src/main.py", "other-session", ttl_seconds=600)
+
+        result, _, _ = _do_begin_work(
+            ctx, "/src/main.py", "session-a", 600, "try to claim",
+            claims, wc,
+        )
+        assert result["ok"] is False
+        assert result["failure_mode"] == "claim_conflict"
+        ws = result.get("workflow_state", {})
+        assert ws.get("current_phase") == "blocked"
+        assert ws.get("next_phase") == "negotiate"
+        assert ws.get("next_tool") == "mempalace_push_handoff"
+        assert ws.get("conflict_status") == "other_claim"
+
+    def test_prepare_edit_returns_workflow_state(self):
+        """prepare_edit success returns workflow_state with current_phase=context_ready."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        si = _MockSymbolIndex()
+        ctx = MagicMock()
+
+        result, _ = _do_prepare_edit(
+            ctx, "/src/main.py", "session-a", "/tmp/palace", None, si, claims,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert ws.get("current_phase") == "context_ready"
+        assert ws.get("next_phase") == "edit"
+        assert ws.get("next_tool") == "MODEL_ACTION:edit"
+        assert "conflict_status" in ws
+        assert "handoff_pending" in ws
+
+    def test_prepare_edit_conflict_failure_workflow_state(self):
+        """Other-session conflict blocks prepare_edit."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        si = _MockSymbolIndex()
+        ctx = MagicMock()
+        claims.claim("file", "/src/main.py", "other-session", ttl_seconds=600)
+
+        result, _ = _do_prepare_edit(
+            ctx, "/src/main.py", "session-a", "/tmp/palace", None, si, claims,
+        )
+        assert result["ok"] is False
+        ws = result.get("workflow_state", {})
+        assert ws.get("current_phase") == "blocked"
+        assert ws.get("next_tool") == "mempalace_push_handoff"
+
+    def test_finish_work_returns_workflow_state(self):
+        """finish_work success returns workflow_state with current_phase=finished."""
+        from mempalace.server._workflow_tools import _do_finish_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        dt = _MockDecisionTracker()
+        ctx = MagicMock()
+
+        result = _do_finish_work(
+            ctx, "/src/main.py", "session-a",
+            diary_entry=None, topic="general", agent_name="claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert ws.get("current_phase") == "finished"
+        assert "conflict_status" in ws
+        assert "handoff_pending" in ws
+
+    def test_publish_handoff_returns_workflow_state(self):
+        """publish_handoff success returns workflow_state with current_phase=published."""
+        from mempalace.server._workflow_tools import _do_publish_handoff
+        from unittest.mock import MagicMock
+
+        hm = _MockHandoffManager()
+        claims = _MockClaimsManager()
+        ctx = MagicMock()
+
+        result = _do_publish_handoff(
+            ctx,
+            summary="Auth refactor done",
+            touched_paths=["/src/auth.py"],
+            blockers=[],
+            next_steps=[],
+            confidence=3,
+            priority="normal",
+            to_session_id=None,
+            from_session_id="session-a",
+            claims_mgr=claims,
+            handoff_mgr=hm,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert ws.get("current_phase") == "published"
+        assert ws.get("next_tool") == "mempalace_diary_write"
+        assert ws.get("handoff_pending") is False
+
+    def test_takeover_work_returns_workflow_state(self):
+        """takeover_work success returns workflow_state with current_phase=takeover."""
+        from mempalace.server._workflow_tools import _do_takeover_work
+        from unittest.mock import MagicMock
+
+        hm = _MockHandoffManager()
+        hm.push_handoff(
+            from_session_id="old-session",
+            summary="Auth work in progress",
+            touched_paths=["/src/auth.py"],
+            blockers=[],
+            next_steps=["Finish the token rotation"],
+            confidence=3,
+            priority="normal",
+        )
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result = _do_takeover_work(
+            ctx,
+            handoff_id="handoff_1",
+            session_id="new-session",
+            paths_to_claim=["/src/auth.py"],
+            ttl_seconds=600,
+            handoff_mgr=hm,
+            claims_mgr=claims,
+            write_coordinator=wc,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert ws.get("current_phase") == "takeover"
+        assert ws.get("next_phase") == "prepare"
+        assert ws.get("next_tool") == "mempalace_wakeup_context"
+
+
+class TestNextToolGuarantee:
+    """next_tool MUST be set on every success result (never None)."""
+
+    def test_all_success_results_have_next_tool(self):
+        """Every OK workflow result has workflow_state.next_tool != None."""
+        from mempalace.server._workflow_tools import _do_begin_work, _do_prepare_edit
+        from mempalace.server._workflow_tools import _do_finish_work, _do_publish_handoff
+        from mempalace.server._workflow_tools import _do_takeover_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        hm = _MockHandoffManager()
+        dt = _MockDecisionTracker()
+        si = _MockSymbolIndex()
+        ctx = MagicMock()
+
+        hm.push_handoff(
+            from_session_id="old-session", summary="test",
+            touched_paths=["/src/a.py"], blockers=[], next_steps=[],
+            confidence=3, priority="normal",
+        )
+
+        cases = [
+            ("begin_work", lambda: _do_begin_work(ctx, "/src/a.py", "s1", 600, None, claims, wc)),
+            ("prepare_edit", lambda: _do_prepare_edit(ctx, "/src/a.py", "s1", "/tmp/p", None, si, claims)),
+            ("finish_work", lambda: _do_finish_work(ctx, "/src/a.py", "s1", None, "g", "c", None, None, "g", 3, claims, dt, None)),
+            ("publish_handoff", lambda: _do_publish_handoff(ctx, "done", ["/src/a.py"], [], [], 3, "n", None, "s1", claims, hm)),
+            ("takeover_work", lambda: _do_takeover_work(ctx, "handoff_1", "s2", ["/src/a.py"], 600, hm, claims, wc)),
+        ]
+
+        # finish_work is terminal (current_phase=finished, next_tool=None) — allowed
+        _terminal_states = {"finished"}
+
+        for name, call in cases:
+            result = call()
+            if isinstance(result, tuple):
+                result = result[0]
+            assert result["ok"] is True, f"{name} returned ok=False"
+            ws = result.get("workflow_state", {})
+            current_phase = ws.get("current_phase")
+            if current_phase in _terminal_states:
+                assert ws.get("next_tool") is None, f"{name} is terminal, next_tool should be None"
+            else:
+                assert ws.get("next_tool") is not None, f"{name} has null next_tool for non-terminal phase {current_phase}: {ws}"
+
+    def test_all_failure_results_have_workflow_state(self):
+        """Every FAIL workflow result has workflow_state (blocked/negotiate state)."""
+        from mempalace.server._workflow_tools import _do_begin_work, _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        claims.claim("file", "/src/blocked.py", "other-session", ttl_seconds=600)
+        wc = _MockWriteCoordinator()
+        si = _MockSymbolIndex()
+        ctx = MagicMock()
+
+        cases = [
+            ("begin_work conflict", lambda: _do_begin_work(ctx, "/src/blocked.py", "s1", 600, None, claims, wc)),
+            ("prepare_edit conflict", lambda: _do_prepare_edit(ctx, "/src/blocked.py", "s1", "/tmp/p", None, si, claims)),
+        ]
+
+        for name, call in cases:
+            result = call()
+            if isinstance(result, tuple):
+                result = result[0]
+            assert result["ok"] is False, f"{name} should fail"
+            ws = result.get("workflow_state", {})
+            assert ws, f"{name} missing workflow_state on failure"
+            assert ws.get("current_phase") == "blocked", f"{name} wrong phase: {ws}"
+            assert ws.get("next_tool") is not None, f"{name} has null next_tool on failure"
+
+    def test_conflict_status_always_set(self):
+        """conflict_status field always present in workflow_state."""
+        from mempalace.server._workflow_tools import _do_begin_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, _, _ = _do_begin_work(
+            ctx, "/src/main.py", "session-a", 600, None, claims, wc,
+        )
+        ws = result.get("workflow_state", {})
+        assert "conflict_status" in ws
+        assert ws["conflict_status"] in ("none", "self_claim", "other_claim", "hotspot")
+
+
+class TestNoContradictoryHints:
+    """next_actions must not contain contradictory hints."""
+
+    def test_begin_work_conflict_no_prepare_in_next_actions(self):
+        """When begin_work fails with claim_conflict, next_actions does NOT contain prepare_edit."""
+        from mempalace.server._workflow_tools import _do_begin_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        claims.claim("file", "/src/main.py", "other-session", ttl_seconds=600)
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result = _do_begin_work(ctx, "/src/main.py", "session-a", 600, None, claims, wc)
+        if isinstance(result, tuple):
+            result = result[0]
+        assert result["ok"] is False
+        assert result["failure_mode"] == "claim_conflict"
+        actions = [a["action"] for a in result.get("next_actions", [])]
+        assert "mempalace_prepare_edit" not in actions
+        assert "mempalace_push_handoff" in actions
+
+    def test_prepare_edit_conflict_no_edit_in_next_actions(self):
+        """When prepare_edit fails with claim_conflict, next_actions points to negotiate."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        claims.claim("file", "/src/main.py", "other-session", ttl_seconds=600)
+        si = _MockSymbolIndex()
+        ctx = MagicMock()
+
+        result = _do_prepare_edit(ctx, "/src/main.py", "session-a", "/tmp/p", None, si, claims)
+        if isinstance(result, tuple):
+            result = result[0]
+        assert result["ok"] is False
+        assert result["failure_mode"] == "claim_conflict"
+        actions = [a["action"] for a in result.get("next_actions", [])]
+        assert "MODEL_ACTION:edit" not in actions
+        assert "mempalace_push_handoff" in actions
+
+    def test_finish_work_no_diary_write_if_immediate(self):
+        """When finish_work writes diary immediately, next_actions does NOT contain mempalace_diary_write."""
+        from mempalace.server._workflow_tools import _do_finish_work
+        from unittest.mock import MagicMock, patch
+
+        claims = _MockClaimsManager()
+        dt = _MockDecisionTracker()
+        ctx = MagicMock()
+
+        class _FakeCollection:
+            def upsert(self, ids, documents, metadatas):
+                pass
+
+        class _FakeBackend:
+            def get_collection(self):
+                return _FakeCollection()
+
+        backend = _FakeBackend()
+
+        result = _do_finish_work(
+            ctx, "/src/main.py", "session-a",
+            diary_entry="Fixed auth bug", topic="bug-fix", agent_name="claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=backend,
+        )
+        assert result["ok"] is True
+        assert result.get("diary_id") is not None, "diary should be written immediately"
+        actions = [a["action"] for a in result.get("next_actions", [])]
+        assert "mempalace_diary_write" not in actions
+
+
+class TestTier2BackwardCompatibility:
+    """Low-level tools still register and return valid shapes."""
+
+    @pytest.mark.asyncio
+    async def test_low_level_claim_path_still_works(self, tmp_path):
+        """mempalace_claim_path (low-level) still registers and works."""
+        import os
+        from mempalace.server.factory import create_server
+        from mempalace.settings import MemPalaceSettings
+
+        original_pp = os.environ.get("MEMPALACE_PALACE_PATH")
+        palace = str(tmp_path / "t2_palace")
+        os.environ["MEMPALACE_PALACE_PATH"] = palace
+
+        try:
+            settings = MemPalaceSettings()
+            settings.palace_path = palace
+            settings.db_path = str(tmp_path / "db")
+            settings.transport = "stdio"
+
+            mcp = create_server(settings=settings, shared_server_mode=True)
+            tool_names = [t.name for t in await mcp.list_tools()]
+
+            for low_level in [
+                "mempalace_claim_path",
+                "mempalace_release_claim",
+                "mempalace_conflict_check",
+            ]:
+                assert low_level in tool_names, f"{low_level} missing"
+
+            if hasattr(mcp, "_claims_manager"):
+                mcp._claims_manager.close()
+            if hasattr(mcp, "_handoff_manager"):
+                mcp._handoff_manager.close()
+            if hasattr(mcp, "_decision_tracker"):
+                mcp._decision_tracker.close()
+        finally:
+            if original_pp:
+                os.environ["MEMPALACE_PALACE_PATH"] = original_pp
+            elif "MEMPALACE_PALACE_PATH" in os.environ:
+                del os.environ["MEMPALACE_PALACE_PATH"]
+

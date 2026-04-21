@@ -17,44 +17,55 @@ import pytest
 from unittest.mock import MagicMock
 import pandas as pd
 
-# ── Bug 1: serve_http() outside __main__ ──────────────────────────────────────
+# ── Bug 1: serve_http() deprecated shim (replaces old Starlette wrapper) ─────────
 
 
-def test_serve_http_no_global_mcp_via_source():
-    """serve_http(server=None) must not reference the global `mcp` variable.
+def test_serve_http_deprecated_shim_no_global_mcp_via_source():
+    """serve_http must not reference the global `mcp` variable.
 
-    Root cause: serve_http referenced global `mcp` which only exists in the
-    __main__ block. Calling serve_http from CLI import path raised NameError.
-    Fix: server = create_server() when server is None.
+    serve_http is now a deprecated shim that calls create_server() +
+    mcp.run(transport='streamable-http'). The old Starlette+Uvicorn wrapper
+    that referenced global `mcp` is removed.
+
+    Root cause (historical): serve_http referenced global `mcp` which only
+    existed in the __main__ block. Calling serve_http from CLI import path
+    raised NameError.
+    Fix: deprecated shim in http_transport.py calls factory.create_server().
     """
-    source = open("mempalace/fastmcp_server.py").read()
+    source = open("mempalace/server/http_transport.py").read()
     tree = ast.parse(source)
 
-    # Find serve_http function
+    # Find serve_http function (defined in http_transport.py)
     serve_http_node = None
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "serve_http":
             serve_http_node = node
             break
 
-    assert serve_http_node is not None, "serve_http function not found"
+    assert serve_http_node is not None, "serve_http function not found in http_transport.py"
 
     # Collect all Name nodes used in serve_http
     names_used = {n.id for n in ast.walk(serve_http_node) if isinstance(n, ast.Name)}
 
-    # `mcp` should NOT be referenced in serve_http
+    # `mcp` should NOT be referenced in serve_http (the shim uses local variables)
     assert "mcp" not in names_used, (
-        "serve_http must not reference global 'mcp' — use create_server() instead. "
-        "Global 'mcp' only exists in __main__ block."
+        "serve_http shim must not reference global 'mcp' — use create_server() instead. "
+        "Global 'mcp' only exists in __main__ blocks."
     )
 
 
-def test_serve_http_calls_create_server_when_server_is_none():
-    """serve_http falls back to create_server() instead of referencing global mcp."""
-    source = open("mempalace/fastmcp_server.py").read()
-    # When server is None, it must call create_server()
-    assert "if server is None:" in source
-    assert "server = create_server()" in source
+def test_serve_http_deprecated_shim_calls_create_server():
+    """serve_http shim calls create_server(shared_server_mode=True)."""
+    source = open("mempalace/server/http_transport.py").read()
+    # The shim must call create_server with shared_server_mode=True
+    assert "create_server(shared_server_mode=True)" in source, (
+        "serve_http shim must call create_server(shared_server_mode=True) "
+        "to activate session coordinators."
+    )
+    # Must call mcp.run with streamable-http
+    assert 'transport="streamable-http"' in source or "transport='streamable-http'" in source, (
+        "serve_http shim must use transport='streamable-http' (canonical FastMCP HTTP path)."
+    )
 
 
 # ── Bug 2: BM25 warmup wrong signature ──────────────────────────────────────────
