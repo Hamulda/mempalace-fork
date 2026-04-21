@@ -179,11 +179,6 @@ def create_server(settings=None, shared_server_mode=False):
     return server
 
 
-def _register_all_tools(server, backend, config, settings, memory_guard):
-    """Legacy — all tool registration now lives in register_*_tools() per module."""
-    pass
-
-
 # ─── CLI ──────────────────────────────────────────────────────────────────
 
 def _parse_args():

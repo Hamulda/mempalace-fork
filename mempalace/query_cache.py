@@ -2,18 +2,23 @@
 LRU cache pro MemPalace query výsledky.
 TTL 60s (výchozí) zajišťuje čerstvost bez zbytečných redundantních searchů.
 
-Canonical cache story:
-- DVA oddělené přástupy ke stejnému _cache slovníku:
+8-shard architektura: kazdy shard má vlastni cache + _last_write mapu.
+Cross-palace izolace je dana palace_path v cache key (get/set) nebo embedding
+v raw-string key (get_value/set_value).
+
+Dva oddělene přístupy ke stejnému _shards slovníku:
   1. get()/set() — strukturovaný klíč (palace_path, collection, query_texts, n_results),
      chráněno _last_write timestampem (invalidate_collection nastaví timestamp,
      get() zkontroluje při každém čtení)
   2. get_value()/set_value() — raw string klíč s embedded palace_path|collection|
      v klíči; cross-palace izolace je přes klíč sám; invalidace přes invalidate_collection()
      (která maže položky s odpovídajícím prefixem) NEBO přes clear() (maže vše)
-- invalidate_query_cache() (searcher.py) → cache.clear() po write operacích
-  (všechny palace najednou, infrequent operace)
-- invalidate_collection(palace_path, collection) → maže přímo entries z _cache
-  pro obě rozhraní najednou
+
+Canonical invalidation story:
+  - invalidate_query_cache() (searcher.py) → cache.clear() — full cross-palace flush
+  - invalidate_collection(palace_path, collection) → maže entries PRES PREFIX KEY SCAN
+    (nikol přes _last_write timestamp pro raw-key entries)
+  - _last_write timestamp se používá jen v get()/set() rozhraní
 """
 from __future__ import annotations
 
@@ -182,11 +187,18 @@ class QueryCache:
         """
         Return cached value by raw string key, or None if missing/expired.
 
-        palace_path + collection are used only for _last_write staleness check
-        (invalidate_collection sets _last_write; entries cached before that
-        timestamp are evicted). TTL always applies. For raw-key entries,
-        cross-palace isolation is provided by palace_path being embedded
-        in the key string itself.
+        palace_path + collection are used only for routing to the correct shard
+        and (when provided) for _last_write staleness check via get()/set() interface.
+        TTL always applies.
+
+        For raw-key entries, cross-palace isolation is provided by palace_path being
+        embedded in the key string itself (format: "{palace_path}|{collection}|...").
+
+        NOTE: set_value does NOT update _last_write — only invalidate_collection()
+        does. For raw-key entries, staleness is handled by invalidate_collection()
+        scanning for matching prefix keys, NOT by _last_write timestamp comparison.
+        The _last_write staleness check below is only effective for entries stored
+        via get()/set() (structured key interface).
         """
         # Extract palace_path+collection from the key itself when not provided.
         # This is critical for cross-shard correctness: the key format is
