@@ -1,6 +1,6 @@
 """
 LRU cache pro MemPalace query výsledky.
-TTL 5s zajišťuje čerstvost bez zbytečných redundantních searchů.
+TTL 60s (výchozí) zajišťuje čerstvost bez zbytečných redundantních searchů.
 
 Canonical cache story:
 - DVA oddělené přástupy ke stejnému _cache slovníku:
@@ -73,17 +73,6 @@ class QueryCache:
         """Select shard from palace_path + collection (stable, no hash randomization)."""
         key = f"{palace_path or ''}|{collection or ''}"
         return hash(key) % self._NUM_SHARDS
-
-    def _make_key(
-        self, palace_path: str, collection: str, query_texts: list[str], n_results: int
-    ) -> str:
-        raw = json.dumps({
-            "p": palace_path,
-            "c": collection,
-            "q": query_texts,
-            "n": n_results,
-        }, sort_keys=True)
-        return hashlib.md5(raw.encode()).hexdigest()
 
     def _make_key(
         self, palace_path: str, collection: str, query_texts: list[str], n_results: int
@@ -267,7 +256,7 @@ class QueryCache:
                 pass
 
     def clear(self) -> None:
-        """Remove all cached entries across all shards."""
+        """Remove all cached entries and all _last_write timestamps across all shards."""
         for i in range(self._NUM_SHARDS):
             with self._shard_locks[i]:
                 try:

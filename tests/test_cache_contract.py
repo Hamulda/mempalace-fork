@@ -10,7 +10,7 @@ import pytest
 import threading
 
 from mempalace.query_cache import QueryCache, get_query_cache
-from mempalace.searcher import invalidate_query_cache, invalidate_all_caches
+from mempalace.searcher import invalidate_query_cache
 
 
 class TestInvalidateCollectionBehavior:
@@ -117,13 +117,13 @@ class TestStalenessAfterWrite:
         for k in keys:
             assert cache.get_value(k) is None, f"{k} should be cleared"
 
-    def test_invalidate_all_caches_alias_works(self):
-        """invalidate_all_caches is an alias for invalidate_query_cache."""
+    def test_invalidate_query_cache_clears_singleton(self):
+        """invalidate_query_cache() clears the singleton cache."""
         cache = get_query_cache()
         key = "/palace/test|default|q|None|None|None|None|5|False|None|None"
         cache.set_value(key, {"data": "fresh"})
 
-        invalidate_all_caches()
+        invalidate_query_cache()
 
         assert cache.get_value(key) is None
 

@@ -301,8 +301,8 @@ class TestSearcherBugfixes:
     def test_invalidate_query_cache(self):
         """invalidate_query_cache clears the query cache."""
         from mempalace.searcher import invalidate_query_cache
-        from mempalace.searcher import _get_query_cache
-        cache = _get_query_cache()
+        from mempalace.query_cache import get_query_cache
+        cache = get_query_cache()
         cache.set_value("testkey", {"result": "value"})
         assert cache.get_value("testkey") is not None
         invalidate_query_cache()
@@ -314,11 +314,11 @@ class TestCacheInvalidationAfterWrite:
 
     async def test_query_cache_cleared_after_add_drawer(self, palace_path, collection):
         """add_drawer clears the query cache."""
-        from mempalace.searcher import _get_query_cache
+        from mempalace.query_cache import get_query_cache
         import mempalace.searcher as searcher_module
         settings = MemPalaceSettings(db_path=palace_path, db_backend="chroma")
         server = create_server(settings=settings)
-        cache = _get_query_cache()
+        cache = get_query_cache()
         cache.set_value("pretest", {"v": 1})
         assert cache.get_value("pretest") is not None
         async with Client(transport=server) as client:

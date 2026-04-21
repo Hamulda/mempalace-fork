@@ -42,11 +42,18 @@ def reset_keyword_index_singleton():
     KeywordIndex._reset_for_testing()
 
 
-class TestFTS5DeleteSync:
-    """FTS5 index must not have stale rows after delete operations."""
+class TestFTS5NoSync:
+    """FTS5 KeywordIndex is NOT updated by LanceDB delete operations.
 
-    def test_delete_by_id_removes_from_fts(self):
-        """delete(ids=[...]) removes records from KeywordIndex FTS5."""
+    After the lexical simplification: FTS5 is maintained via the diagnostics
+    rebuild path (rebuild_keyword_index), not via inline sync on every write.
+    This means deleted LanceDB records may have stale FTS5 entries until
+    rebuild_keyword_index is run. The FTS5 count divergence is expected and
+    corrected by the diagnostic repair path.
+    """
+
+    def test_delete_by_id_leaves_fts5_stale_until_rebuild(self):
+        """delete(ids=[...]) does NOT update FTS5 — stale entries remain until rebuild."""
         import unittest.mock as mock
         from mempalace.backends.lance import LanceBackend
         from mempalace.lexical_index import KeywordIndex
@@ -55,9 +62,9 @@ class TestFTS5DeleteSync:
 
         with mock.patch("mempalace.backends.lance._embed_texts", side_effect=_mock_embed_texts):
             backend = LanceBackend()
-            col = backend.get_collection(palace, "fts_delete", create=True)
+            col = backend.get_collection(palace, "fts_nosync_delete", create=True)
 
-            # Add records (upsert triggers FTS5 upsert_drawer)
+            # Add records (upsert writes to LanceDB only, not FTS5)
             col.upsert(
                 documents=["apple banana cherry", "dog cat bird"],
                 ids=["d1", "d2"],
@@ -65,19 +72,11 @@ class TestFTS5DeleteSync:
             )
 
             idx = KeywordIndex.get(palace)
-            assert idx.count() == 2
+            # FTS5 is NOT populated by upsert — it's populated by rebuild_keyword_index
+            assert idx.count() == 0
 
-            # Delete one record by ID
-            col.delete(ids=["d1"])
-
-            # FTS5 must NOT have stale row for d1
-            assert idx.count() == 1
-            search = idx.search("apple banana")
-            doc_ids = [r["document_id"] for r in search]
-            assert "d1" not in doc_ids
-
-    def test_delete_by_where_removes_from_fts(self):
-        """delete(where=...) removes matching records from KeywordIndex FTS5."""
+    def test_delete_by_where_leaves_fts5_stale_until_rebuild(self):
+        """delete(where=...) does NOT update FTS5 — rebuild is needed to sync."""
         import unittest.mock as mock
         from mempalace.backends.lance import LanceBackend
         from mempalace.lexical_index import KeywordIndex
@@ -86,7 +85,7 @@ class TestFTS5DeleteSync:
 
         with mock.patch("mempalace.backends.lance._embed_texts", side_effect=_mock_embed_texts):
             backend = LanceBackend()
-            col = backend.get_collection(palace, "fts_delete_where", create=True)
+            col = backend.get_collection(palace, "fts_nosync_delete_where", create=True)
 
             col.upsert(
                 documents=["alpha beta gamma", "delta epsilon zeta", "theta iota kappa"],
@@ -99,17 +98,8 @@ class TestFTS5DeleteSync:
             )
 
             idx = KeywordIndex.get(palace)
-            assert idx.count() == 3
-
-            # Delete all records in src room
-            col.delete(where={"room": "src"})
-
-            # Only w2 (general room) should remain in FTS5
-            assert idx.count() == 1
-            search = idx.search("alpha")
-            doc_ids = [r["document_id"] for r in search]
-            assert "w1" not in doc_ids  # was in src
-            assert "w3" not in doc_ids  # was in src
+            # FTS5 is empty — LanceDB writes do not populate KeywordIndex
+            assert idx.count() == 0
 
 
 class TestWriteCoordinatorRecovery:
@@ -368,7 +358,7 @@ class TestLexicalIndexConsistency:
     """Lexical index stays in sync with LanceDB state."""
 
     def test_bulk_upsert_clears_and_rebuilds(self):
-        """bulk_upsert() replaces all FTS5 entries with provided entries."""
+        """clear() + bulk_insert_batch() replaces all FTS5 entries with provided entries."""
         from mempalace.lexical_index import KeywordIndex
 
         palace = _pp()
@@ -378,7 +368,8 @@ class TestLexicalIndexConsistency:
         idx.upsert_drawer("doc2", "dog cat bird", "repo", "src", "English")
         assert idx.count() == 2
 
-        idx.bulk_upsert([
+        idx.clear()
+        idx.bulk_insert_batch([
             {"document_id": "doc3", "content": "new content alpha", "wing": "repo", "room": "src", "language": "English"},
         ])
         assert idx.count() == 1

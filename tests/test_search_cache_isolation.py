@@ -243,9 +243,10 @@ class TestSearchCacheIntegration:
 
     def test_invalidate_query_cache_clears_all_search_entries(self):
         """invalidate_query_cache must clear all search_memories cache entries."""
-        from mempalace.searcher import invalidate_query_cache, _get_query_cache
+        from mempalace.searcher import invalidate_query_cache
+        from mempalace.query_cache import get_query_cache
 
-        cache = _get_query_cache()
+        cache = get_query_cache()
         initial_size = cache._total_size()
 
         # Simulate search_memories writing entries
@@ -264,21 +265,22 @@ class TestSearchCacheIntegration:
             assert cache.get_value(k) is None
 
     def test_write_invalidation_chain_reaches_search_cache(self):
-        """Lance write -> invalidate_all_caches -> search cache cleared.
+        """Lance write -> invalidate_query_cache -> search cache cleared.
 
         This tests the full invalidation chain: after a write operation
         (add_drawer/delete_memory), the search cache must be cleared so
         subsequent searches return fresh results.
         """
-        from mempalace.searcher import invalidate_all_caches, _get_query_cache
+        from mempalace.searcher import invalidate_query_cache
+        from mempalace.query_cache import get_query_cache
 
-        cache = _get_query_cache()
+        cache = get_query_cache()
 
         key = "/palace/a|default|error|None|None|None|None|5|False|None|None"
         cache.set_value(key, {"results": ["old", "stale"]})
 
-        # Simulate write completion → invalidate_all_caches()
-        invalidate_all_caches()
+        # Simulate write completion → invalidate_query_cache()
+        invalidate_query_cache()
 
         # Cache is now empty — next search will hit the backend
         assert cache.get_value(key) is None

@@ -10,11 +10,8 @@ import threading
 import pytest
 from unittest import mock
 
-from mempalace.query_cache import QueryCache
-from mempalace.searcher import (
-    invalidate_query_cache,
-    _get_query_cache,
-)
+from mempalace.query_cache import QueryCache, get_query_cache
+from mempalace.searcher import invalidate_query_cache
 
 
 class TestSameQueryDifferentPalace:
@@ -68,7 +65,7 @@ class TestWriteInvalidation:
 
     def test_invalidate_query_cache_clears_search_entries(self):
         """invalidate_query_cache() musí vymazat všechny search_memories cache entries."""
-        cache = _get_query_cache()
+        cache = get_query_cache()
 
         keys = [
             "/palace/a|default|q1|None|None|None|None|5|False|None|None",
@@ -84,7 +81,7 @@ class TestWriteInvalidation:
 
     def test_invalidate_query_cache_clears_query_cache(self):
         """invalidate_query_cache() zneplatní query cache."""
-        cache = _get_query_cache()
+        cache = get_query_cache()
 
         key = "/palace|default|query|None|None|None|None|5|False|None|None"
         cache.set_value(key, {"stale": True})
@@ -206,7 +203,7 @@ class TestHybridSearchStaleness:
         import mempalace.searcher as searcher_mod
 
         # Setup query cache entry
-        cache = _get_query_cache()
+        cache = get_query_cache()
         key = "/palace|default|query|None|None|None|None|5|False|None|None"
         cache.set_value(key, {"results": "stale"})
 

@@ -294,6 +294,96 @@ def _do_begin_work(
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# File slice helpers — bounded line streaming for large-file safety
+# ────────────────────────────────────────────────────────────────────────────────
+
+_MAX_LINES_TO_INSPECT = 100  # Only read up to this many lines to find total line count
+_SLICE_BUDGET_LINES = 40    # Slice window: 20 before + 1 symbol + 20 after
+
+
+def _read_file_slice(path: str, first_symbol_line: int,
+                     max_lines_inspect: int = _MAX_LINES_TO_INSPECT,
+                     slice_budget: int = _SLICE_BUDGET_LINES) -> dict | None:
+    """
+    Bounded file slice: read only what we need, never load the full file into memory.
+
+    Strategy:
+      1. Stream first N lines to count total_lines (fast estimate for large files)
+      2. Compute slice window around first_symbol_line
+      3. Seek + read only the slice window bytes (not the whole file)
+      4. Fallback: if file is too large to count, use os.path.getsize estimate
+
+    Returns dict with {total_lines, slice_start, slice_end, pre_context, symbol_context,
+                        has_pre, has_post, line_count} or None on error.
+    """
+    try:
+        stat_info = os.stat(path)
+        file_size = stat_info.st_size
+
+        # Fast path: try to get line count from first N lines only
+        # This avoids reading multi-MB files just to count lines
+        total_lines = 0
+        pre_lines = []
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i in range(max_lines_inspect):
+                line = fh.readline()
+                if not line:
+                    # EOF reached before max_lines_inspect
+                    total_lines = i
+                    break
+                pre_lines.append(line.rstrip("\n"))
+                total_lines = i + 1
+
+            # Check if we hit the limit — file might be larger
+            if total_lines == max_lines_inspect:
+                # File has more lines; read one more to confirm EOF or continue
+                peek = fh.readline()
+                if peek:
+                    # File has more than max_lines_inspect lines
+                    # For safety, use conservative estimate: file_size / avg_line_estimate
+                    # avg_line_estimate = 100 bytes (generous for most source files)
+                    avg_line_estimate = 100
+                    estimated_total = max(max_lines_inspect, file_size // avg_line_estimate)
+                    total_lines = estimated_total
+
+        # Slice window computation (1-indexed lines)
+        start_1 = max(1, first_symbol_line - (slice_budget // 2))
+        end_1 = min(total_lines, first_symbol_line + (slice_budget // 2))
+        if end_1 < start_1:
+            start_1 = 1
+            end_1 = min(total_lines, slice_budget)
+
+        # Read only the slice window
+        slice_lines = []
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno in range(1, end_1 + 1):
+                line = fh.readline()
+                if not line:
+                    break
+                if lineno >= start_1:
+                    slice_lines.append(line.rstrip("\n"))
+
+        # Separate pre_context (lines before symbol) from symbol_context (symbol + after)
+        # first_symbol_line is 1-indexed; compute position in slice
+        symbol_pos = first_symbol_line - start_1  # 0-indexed position in slice_lines
+        pre_context = slice_lines[:max(0, symbol_pos)]
+        symbol_context = slice_lines[max(0, symbol_pos):]
+
+        return {
+            "total_lines": total_lines,
+            "slice_start": start_1,
+            "slice_end": end_1,
+            "pre_context": pre_context,
+            "symbol_context": symbol_context,
+            "has_pre": start_1 > 1,
+            "has_post": end_1 < total_lines,
+            "line_count": len(slice_lines),
+        }
+    except Exception:
+        return None
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # mempalace_prepare_edit
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -397,36 +487,15 @@ def _do_prepare_edit(
     # Step 4: Content preview (optional, controlled by preview_mode)
     file_slice = None
     if preview_mode == "slice" and first_symbol_line is not None:
-        try:
-            from pathlib import Path
-            content = Path(path).read_text(encoding="utf-8", errors="replace")
-            lines = content.split("\n")
-            total = len(lines)
-            # Slice: 20 lines before first symbol, first symbol, 20 lines after
-            # Clamp to file boundaries
-            start = max(0, first_symbol_line - 21)  # 0-indexed, so -21 means 20 before (1-indexed line)
-            end = min(total, first_symbol_line + 20)
-            if end > start:
-                slice_lines = lines[start:end]
-                file_slice = {
-                    "total_lines": total,
-                    "slice_start": start + 1,   # 1-indexed for humans
-                    "slice_end": end,
-                    "pre_context": slice_lines[:20],
-                    "symbol_context": slice_lines[20:],
-                    "has_pre": start > 0,
-                    "has_post": end < total,
-                    "line_count": end - start,
-                }
-                snippets["file_slice"] = {
-                    "total_lines": total,
-                    "slice_start": start + 1,
-                    "slice_end": end,
-                    "has_pre": start > 0,
-                    "has_post": end < total,
-                }
-        except Exception:
-            pass
+        file_slice = _read_file_slice(path, first_symbol_line)
+        if file_slice is not None:
+            snippets["file_slice"] = {
+                "total_lines": file_slice["total_lines"],
+                "slice_start": file_slice["slice_start"],
+                "slice_end": file_slice["slice_end"],
+                "has_pre": file_slice["has_pre"],
+                "has_post": file_slice["has_post"],
+            }
 
     # Step 4: Build next_actions
     if hotspot_detected:

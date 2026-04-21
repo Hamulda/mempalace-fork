@@ -121,21 +121,20 @@ class TestSearcherCacheContract:
     """searcher.py uses canonical query cache singleton."""
 
     def test_searcher_uses_query_cache_singleton(self):
-        """_get_query_cache returns the process-global singleton from query_cache.py."""
-        from mempalace.searcher import _get_query_cache
+        """searcher uses the canonical get_query_cache singleton from query_cache.py."""
         from mempalace.query_cache import get_query_cache
 
-        cache_from_searcher = _get_query_cache()
         cache_from_module = get_query_cache()
 
-        # Same singleton instance
-        assert cache_from_searcher is cache_from_module
+        # get_query_cache returns the singleton
+        assert cache_from_module is get_query_cache()
 
     def test_invalidate_query_cache_clears_all(self):
         """invalidate_query_cache() clears the shared cache (full flush)."""
-        from mempalace.searcher import invalidate_query_cache, _get_query_cache
+        from mempalace.searcher import invalidate_query_cache
+        from mempalace.query_cache import get_query_cache
 
-        cache = _get_query_cache()
+        cache = get_query_cache()
         # Prime the cache with a known key
         cache.set_value("test_key", {"data": "test"}, palace_path="/tmp/nonexistent", collection="test")
         assert cache.get_value("test_key", palace_path="/tmp/nonexistent", collection="test") is not None

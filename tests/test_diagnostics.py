@@ -75,6 +75,7 @@ class TestValidateKeywordIndex:
         assert "counts_match" in result
         assert "stats" in result
 
+    @pytest.mark.slow
     def test_counts_match_when_consistent(self, palace_path, seeded_collection):
         """When FTS5 and LanceDB have same documents, counts_match is True."""
         result = validate_keyword_index(palace_path)

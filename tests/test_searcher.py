@@ -364,7 +364,8 @@ class TestHybridSearch:
         # This test verifies the cache accessor exists and is callable.
         # Full cache behavior tested via integration in other tests.
         import mempalace.searcher as sr
-        cache = sr._get_query_cache()
+        from mempalace.query_cache import get_query_cache
+        cache = get_query_cache()
         assert cache is not None
 
     def test_cache_not_stored_on_error(self, palace_path, seeded_collection):
@@ -376,7 +377,8 @@ class TestHybridSearch:
     def test_cache_key_includes_all_params(self, palace_path, seeded_collection):
         """Different is_latest values produce different cache keys."""
         import mempalace.searcher as sr
-        cache = sr._get_query_cache()
+        from mempalace.query_cache import get_query_cache
+        cache = get_query_cache()
         cache.clear()
 
         # First call with is_latest=True

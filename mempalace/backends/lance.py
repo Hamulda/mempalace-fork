@@ -885,7 +885,13 @@ class LanceCollection(BaseCollection):
                 raise
 
     def _maybe_rebuild_fts(self) -> None:
-        """Throttled FTS index rebuild — runs every _reindex_threshold writes."""
+        """Throttled FTS index rebuild — runs every _reindex_threshold writes.
+
+        NOTE: LanceDB FTS auto-indexes new data on add(). This rebuild is only needed
+        as a safety measure after direct DB writes or migration scenarios where data
+        was inserted bypassing the normal write path. For normal add()/upsert() calls,
+        this is effectively a no-op from the searchability standpoint.
+        """
         self._writes_since_reindex += 1
         if self._writes_since_reindex >= self._reindex_threshold:
             try:
@@ -1063,7 +1069,6 @@ class LanceCollection(BaseCollection):
             batch = records[i : i + self.BATCH_SIZE]
             self._write_with_retry(lambda b=batch: self._table.add(b))
 
-        self._maybe_rebuild_fts()
         if self._optimizer:
             self._optimizer.record_write()
 
@@ -1159,24 +1164,8 @@ class LanceCollection(BaseCollection):
             batch = records[i : i + self.BATCH_SIZE]
             self._write_with_retry(lambda b=batch: self._table.add(b))
 
-        self._maybe_rebuild_fts()
         if self._optimizer:
             self._optimizer.record_write()
-
-        # Update FTS5 lexical index — best-effort (lexical_index is optional enhancement)
-        try:
-            from ..lexical_index import KeywordIndex
-            idx = KeywordIndex.get(self._palace_path)
-            for did, doc, meta in zip(final_ids, final_docs, final_metas):
-                idx.upsert_drawer(
-                    document_id=did,
-                    content=doc,
-                    wing=meta.get("wing", ""),
-                    room=meta.get("room", ""),
-                    language=meta.get("language", ""),
-                )
-        except Exception:
-            pass  # FTS5 index is optional — lexical search still works via BM25 fallback
 
         # Invalidate query cache
         from ..query_cache import get_query_cache
@@ -1419,15 +1408,6 @@ class LanceCollection(BaseCollection):
                 self._table.delete(where_clause)
 
             self._write_with_retry(do_delete)
-
-            # Sync FTS5 lexical index — delete each deleted ID from KeywordIndex
-            try:
-                from ..lexical_index import KeywordIndex
-                idx = KeywordIndex.get(self._palace_path)
-                for did in ids:
-                    idx.delete_drawer(did)
-            except Exception:
-                pass  # FTS5 index is optional
         elif where:
             # LanceDB's json_extract SQL cannot filter UTF-8 metadata_json strings.
             # Collect ALL matching ids in one full-table scan, then delete in batches.
@@ -1500,23 +1480,11 @@ class LanceCollection(BaseCollection):
                     return
 
                 # Delete matching ids in batches (single-id deletes preserve MVCC safety)
-                deleted_ids: list[str] = []
                 for i in range(0, len(matching_ids), batch_size):
                     for mid in matching_ids[i:i + batch_size]:
                         self._write_with_retry(
                             lambda i=mid: self._table.delete(f"id = '{i}'")
                         )
-                        deleted_ids.append(mid)
-
-                # Sync FTS5 lexical index — delete each deleted ID from KeywordIndex
-                if deleted_ids:
-                    try:
-                        from ..lexical_index import KeywordIndex
-                        idx = KeywordIndex.get(self._palace_path)
-                        for did in deleted_ids:
-                            idx.delete_drawer(did)
-                    except Exception:
-                        pass  # FTS5 index is optional
             except RuntimeError:
                 raise  # re-raise our own RuntimeError
             except Exception as e:

@@ -94,16 +94,6 @@ def _add_repo_rel_path(hits: list[dict], source_files: list[str]) -> list[dict]:
                 hit["repo_rel_path"] = _compute_repo_rel_path(sf, common)
     return hits
 
-def _get_query_cache():
-    """Return the canonical query cache singleton.
-
-    Uses the process-global singleton from query_cache.py so that
-    search_memories, fastmcp_server, and lance.py all share the same cache.
-    """
-    from .query_cache import get_query_cache
-    return get_query_cache()
-
-
 def _get_reranker():
     global _reranker
     if _reranker is None:
@@ -254,6 +244,10 @@ def search_memories(
     Used by the MCP server and other callers that need data.
     """
     from .config import MempalaceConfig
+
+    def _get_query_cache():
+        from .query_cache import get_query_cache
+        return get_query_cache()
 
     query = sanitize_query(query)
     if not query:
@@ -462,15 +456,13 @@ def invalidate_query_cache() -> None:
     palace_path+collection of the write.
     """
     try:
-        cache = _get_query_cache()
+        from .query_cache import get_query_cache
+        cache = get_query_cache()
         cache.clear()
     except Exception:
         pass
     logger.debug("Query cache cleared")
 
-
-# Alias for callers that use the older name
-invalidate_all_caches = invalidate_query_cache
 
 
 def _rrf_merge(result_lists: list, k: int = 60) -> list:
