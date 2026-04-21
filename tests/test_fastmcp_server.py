@@ -120,9 +120,10 @@ async def seeded_palace_client(tmp_path):
 
 
 async def test_list_tools_count(client):
-    """Verify server exposes exactly 26 tools."""
+    """Verify server exposes all registered tools (56 across 7 tool groups)."""
     tools = await client.list_tools()
-    assert len(tools) == 27
+    # 7 groups: search(12) + write(6) + kg(7) + code(5) + session(15) + symbol(5) + workflow(7) = 56
+    assert len(tools) == 56
 
 
 async def test_list_tools_contains_expected(client):
@@ -130,6 +131,7 @@ async def test_list_tools_contains_expected(client):
     tools = await client.list_tools()
     tool_names = {t.name for t in tools}
     expected = {
+        # search tools (12)
         "mempalace_status",
         "mempalace_list_wings",
         "mempalace_list_rooms",
@@ -141,22 +143,57 @@ async def test_list_tools_contains_expected(client):
         "mempalace_traverse_graph",
         "mempalace_find_tunnels",
         "mempalace_graph_stats",
-        "mempalace_kg_query",
-        "mempalace_kg_add",
-        "mempalace_kg_invalidate",
-        "mempalace_kg_supersede",
-        "mempalace_kg_history",
-        "mempalace_kg_timeline",
-        "mempalace_kg_stats",
+        "mempalace_eval",
+        # write tools (6)
         "mempalace_add_drawer",
         "mempalace_delete_drawer",
         "mempalace_diary_write",
         "mempalace_diary_read",
-        "mempalace_project_context",
         "mempalace_remember_code",
         "mempalace_consolidate",
+        # kg tools (7)
+        "mempalace_kg_query",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
+        "mempalace_kg_timeline",
+        "mempalace_kg_stats",
+        "mempalace_kg_history",
+        # code tools (5)
+        "mempalace_search_code",
+        "mempalace_auto_search",
+        "mempalace_file_context",
+        "mempalace_project_context",
         "mempalace_export_claude_md",
-        "mempalace_eval",
+        # session tools (15)
+        "mempalace_claim_path",
+        "mempalace_release_claim",
+        "mempalace_list_claims",
+        "mempalace_conflict_check",
+        "mempalace_file_status",
+        "mempalace_workspace_claims",
+        "mempalace_edit_guidance",
+        "mempalace_push_handoff",
+        "mempalace_pull_handoffs",
+        "mempalace_accept_handoff",
+        "mempalace_complete_handoff",
+        "mempalace_wakeup_context",
+        "mempalace_capture_decision",
+        "mempalace_list_decisions",
+        # symbol tools (5)
+        "mempalace_find_symbol",
+        "mempalace_search_symbols",
+        "mempalace_callers",
+        "mempalace_recent_changes",
+        "mempalace_file_symbols",
+        # workflow tools (7)
+        "mempalace_begin_work",
+        "mempalace_prepare_edit",
+        "mempalace_finish_work",
+        "mempalace_publish_handoff",
+        "mempalace_takeover_work",
+        "mempalace_begin_work_batch",
+        "mempalace_finish_work_batch",
     }
     assert expected.issubset(tool_names), f"Missing tools: {expected - tool_names}"
 

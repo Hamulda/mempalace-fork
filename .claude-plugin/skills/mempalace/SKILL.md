@@ -54,3 +54,11 @@ If MemPalace MCP tools return an error, start the server:
 python3 -m mempalace.fastmcp_server
 ```
 Server URL: `http://127.0.0.1:8765/mcp`
+
+**Verify health:**
+```bash
+curl http://127.0.0.1:8765/health
+# → {"status": "ok", "service": "mempalace"}
+```
+
+**Using the Claude Code plugin?** The plugin handles MCP registration persistently. After running `claude plugin install --scope user mempalace` and restarting Claude Code, tools appear automatically — no manual `claude mcp add` needed.

@@ -230,13 +230,13 @@ class TestInvalidateQueryCacheContract:
                 key = f"{palace}|default|q{i}|None|None|None|None|5|False|None|None"
                 cache.set_value(key, {"palace": palace, "i": i})
 
-        initial_entries = len(cache._cache)
+        initial_entries = cache._total_size()
         assert initial_entries > 0
 
         invalidate_query_cache()
 
         # All entries gone
-        assert len(cache._cache) == 0
+        assert cache._total_size() == 0
 
     def test_write_tool_chain_full_clear(self):
         """Simulate full write tool chain: Lance write → invalidate_query_cache."""

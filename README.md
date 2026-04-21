@@ -130,7 +130,7 @@ Restart Claude Code, then type `/skills` to verify "mempalace" appears.
 claude mcp add mempalace -- python -m mempalace.fastmcp_server
 ```
 
-Now your AI has 27 tools available through MCP. Ask it anything:
+Now your AI has 56 tools available through MCP. Ask it anything:
 
 > *"What did we decide about auth last month?"*
 
@@ -482,7 +482,7 @@ transport:
 These are activated by `shared_server_mode=True` (default for HTTP transport).
 Stdio/dev mode does not activate them — safe for development, not for multi-session.
 
-### 27 Tools
+### Tools
 
 **Palace (read)**
 
@@ -686,7 +686,7 @@ mempalace/
 ├── README.md                  ← you are here
 ├── mempalace/                 ← core package (README)
 │   ├── cli.py                 ← CLI entry point
-│   ├── fastmcp_server.py          ← MCP server (27 tools)
+│   ├── fastmcp_server.py          ← MCP server entry point
 │   ├── knowledge_graph.py     ← temporal entity graph
 │   ├── palace_graph.py        ← room navigation graph
 │   ├── dialect.py             ← AAAK compression

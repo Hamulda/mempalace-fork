@@ -246,7 +246,7 @@ class TestSearchCacheIntegration:
         from mempalace.searcher import invalidate_query_cache, _get_query_cache
 
         cache = _get_query_cache()
-        initial_size = len(cache._cache)
+        initial_size = cache._total_size()
 
         # Simulate search_memories writing entries
         keys = [
@@ -256,7 +256,7 @@ class TestSearchCacheIntegration:
         for k in keys:
             cache.set_value(k, {"results": k})
 
-        assert len(cache._cache) == initial_size + 2
+        assert cache._total_size() == initial_size + 2
 
         invalidate_query_cache()
 

@@ -50,7 +50,7 @@ For takeover:
 
 ---
 
-## MCP Tools (27)
+## MCP Tools (57 across 7 groups)
 
 ### Palace (read)
 - mempalace_status -- Palace status and stats
@@ -74,7 +74,7 @@ For takeover:
 - mempalace_kg_stats -- Knowledge graph statistics
 
 ### Navigation
-- mempalace_traverse -- Traverse the palace structure
+- mempalace_traverse_graph -- Traverse the palace structure
 - mempalace_find_tunnels -- Find cross-wing connections
 - mempalace_graph_stats -- Graph connectivity statistics
 

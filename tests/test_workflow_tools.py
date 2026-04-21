@@ -88,6 +88,19 @@ class _MockClaimsManager:
             if c["session_id"] == session_id and c["expires_at"] > now
         ]
 
+    def get_claim(self, target_type, target_id):
+        key = (target_type, target_id)
+        c = self._claims.get(key)
+        if c is None or c["expires_at"] <= _now():
+            return None
+        return {
+            "session_id": c["session_id"],
+            "target_type": target_type,
+            "target_id": target_id,
+            "payload": c.get("payload", {}),
+            "expires_at": c["expires_at"],
+        }
+
 
 class _MockWriteCoordinator:
     def __init__(self):
@@ -1508,6 +1521,344 @@ class TestTier2BackwardCompatibility:
                 "mempalace_conflict_check",
             ]:
                 assert low_level in tool_names, f"{low_level} missing"
+
+            if hasattr(mcp, "_claims_manager"):
+                mcp._claims_manager.close()
+            if hasattr(mcp, "_handoff_manager"):
+                mcp._handoff_manager.close()
+            if hasattr(mcp, "_decision_tracker"):
+                mcp._decision_tracker.close()
+        finally:
+            if original_pp:
+                os.environ["MEMPALACE_PALACE_PATH"] = original_pp
+            elif "MEMPALACE_PALACE_PATH" in os.environ:
+                del os.environ["MEMPALACE_PALACE_PATH"]
+
+
+# ---------------------------------------------------------------------------
+# Test: begin_work_batch — atomic multi-file claims
+# ---------------------------------------------------------------------------
+
+class TestBeginWorkBatchUnit:
+    """Unit tests for _do_begin_work_batch."""
+
+    def test_batch_all_paths_free_acquires_all(self):
+        """All paths unclaimed → all acquired, ok=True."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, acquired, conflict_map = _do_begin_work_batch(
+            ctx, ["/src/a.py", "/src/b.py", "/src/c.py"],
+            "session-a", 1800, "multi-file refactor",
+            claims, wc,
+        )
+        assert result["ok"] is True
+        assert acquired is True
+        assert result["paths"] == ["/src/a.py", "/src/b.py", "/src/c.py"]
+        assert result["owner"] == "session-a"
+        assert result["intent_id"] is not None
+        for path in ["/src/a.py", "/src/b.py", "/src/c.py"]:
+            c = claims.get_claim("file", path)
+            assert c is not None
+            assert c["session_id"] == "session-a"
+
+    def test_batch_one_blocked_fails_all(self):
+        """One path blocked → entire batch fails, no partial state."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        # session-b holds /src/b.py — this should be in the blocked list
+        claims.claim("file", "/src/b.py", "session-b")
+
+        result, acquired, conflict_map = _do_begin_work_batch(
+            ctx, ["/src/a.py", "/src/b.py", "/src/c.py"],
+            "session-a", 1800, "multi-file refactor",
+            claims, wc,
+        )
+        assert result["ok"] is False
+        assert acquired is False
+        assert result["failure_mode"] == "batch_claim_conflict"
+        # a.py and c.py were never claimed (no partial state)
+        assert claims.get_claim("file", "/src/a.py") is None
+        assert claims.get_claim("file", "/src/c.py") is None
+        # b.py still held by session-b (blocked, not claimed by session-a)
+        b_claim = claims.get_claim("file", "/src/b.py")
+        assert b_claim is not None
+        assert b_claim["session_id"] == "session-b"
+        # blocked_paths details
+        assert len(result["details"]["blocked_paths"]) == 1
+        assert result["details"]["blocked_paths"][0]["path"] == "/src/b.py"
+
+    def test_batch_partial_acquire_rollback(self):
+        """If claim() fails on second path after first acquired → rollback."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        claims.claim("file", "/src/a.py", "session-a")
+
+        original_claim = claims.claim
+        def bad_claim(target_type, target_id, session_id, ttl_seconds=600, payload=None):
+            if target_id == "/src/b.py":
+                return {"acquired": False, "owner": "session-c"}
+            return original_claim(target_type, target_id, session_id, ttl_seconds, payload)
+        claims.claim = bad_claim
+
+        result, acquired, conflict_map = _do_begin_work_batch(
+            ctx, ["/src/a.py", "/src/b.py"],
+            "session-a", 1800, "refactor",
+            claims, wc,
+        )
+        assert result["ok"] is False
+        assert result["failure_mode"] == "batch_partial_failure"
+        a_claim = claims.get_claim("file", "/src/a.py")
+        assert a_claim is None
+
+    def test_batch_pending_edits_in_workflow_state(self):
+        """Success result includes pending_edits with paths + deadline."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, _, _ = _do_begin_work_batch(
+            ctx, ["/src/a.py", "/src/b.py"],
+            "session-a", 1800, "auth refactor",
+            claims, wc,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert "pending_edits" in ws
+        assert ws["pending_edits"]["paths"] == ["/src/a.py", "/src/b.py"]
+        assert ws["pending_edits"]["expected_outcome"] == "auth refactor"
+        assert ws["pending_edits"]["claim_ttl_seconds"] == 1800
+        assert "edits_must_happen_before" in ws["pending_edits"]
+
+    def test_batch_next_tool_is_prepare_edit(self):
+        """next_tool after success is mempalace_prepare_edit."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, _, _ = _do_begin_work_batch(
+            ctx, ["/src/a.py"], "session-a", 600, None, claims, wc,
+        )
+        assert result["ok"] is True
+        assert result["workflow_state"]["next_tool"] == "mempalace_prepare_edit"
+
+    def test_batch_self_claim_is_not_blocking(self):
+        """Session already holding one path in batch → refreshes, not blocked."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        claims.claim("file", "/src/a.py", "session-a")
+
+        result, acquired, conflict_map = _do_begin_work_batch(
+            ctx, ["/src/a.py", "/src/b.py"],
+            "session-a", 600, "continue refactor",
+            claims, wc,
+        )
+        assert result["ok"] is True
+
+
+class TestFinishWorkBatchUnit:
+    """Unit tests for _do_finish_work_batch."""
+
+    def test_finish_batch_releases_all_claims(self):
+        """finish_work_batch releases all path claims."""
+        from mempalace.server._workflow_tools import _do_finish_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        dt = _MockDecisionTracker()
+        ctx = MagicMock()
+
+        for path in ["/src/a.py", "/src/b.py"]:
+            claims.claim("file", path, "session-a")
+
+        result = _do_finish_work_batch(
+            ctx, ["/src/a.py", "/src/b.py"], "session-a",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        for path in ["/src/a.py", "/src/b.py"]:
+            c = claims.get_claim("file", path)
+            assert c is None
+
+    def test_finish_batch_with_diary_writes_one_entry(self):
+        """With diary_entry → one diary_id returned."""
+        from mempalace.server._workflow_tools import _do_finish_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        dt = _MockDecisionTracker()
+        ctx = MagicMock()
+
+        class _FakeCollection:
+            def upsert(self, ids, documents, metadatas):
+                self.ids = ids
+                self.metadatas = metadatas
+
+        class _FakeBackend:
+            def get_collection(self):
+                return _FakeCollection()
+
+        backend = _FakeBackend()
+
+        result = _do_finish_work_batch(
+            ctx, ["/src/a.py", "/src/b.py"], "session-a",
+            diary_entry="Refactored auth module",
+            topic="refactor", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=backend,
+        )
+        assert result["ok"] is True
+        assert result["diary_id"] is not None
+        assert result["diary_entry"] == "Refactored auth module"
+        assert result["context_snippets"]["paths"] == ["/src/a.py", "/src/b.py"]
+
+    def test_finish_batch_pending_edits_cleared(self):
+        """Success clears pending_edits in workflow_state."""
+        from mempalace.server._workflow_tools import _do_finish_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        dt = _MockDecisionTracker()
+        ctx = MagicMock()
+
+        result = _do_finish_work_batch(
+            ctx, ["/src/a.py"], "session-a",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        ws = result.get("workflow_state", {})
+        assert ws["pending_edits"] is None
+
+    def test_finish_batch_no_partial_failure_on_individual_release(self):
+        """One path can't be released → still reports it, doesn't fail."""
+        from mempalace.server._workflow_tools import _do_finish_work_batch
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        dt = _MockDecisionTracker()
+        ctx = MagicMock()
+
+        claims.claim("file", "/src/a.py", "session-a")
+
+        result = _do_finish_work_batch(
+            ctx, ["/src/a.py", "/src/b.py"], "session-a",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        released_paths = [r["path"] for r in result["released_claims"] if r["success"]]
+        assert "/src/a.py" in released_paths
+
+
+class TestBeginWorkBatchRegistration:
+    """Verify batch tools register correctly."""
+
+    def test_register_workflow_tools_includes_batch_tools(self, tmp_path):
+        """register_workflow_tools registers begin_work_batch and finish_work_batch."""
+        from unittest.mock import MagicMock
+        from mempalace.server._workflow_tools import register_workflow_tools
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = str(tmp_path)
+
+        class _MockSettings:
+            def __init__(self):
+                self.palace_path = tmp
+                self.db_path = tmp
+                self.effective_collection_name = "test"
+                self.wal_dir = tmp
+                self.timeout_write = 30
+                self.timeout_read = 15
+                self.timeout_embed = 60
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._shared_server_mode = True
+        server._claims_manager = _MockClaimsManager()
+        server._handoff_manager = _MockHandoffManager()
+        server._decision_tracker = _MockDecisionTracker()
+        server._write_coordinator = _MockWriteCoordinator()
+
+        captured = {}
+        _orig = server.tool
+        def capture(**kwargs):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        backend = MagicMock()
+        config = MagicMock()
+        config.palace_path = tmp
+        settings = _MockSettings()
+
+        register_workflow_tools(server, backend, config, settings)
+        server.tool = _orig
+
+        for name in ["mempalace_begin_work_batch", "mempalace_finish_work_batch"]:
+            assert name in captured, f"{name} not registered"
+
+
+class TestWorkflowToolsBatchIntegration:
+    """Integration: full batch workflow tools appear in tool list."""
+
+    @pytest.mark.asyncio
+    async def test_batch_workflow_all_registered(self, tmp_path):
+        """Full batch workflow tools appear in tool list."""
+        import os
+        from mempalace.server.factory import create_server
+        from mempalace.settings import MemPalaceSettings
+
+        original_pp = os.environ.get("MEMPALACE_PALACE_PATH")
+        palace = str(tmp_path / "batch_palace")
+        os.environ["MEMPALACE_PALACE_PATH"] = palace
+
+        try:
+            settings = MemPalaceSettings()
+            settings.palace_path = palace
+            settings.db_path = str(tmp_path / "db")
+            settings.transport = "stdio"
+
+            mcp = create_server(settings=settings, shared_server_mode=True)
+            tool_names = [t.name for t in await mcp.list_tools()]
+
+            for batch_tool in ["mempalace_begin_work_batch", "mempalace_finish_work_batch"]:
+                assert batch_tool in tool_names, f"{batch_tool} missing from {tool_names}"
 
             if hasattr(mcp, "_claims_manager"):
                 mcp._claims_manager.close()

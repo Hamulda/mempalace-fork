@@ -3,7 +3,7 @@ LRU cache pro MemPalace query výsledky.
 TTL 5s zajišťuje čerstvost bez zbytečných redundantních searchů.
 
 Canonical cache story:
-- DVA oddělené přístupy ke stejnému _cache slovníku:
+- DVA oddělené přástupy ke stejnému _cache slovníku:
   1. get()/set() — strukturovaný klíč (palace_path, collection, query_texts, n_results),
      chráněno _last_write timestampem (invalidate_collection nastaví timestamp,
      get() zkontroluje při každém čtení)
@@ -15,6 +15,8 @@ Canonical cache story:
 - invalidate_collection(palace_path, collection) → maže přímo entries z _cache
   pro obě rozhraní najednou
 """
+from __future__ import annotations
+
 import time
 import threading
 from collections import OrderedDict
@@ -37,22 +39,51 @@ class QueryCache:
 
     Cache key pro get/set: hash(collection + query_texts + n_results)
     Cache key pro get_value/set_value: libovolný string (caller definuje format)
+
+    Sharded locking: 8 shards reduce read/write contention under concurrent
+    use. Each shard has its own lock and LRU dict — concurrent sessions hitting
+    different palace+collection combos proceed in parallel.
     """
+
+    _NUM_SHARDS = 8
 
     def __init__(
         self,
         maxsize: int = 256,
         ttl_seconds: float = 60.0,
     ):
-        self._cache: OrderedDict[str, tuple[Any, float]] = OrderedDict()
         self._maxsize = maxsize
         self._ttl = ttl_seconds
-        self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
-        # Per-(palace_path, collection) write timestamps for cross-palace isolation.
-        # Key format: (palace_path, collection_name) — palace_path "" means global.
-        self._last_write: dict[tuple[str, str], float] = {}
+        # Per-shard data structures — each shard is fully independent
+        self._shards: list[dict] = [
+            {
+                "cache": OrderedDict[str, tuple[Any, float]](),
+                # Per-(palace_path, collection) write timestamps for cross-palace isolation.
+                "last_write": {},  # Key: (palace_path, collection_name)
+            }
+            for _ in range(self._NUM_SHARDS)
+        ]
+        # One lock per shard — concurrent access to different shards is parallel
+        self._shard_locks = [threading.Lock() for _ in range(self._NUM_SHARDS)]
+        self._global_lock = threading.Lock()  # Only for stats() access
+
+    def _shard_idx(self, palace_path: str, collection: str) -> int:
+        """Select shard from palace_path + collection (stable, no hash randomization)."""
+        key = f"{palace_path or ''}|{collection or ''}"
+        return hash(key) % self._NUM_SHARDS
+
+    def _make_key(
+        self, palace_path: str, collection: str, query_texts: list[str], n_results: int
+    ) -> str:
+        raw = json.dumps({
+            "p": palace_path,
+            "c": collection,
+            "q": query_texts,
+            "n": n_results,
+        }, sort_keys=True)
+        return hashlib.md5(raw.encode()).hexdigest()
 
     def _make_key(
         self, palace_path: str, collection: str, query_texts: list[str], n_results: int
@@ -75,31 +106,40 @@ class QueryCache:
         """Vrátí cached výsledek nebo None pokud cache miss/expired."""
         key = self._make_key(palace_path, collection, query_texts, n_results)
         now = time.monotonic()
+        shard_idx = self._shard_idx(palace_path, collection)
+        lock = self._shard_locks[shard_idx]
+        shard = self._shards[shard_idx]
 
-        with self._lock:
-            if key not in self._cache:
-                self._misses += 1
+        with lock:
+            cache = shard["cache"]
+            last_write = shard["last_write"]
+
+            if key not in cache:
+                with self._global_lock:
+                    self._misses += 1
                 return None
 
-            result, ts = self._cache[key]
+            result, ts = cache[key]
 
             # Zkontroluj TTL
             if now - ts > self._ttl:
-                del self._cache[key]
-                self._misses += 1
+                del cache[key]
+                with self._global_lock:
+                    self._misses += 1
                 return None
 
             # Zkontroluj jestli nebyl write po uložení do cache
-            # Use (palace_path, collection) composite key for cross-palace accuracy
-            last_write = self._last_write.get((palace_path, collection), 0.0)
-            if last_write > ts:
-                del self._cache[key]
-                self._misses += 1
+            last_write_ts = last_write.get((palace_path, collection), 0.0)
+            if last_write_ts > ts:
+                del cache[key]
+                with self._global_lock:
+                    self._misses += 1
                 return None
 
             # Cache hit – přesuň na konec (LRU update)
-            self._cache.move_to_end(key)
-            self._hits += 1
+            cache.move_to_end(key)
+            with self._global_lock:
+                self._hits += 1
             return result
 
     def set(
@@ -113,43 +153,41 @@ class QueryCache:
         """Uloží výsledek do cache."""
         key = self._make_key(palace_path, collection, query_texts, n_results)
         now = time.monotonic()
+        shard_idx = self._shard_idx(palace_path, collection)
+        lock = self._shard_locks[shard_idx]
+        shard = self._shards[shard_idx]
 
-        with self._lock:
-            self._cache[key] = (result, now)
-            self._cache.move_to_end(key)
+        with lock:
+            cache = shard["cache"]
+            cache[key] = (result, now)
+            cache.move_to_end(key)
 
-            # Evict nejstarší položky pokud překračujeme maxsize
-            while len(self._cache) > self._maxsize:
-                self._cache.popitem(last=False)
+            # Evict nejstarší položky pokud překračujeme maxsize (per-shard)
+            while len(cache) > self._maxsize:
+                cache.popitem(last=False)
 
     def invalidate_collection(self, palace_path: str, collection: str) -> None:
         """
-        Invalidate ALL cache entries for (palace_path, collection).
+        Invalidate ALL cache entries for (palace_path, collection) across ALL shards.
         Removes entries from both interfaces:
         - get()/set(): tuple-keyed entries matching this palace+collection
         - get_value()/set_value(): raw-string-keyed entries whose key starts with
           "{palace_path}|{collection}|" (the format used by search_memories)
         For full cross-palace flush (all palace+collection), use clear().
         """
-        with self._lock:
-            self._last_write[(palace_path, collection)] = time.monotonic()
-            # Evict structured-key entries (get/set interface)
-            # Tuple key format: (palace_path, collection, query_texts, n_results)
-            to_remove = [k for k in self._cache
-                         if isinstance(k, tuple)
-                         and len(k) >= 2
-                         and k[0] == palace_path
-                         and k[1] == collection]
-            for k in to_remove:
-                del self._cache[k]
-            # Evict raw-string-key entries (get_value/set_value interface)
-            # String key format used by search_memories:
-            # f"{palace_path}|{collection_name}|{query}|{wing}|{room}|..."
-            prefix = f"{palace_path}|{collection}|"
-            to_remove_str = [k for k in self._cache
-                             if isinstance(k, str) and k.startswith(prefix)]
-            for k in to_remove_str:
-                del self._cache[k]
+        prefix = f"{palace_path}|{collection}|"
+        target_shard = self._shard_idx(palace_path, collection)
+        for i in range(self._NUM_SHARDS):
+            lock = self._shard_locks[i]
+            with lock:
+                shard = self._shards[i]
+                cache = shard["cache"]
+                if i == target_shard:
+                    shard["last_write"][(palace_path, collection)] = time.monotonic()
+                # Evict raw-string-key entries with matching prefix
+                for k in list(cache.keys()):
+                    if isinstance(k, str) and k.startswith(prefix):
+                        cache.pop(k, None)
 
     def get_value(self, key: str, palace_path: str = "", collection: str = "") -> Optional[Any]:
         """
@@ -161,21 +199,39 @@ class QueryCache:
         cross-palace isolation is provided by palace_path being embedded
         in the key string itself.
         """
-        with self._lock:
+        # Extract palace_path+collection from the key itself when not provided.
+        # This is critical for cross-shard correctness: the key format is
+        # "{palace_path}|{collection}|..." so we can parse it.
+        if palace_path and collection:
+            shard_idx = self._shard_idx(palace_path, collection)
+        else:
+            # Parse palace_path+collection from the key for correct shard routing
+            parts = key.split("|", 2)
+            if len(parts) >= 2:
+                palace_path, collection = parts[0], parts[1]
+            shard_idx = self._shard_idx(palace_path or "", collection or "")
+        lock = self._shard_locks[shard_idx]
+        shard = self._shards[shard_idx]
+
+        with lock:
             try:
-                value, ts = self._cache[key]
+                cache = shard["cache"]
+                value, ts = cache[key]
                 if time.monotonic() - ts < self._ttl:
                     # _last_write staleness check for this palace+collection
                     if palace_path and collection:
-                        last_write = self._last_write.get((palace_path, collection), 0.0)
-                        if last_write > ts:
-                            del self._cache[key]
-                            self._misses += 1
+                        last_write_ts = shard["last_write"].get((palace_path, collection), 0.0)
+                        if last_write_ts > ts:
+                            del cache[key]
+                            with self._global_lock:
+                                self._misses += 1
                             return None
                     return value
-                del self._cache[key]
+                del cache[key]
             except (KeyError, TypeError, AttributeError):
                 pass
+            with self._global_lock:
+                self._misses += 1
             return None
 
     def set_value(self, key: str, value: Any, palace_path: str = "", collection: str = "") -> None:
@@ -188,34 +244,61 @@ class QueryCache:
         does. Staleness for raw-key entries is handled by invalidate_collection()
         scanning for matching prefix keys, not by _last_write timestamp comparison.
         """
-        with self._lock:
+        # Extract palace_path+collection from the key itself when not provided.
+        if palace_path and collection:
+            shard_idx = self._shard_idx(palace_path, collection)
+        else:
+            parts = key.split("|", 2)
+            if len(parts) >= 2:
+                palace_path, collection = parts[0], parts[1]
+            shard_idx = self._shard_idx(palace_path or "", collection or "")
+        lock = self._shard_locks[shard_idx]
+        shard = self._shards[shard_idx]
+
+        with lock:
             try:
                 now = time.monotonic()
-                self._cache[key] = (value, now)
-                self._cache.move_to_end(key)
-                while len(self._cache) > self._maxsize:
-                    self._cache.popitem(last=False)
+                cache = shard["cache"]
+                cache[key] = (value, now)
+                cache.move_to_end(key)
+                while len(cache) > self._maxsize:
+                    cache.popitem(last=False)
             except Exception:
                 pass
 
     def clear(self) -> None:
-        """Remove all cached entries."""
-        with self._lock:
-            try:
-                self._cache.clear()
-            except Exception:
-                pass
+        """Remove all cached entries across all shards."""
+        for i in range(self._NUM_SHARDS):
+            with self._shard_locks[i]:
+                try:
+                    self._shards[i]["cache"].clear()
+                    self._shards[i]["last_write"].clear()
+                except Exception:
+                    pass
 
     def stats(self) -> dict:
-        with self._lock:
+        with self._global_lock:
             total = self._hits + self._misses
             hit_rate = self._hits / total if total > 0 else 0.0
-            return {
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_rate": f"{hit_rate:.1%}",
-                "cached_entries": len(self._cache),
-            }
+            cached = sum(len(s["cache"]) for s in self._shards)
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": f"{hit_rate:.1%}",
+            "cached_entries": cached,
+            "shards": self._NUM_SHARDS,
+        }
+
+    def _total_size(self) -> int:
+        """Total entries across all shards. For test compatibility."""
+        return sum(len(s["cache"]) for s in self._shards)
+
+    def _all_keys(self) -> set[str]:
+        """All keys across all shards. For test compatibility."""
+        result = set()
+        for shard in self._shards:
+            result.update(shard["cache"].keys())
+        return result
 
 
 # Globální cache singleton sdílená v HTTP MCP serveru

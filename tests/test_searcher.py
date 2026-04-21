@@ -377,15 +377,15 @@ class TestHybridSearch:
         """Different is_latest values produce different cache keys."""
         import mempalace.searcher as sr
         cache = sr._get_query_cache()
-        cache._cache.clear()
+        cache.clear()
 
         # First call with is_latest=True
         r1 = search_memories("JWT", palace_path, n_results=3, is_latest=True)
-        keys_after_first = set(cache._cache.keys())
+        keys_after_first = cache._all_keys()
 
         # Second call with is_latest=False — different key
         r2 = search_memories("JWT", palace_path, n_results=3, is_latest=False)
-        keys_after_second = set(cache._cache.keys())
+        keys_after_second = cache._all_keys()
 
         # Keys should differ
         assert keys_after_first != keys_after_second, "Different is_latest must produce different cache key"

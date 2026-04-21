@@ -1,7 +1,7 @@
 {
   "name": "mempalace",
   "version": "3.1.0",
-  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 19 MCP tools, auto-save hooks, and guided setup. Run 'python3 -m mempalace.fastmcp_server' before use.",
+  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 56 MCP tools, session coordination, and guided workflow. LanceDB-backed, runs locally.",
   "author": {
     "name": "milla-jovovich"
   },

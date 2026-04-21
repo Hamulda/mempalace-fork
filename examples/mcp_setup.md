@@ -9,7 +9,7 @@ pip install mempalace && python -m mempalace.fastmcp_server &
 
 **Verify it's running:**
 ```bash
-curl http://127.0.0.1:8766/health
+curl http://127.0.0.1:8765/health
 # → {"status": "ok", "service": "mempalace"}
 ```
 
@@ -53,7 +53,7 @@ Default backend is **LanceDB** (local, zero API calls). ChromaDB is available vi
 
 ## Troubleshooting
 
-**Port 8766 already in use:**
+**Port 8765 already in use:**
 ```bash
 pkill -f mempalace.fastmcp_server
 python -m mempalace.fastmcp_server &

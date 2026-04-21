@@ -217,6 +217,12 @@ def _do_begin_work(
                 "next_tool": "mempalace_prepare_edit",
                 "conflict_status": "self_claim" if is_self else "none",
                 "handoff_pending": False,
+                "pending_edits": {
+                    "paths": [path],
+                    "expected_outcome": note or "file edited",
+                    "claim_ttl_seconds": ttl_seconds,
+                    "edits_must_happen_before": expires_at,
+                },
             },
         ),
         True,
@@ -771,6 +777,331 @@ def _do_takeover_work(
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# mempalace_begin_work_batch
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _do_begin_work_batch(
+    ctx: Context,
+    paths: list[str],
+    session_id: str,
+    ttl_seconds: int,
+    note: str | None,
+    claims_mgr,
+    write_coordinator,
+) -> dict:
+    """
+    Atomic multi-file claim: all-or-nothing conflict check + claim for a file set.
+
+    Checks conflicts on ALL paths first. If any path is blocked by another
+    session, the entire batch fails — no partial state is created.
+
+    Returns (workflow_result, all_acquired, conflict_map).
+    """
+    if claims_mgr is None:
+        return (
+            _fail(
+                _phase("begin_work_batch", "init"),
+                "begin_work_batch",
+                reason="session coordination not available",
+                hint="Run with shared_server_mode=True or transport='http'",
+                failure_mode="no_coordination",
+                workflow_state={
+                    "current_phase": "unavailable",
+                    "next_phase": None,
+                    "next_tool": None,
+                    "conflict_status": "unknown",
+                    "handoff_pending": False,
+                },
+            ),
+            False,
+            {},
+        )
+
+    # Step 1: conflict check on ALL paths first (all-or-nothing)
+    conflict_map: dict[str, dict] = {}
+    blocked_paths: list[dict] = []
+    for path in paths:
+        conflict = claims_mgr.check_conflicts("file", path, session_id)
+        conflict_map[path] = conflict
+        if conflict.get("has_conflict") and not conflict.get("is_self"):
+            blocked_paths.append({
+                "path": path,
+                "owner": conflict.get("owner"),
+                "expires_at": conflict.get("expires_at"),
+            })
+
+    if blocked_paths:
+        return (
+            _fail(
+                _phase("begin_work_batch", "conflict_check"),
+                "begin_work_batch",
+                reason=f"{len(blocked_paths)} path(s) blocked by other sessions",
+                hint="Wait for TTL expiry or negotiate via mempalace_push_handoff",
+                failure_mode="batch_claim_conflict",
+                details={"blocked_paths": blocked_paths},
+                workflow_state={
+                    "current_phase": "blocked",
+                    "next_phase": "negotiate",
+                    "next_tool": "mempalace_push_handoff",
+                    "conflict_status": "other_claim",
+                    "handoff_pending": False,
+                },
+                next_actions=[{
+                    "action": "mempalace_push_handoff",
+                    "reason": f"{len(blocked_paths)} file(s) claimed by other sessions — negotiate or wait",
+                    "priority": "high",
+                }],
+            ),
+            False,
+            conflict_map,
+        )
+
+    # Step 2: acquire claims on ALL paths
+    acquired_paths: list[dict] = []
+    failed_paths: list[dict] = []
+    for path in paths:
+        payload = {"note": note, "path": path} if note else {"path": path}
+        claim_result = claims_mgr.claim("file", path, session_id, ttl_seconds=ttl_seconds, payload=payload)
+        if claim_result.get("acquired"):
+            acquired_paths.append({"path": path, "owner": session_id, "expires_at": claim_result.get("expires_at")})
+        else:
+            failed_paths.append({"path": path, "owner": claim_result.get("owner")})
+
+    # If any failed, fail the whole batch (rollback acquired claims)
+    if failed_paths:
+        for p in acquired_paths:
+            try:
+                claims_mgr.release_claim("file", p["path"], session_id)
+            except Exception:
+                pass
+        return (
+            _fail(
+                _phase("begin_work_batch", "claim_acquire"),
+                "begin_work_batch",
+                reason="Some paths could not be acquired",
+                hint="Check session health and retry",
+                failure_mode="batch_partial_failure",
+                details={
+                    "acquired": acquired_paths,
+                    "failed": failed_paths,
+                },
+                workflow_state={
+                    "current_phase": "blocked",
+                    "next_phase": "retry",
+                    "next_tool": "mempalace_begin_work_batch",
+                    "conflict_status": "unknown",
+                    "handoff_pending": False,
+                },
+            ),
+            False,
+            conflict_map,
+        )
+
+    # Step 3: log batch intent to WriteCoordinator
+    intent_id = None
+    if write_coordinator and session_id:
+        try:
+            intent_id = write_coordinator.log_intent(
+                session_id, "edit_batch", "file", "|".join(paths),
+                {"note": note, "paths": paths}
+            )
+        except Exception:
+            pass  # fail-open on intent logging
+
+    expires_at = acquired_paths[0]["expires_at"] if acquired_paths else "unknown"
+
+    data = {
+        "paths": paths,
+        "session_id": session_id,
+        "owner": session_id,
+        "expires_at": expires_at,
+        "intent_id": intent_id,
+    }
+
+    next_actions = [{
+        "action": "mempalace_prepare_edit",
+        "reason": "Get symbol context for each claimed file before editing",
+        "priority": "high",
+    }]
+
+    return (
+        _ok(
+            _phase("begin_work_batch", "done"),
+            "begin_work_batch",
+            data,
+            next_actions,
+            context_snippets={"paths": paths, "note": note or "", "count": len(paths)},
+            workflow_state={
+                "current_phase": "claim_acquired",
+                "next_phase": "prepare",
+                "next_tool": "mempalace_prepare_edit",
+                "conflict_status": "none",
+                "handoff_pending": False,
+                "pending_edits": {
+                    "paths": paths,
+                    "expected_outcome": note or f"{len(paths)} files edited",
+                    "claim_ttl_seconds": ttl_seconds,
+                    "edits_must_happen_before": expires_at,
+                },
+            },
+        ),
+        True,
+        conflict_map,
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# mempalace_finish_work_batch
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _do_finish_work_batch(
+    ctx: Context,
+    paths: list[str],
+    session_id: str,
+    diary_entry: str | None,
+    topic: str,
+    agent_name: str,
+    capture_decision: str | None,
+    rationale: str | None,
+    decision_category: str,
+    decision_confidence: int,
+    claims_mgr,
+    decision_tracker,
+    backend,
+) -> dict:
+    """
+    Release all claims in paths + optionally write one diary entry + optionally
+    capture one decision for the batch.
+
+    All-or-nothing release attempt: tries to release each path, collects results.
+    Diary is written once for the entire batch (not per-file).
+    """
+    if claims_mgr is None:
+        return _fail(
+            _phase("finish_work_batch", "init"),
+            "finish_work_batch",
+            reason="session coordination not available",
+            hint="Run with shared_server_mode=True or transport='http'",
+            failure_mode="no_coordination",
+            workflow_state={
+                "current_phase": "unavailable",
+                "next_phase": None,
+                "next_tool": None,
+                "conflict_status": "unknown",
+                "handoff_pending": False,
+            },
+        )
+
+    results = []
+    errors = []
+
+    # Step 1: release all claims
+    released: list[dict] = []
+    for path in paths:
+        try:
+            release_result = claims_mgr.release_claim("file", path, session_id)
+            released.append({"path": path, "success": release_result.get("success")})
+            results.append(f"claim_released:{path}:{release_result.get('success')}")
+        except Exception as e:
+            errors.append(f"claim_release:{path}:{e}")
+            released.append({"path": path, "success": False, "error": str(e)})
+
+    # Step 2: write one diary entry for the batch
+    diary_id = None
+    if diary_entry and backend:
+        try:
+            from ..config import sanitize_name, sanitize_content
+            agent_name_sanitized = sanitize_name(agent_name, "agent_name")
+            entry_sanitized = sanitize_content(diary_entry)
+            wing = f"wing_{agent_name_sanitized.lower().replace(' ', '_')}"
+            room = "diary"
+
+            col = backend.get_collection()
+            now = datetime.now(timezone.utc)
+            diary_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}"
+            entry_timestamp = now.isoformat() + "Z"
+
+            col.upsert(
+                ids=[diary_id],
+                documents=[entry_sanitized],
+                metadatas=[{
+                    "wing": wing, "room": room,
+                    "source_file": "|".join(paths),
+                    "chunk_index": 0, "added_by": agent_name, "agent_id": agent_name,
+                    "entities": "[]", "timestamp": entry_timestamp,
+                    "origin_type": "diary_entry_batch", "is_latest": True,
+                    "supersedes_id": "", "topic": topic,
+                }],
+            )
+            results.append(f"diary_written:{diary_id}")
+        except Exception as e:
+            errors.append(f"diary_write:{e}")
+            diary_id = None
+    elif diary_entry:
+        try:
+            from ..config import sanitize_name, sanitize_content
+            agent_name_sanitized = sanitize_name(agent_name, "agent_name")
+            wing = f"wing_{agent_name_sanitized.lower().replace(' ', '_')}"
+            diary_id = f"diary_{wing}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            results.append(f"diary_prepared:{diary_id}")
+        except Exception as e:
+            errors.append(f"diary_prep:{e}")
+
+    # Step 3: optional decision capture
+    decision_id = None
+    if capture_decision and rationale:
+        try:
+            decision_result = decision_tracker.capture_decision(
+                session_id=session_id,
+                decision_text=capture_decision,
+                rationale=rationale,
+                alternatives=[],
+                category=decision_category,
+                confidence=decision_confidence,
+            )
+            decision_id = decision_result.get("id")
+            results.append(f"decision_captured:{decision_id}")
+        except Exception as e:
+            errors.append(f"decision:{e}")
+
+    data = {
+        "paths": paths,
+        "session_id": session_id,
+        "released_claims": released,
+        "release_errors": errors,
+        "diary_id": diary_id,
+        "diary_entry": diary_entry,
+        "decision_id": decision_id,
+        "operations": results,
+        "errors": errors,
+    }
+
+    next_actions = []
+    if capture_decision and not decision_id:
+        next_actions.append({
+            "action": "mempalace_capture_decision",
+            "reason": "Persist the architectural decision",
+            "priority": "high",
+        })
+
+    return _ok(
+        _phase("finish_work_batch", "done"),
+        "finish_work_batch",
+        data,
+        next_actions,
+        context_snippets={"diary_entry": diary_entry or "", "paths": paths},
+        workflow_state={
+            "current_phase": "finished",
+            "next_phase": None,
+            "next_tool": None,
+            "conflict_status": "none",
+            "handoff_pending": False,
+            "pending_edits": None,
+        },
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Tool registration
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -1085,6 +1416,122 @@ def register_workflow_tools(server, backend, config, settings):
         return _do_takeover_work(
             ctx, handoff_id, resolved, actual_paths, ttl_seconds,
             handoff_mgr, claims_mgr, wc,
+        )
+
+    # ── mempalace_begin_work_batch ────────────────────────────────────────
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_begin_work_batch(
+        ctx: Context,
+        paths: list[str],
+        session_id: str | None = None,
+        ttl_seconds: int = 1800,
+        note: str | None = None,
+    ) -> dict:
+        """
+        Begin a working session on multiple files atomically — all-or-nothing.
+
+        Use for multi-file refactors where all files must be claimed together.
+        If any path is blocked by another session, the ENTIRE batch fails
+        (no partial state created).
+
+        Combines in one call:
+          1. conflict_check on ALL paths — if any blocked, all fail together
+          2. claim_path for ALL paths — atomic acquisition
+          3. log_intent for the batch
+
+        Returns a workflow_result with:
+          - ok / error status
+          - phase, paths, session_id, owner, expires_at
+          - failure_mode: batch_claim_conflict (some paths blocked),
+                          batch_partial_failure (claim acquire failed)
+          - next_actions: prepare_edit per file
+          - pending_edits: paths + deadline in workflow_state
+
+        TTL guidance for batch:
+          Quick multi-file (< 10 min) : 900s
+          Standard refactor           : 1800s (default)
+          Large cross-module change   : 3600s
+        """
+        claims_mgr = _get_claims_manager()
+        if claims_mgr is None:
+            return _fail(
+                _phase("begin_work_batch", "init"),
+                "begin_work_batch",
+                reason="session coordination not available",
+                hint="Run with shared_server_mode=True or transport='http'",
+                failure_mode="no_coordination",
+            )
+
+        wc = _get_write_coordinator()
+        resolved = _require_session_id(ctx, session_id, "begin_work_batch")
+
+        result, _, _ = _do_begin_work_batch(
+            ctx, paths, resolved, ttl_seconds, note, claims_mgr, wc
+        )
+        return result
+
+    # ── mempalace_finish_work_batch ───────────────────────────────────────
+
+    @server.tool(timeout=settings.timeout_write)
+    def mempalace_finish_work_batch(
+        ctx: Context,
+        paths: list[str],
+        session_id: str | None = None,
+        diary_entry: str | None = None,
+        topic: str = "general",
+        agent_name: str = "claude",
+        capture_decision: str | None = None,
+        rationale: str | None = None,
+        decision_category: str = "general",
+        decision_confidence: int = 3,
+    ) -> dict:
+        """
+        Finish a multi-file working session — release all claims + batch diary.
+
+        Use after begin_work_batch when all edits are complete.
+
+        Combines in one call:
+          1. release_claim for each path in paths
+          2. diary_write for the batch (single entry covering all paths)
+          3. capture_decision (optional)
+
+        Returns a workflow_result with:
+          - ok / error status
+          - paths, released_claims, diary_id (written immediately)
+          - decision_id (if capture_decision provided)
+          - next_actions: capture_decision reminder if not completed
+          - pending_edits: null (cleared on success)
+
+        Unlike finish_work (single file), this writes ONE diary entry for the
+        entire batch, tagged with origin_type="diary_entry_batch".
+        """
+        claims_mgr = _get_claims_manager()
+        if claims_mgr is None:
+            return _fail(
+                _phase("finish_work_batch", "init"),
+                "finish_work_batch",
+                reason="session coordination not available",
+                hint="Run with shared_server_mode=True or transport='http'",
+                failure_mode="no_coordination",
+            )
+
+        dt = _get_decision_tracker()
+        if capture_decision and dt is None:
+            return _fail(
+                _phase("finish_work_batch", "init"),
+                "finish_work_batch",
+                reason="decision tracker not available",
+                hint="Run with shared_server_mode=True",
+                failure_mode="no_decision_tracker",
+            )
+
+        resolved = _require_session_id(ctx, session_id, "finish_work_batch")
+
+        return _do_finish_work_batch(
+            ctx, paths, resolved, diary_entry, topic, agent_name,
+            capture_decision, rationale, decision_category, decision_confidence,
+            claims_mgr, dt or _EmptyDecisionTracker(), backend,
         )
 
 

@@ -46,7 +46,7 @@ class TestQueryCache:
         for i in range(4):
             cache.set("/palace", "col", [f"q{i}"], 5, {"n": i})
 
-        assert len(cache._cache) == 3
+        assert cache._total_size() == 3
         assert cache.get("/palace", "col", ["q0"], 5) is None  # nejstarší evictnut
 
     def test_different_queries_not_cached(self):

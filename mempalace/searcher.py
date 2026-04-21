@@ -708,28 +708,44 @@ def _fts5_search(
         if not results:
             return []
 
-        # Fetch metadata for each hit from the collection
+        # Batch fetch all document metadata in a single round-trip (was N round-trips)
         doc_ids = [r["document_id"] for r in results]
         hits = []
-        for r in results:
-            try:
-                record = col.get(ids=[r["document_id"]], include=["documents", "metadatas"])
-                if record and record.get("ids"):
-                    doc = record["documents"][0] if record["documents"] else ""
-                    meta = record["metadatas"][0] if record["metadatas"] else {}
-                    hits.append({
-                        "id": r["document_id"],
-                        "text": doc,
-                        "wing": meta.get("wing", r.get("wing", "")),
-                        "room": meta.get("room", r.get("room", "")),
-                        "source_file": meta.get("source_file", "?"),
-                        "similarity": max(0.0, 1.0 - abs(r["score"]) / 10),  # Convert FTS5 score
-                        "source": "fts5",
-                        "fts5_score": round(r["score"], 4),
-                        "language": meta.get("language", r.get("language", "")),
-                    })
-            except Exception:
-                continue
+        try:
+            batch = col.get(ids=doc_ids, include=["documents", "metadatas"])
+            returned_ids = batch.get("ids", []) if batch else []
+            docs_map = {id_: doc for id_, doc in zip(returned_ids, batch.get("documents", []))}
+            metas_map = {id_: meta for id_, meta in zip(returned_ids, batch.get("metadatas", []))}
+
+            for r in results:
+                doc_id = r["document_id"]
+                doc = docs_map.get(doc_id, "")
+                meta = metas_map.get(doc_id, {})
+                hits.append({
+                    "id": doc_id,
+                    "text": doc,
+                    "wing": meta.get("wing", r.get("wing", "")),
+                    "room": meta.get("room", r.get("room", "")),
+                    "source_file": meta.get("source_file", "?"),
+                    "similarity": max(0.0, 1.0 - abs(r["score"]) / 10),  # Convert FTS5 score
+                    "source": "fts5",
+                    "fts5_score": round(r["score"], 4),
+                    "language": meta.get("language", r.get("language", "")),
+                })
+        except Exception:
+            # Fallback: skip metadata enrichment (return partial hits)
+            for r in results:
+                hits.append({
+                    "id": r["document_id"],
+                    "text": "",
+                    "wing": r.get("wing", ""),
+                    "room": r.get("room", ""),
+                    "source_file": "?",
+                    "similarity": max(0.0, 1.0 - abs(r["score"]) / 10),
+                    "source": "fts5",
+                    "fts5_score": round(r["score"], 4),
+                    "language": r.get("language", ""),
+                })
         return hits[:n_results]
     except Exception as e:
         logger.warning("FTS5 search failed: %s", e)

@@ -110,8 +110,31 @@ class ClaimsManager:
         self._write_lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._local = threading.local()
+        self._cleanup_timer: Optional[threading.Timer] = None
+        self._cleanup_interval = 60.0  # seconds between lazy cleanup runs
         self._connect()
         self._initialize()
+        self._start_lazy_cleanup()
+
+    def _start_lazy_cleanup(self) -> None:
+        """Start background thread to clean up expired claims periodically."""
+        def _run():
+            try:
+                self.cleanup_expired()
+            except Exception:
+                pass
+            # Re-schedule
+            with self._write_lock:
+                if self._cleanup_timer is not None:
+                    self._cleanup_timer = threading.Timer(
+                        self._cleanup_interval, _run
+                    )
+                    self._cleanup_timer.daemon = True
+                    self._cleanup_timer.start()
+
+        self._cleanup_timer = threading.Timer(self._cleanup_interval, _run)
+        self._cleanup_timer.daemon = True
+        self._cleanup_timer.start()
 
     def _connect(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -276,7 +299,6 @@ class ClaimsManager:
 
     def get_claim(self, target_type: str, target_id: str) -> Optional[dict]:
         """Get current unexpired claim, or None."""
-        self.cleanup_expired()
         now = _utc_now()
 
         with self._conn_ctx as conn:
@@ -301,10 +323,9 @@ class ClaimsManager:
     def get_session_claims(self, session_id: str) -> list[dict]:
         """Get all unexpired claims held by a session.
 
-        Calls cleanup_expired() first to purge stale claims from storage.
-        Only returns claims where expires_at > now.
+        Returns claims where expires_at > now. Cleanup runs lazily via
+        background thread — no synchronous DELETE on every read.
         """
-        self.cleanup_expired()
         now = _utc_now()
 
         with self._conn_ctx as conn:
@@ -368,9 +389,9 @@ class ClaimsManager:
     def list_active_claims(self, project_root: Optional[str] = None) -> list[dict]:
         """List all unexpired claims across all sessions.
 
-        Calls cleanup_expired() first. Optionally filtered by project_root prefix.
+        Cleanup runs lazily via background thread — no synchronous DELETE on every read.
+        Optionally filtered by project_root prefix.
         """
-        self.cleanup_expired()
         now = _utc_now()
 
         with self._conn_ctx as conn:
@@ -395,8 +416,11 @@ class ClaimsManager:
         return claims
 
     def check_conflicts(self, target_type: str, target_id: str, session_id: str) -> dict:
-        """Returns conflict info if another session holds a claim."""
-        self.cleanup_expired()
+        """Returns conflict info if another session holds a claim.
+
+        No synchronous cleanup — reads are lock-free and return within µs.
+        Expired claims are cleaned up lazily by the background thread.
+        """
         now = _utc_now()
 
         with self._conn_ctx as conn:
@@ -498,6 +522,9 @@ class ClaimsManager:
 
     def close(self) -> None:
         with self._write_lock:
+            if self._cleanup_timer is not None:
+                self._cleanup_timer.cancel()
+                self._cleanup_timer = None
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None

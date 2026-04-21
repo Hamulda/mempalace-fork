@@ -480,6 +480,8 @@ class SymbolIndex:
 
         Returns list of dicts with: file_path, imported_module, called_symbol,
         import_type ("direct" or "module").
+
+        Performance: 2 SQL queries total (was 1 + 2N where N = definition count).
         """
         with self._lock:
             if not self._conn:
@@ -492,60 +494,72 @@ class SymbolIndex:
         callers = []
         seen = set()
 
+        # Build module names per definition file
+        module_map = {}  # def_file -> module_name
         for def_ in defs:
             def_file = def_["file_path"]
             try:
                 rel = Path(def_file).relative_to(project_path).as_posix()
             except ValueError:
                 rel = def_file
+            module_map[def_file] = str(Path(rel).with_suffix("")).replace("/", ".").replace("\\", ".")
 
-            module_name = str(Path(rel).with_suffix("")).replace("/", ".").replace("\\", ".")
+        all_def_files = set(module_map.keys())
 
-            if not self._conn:
-                break
+        # Batch query 1: all direct imports matching symbol_name across ALL definitions
+        # (was run N times — one per definition)
+        try:
+            cur = self._conn.execute(
+                """SELECT file_path, direct_imports FROM symbol_index
+                   WHERE direct_imports LIKE ? LIMIT 50""",
+                (f"%{symbol_name}%",),
+            )
+            for row in cur.fetchall():
+                fp = row[0]
+                if fp in all_def_files:
+                    continue
+                if fp not in seen:
+                    seen.add(fp)
+                    def_file = next(iter(all_def_files), "")
+                    callers.append({
+                        "file_path": fp,
+                        "imported_module": module_map.get(def_file, ""),
+                        "called_symbol": symbol_name,
+                        "import_type": "direct",
+                    })
+        except Exception:
+            pass
 
-            # Search 2 FIRST: direct imports (from module import symbol)
-            # More specific than module-level, check first for import_type accuracy
+        # Batch query 2: all module imports across ALL definitions in ONE SQL query
+        # (was run N times — one per definition)
+        if module_map:
+            module_names = list(module_map.values())
+            # Build OR chain for all module names
+            like_clauses = " OR ".join(["imports LIKE ?"] * len(module_names))
+            params = [f"%{mn}%" for mn in module_names]
             try:
                 cur = self._conn.execute(
-                    """SELECT file_path, direct_imports FROM symbol_index
-                       WHERE direct_imports LIKE ? LIMIT 50""",
-                    (f"%{symbol_name}%",),
+                    f"""SELECT file_path, imports FROM symbol_index
+                        WHERE ({like_clauses}) LIMIT 50""",
+                    params,
                 )
                 for row in cur.fetchall():
-                    if row[0] != def_file:
-                        key = row[0]
-                        if key not in seen:
-                            seen.add(key)
-                            callers.append({
-                                "file_path": row[0],
-                                "imported_module": module_name,
-                                "called_symbol": symbol_name,
-                                "import_type": "direct",
-                            })
-            except Exception:
-                pass
-
-            # Search 1 SECOND: module-level imports (import module, from package import module)
-            # Only add files not already found via direct import
-            if not self._conn:
-                break
-            try:
-                cur = self._conn.execute(
-                    """SELECT file_path, imports FROM symbol_index WHERE imports LIKE ? LIMIT 50""",
-                    (f"%{module_name}%",),
-                )
-                for row in cur.fetchall():
-                    if row[0] != def_file:
-                        key = row[0]
-                        if key not in seen:
-                            seen.add(key)
-                            callers.append({
-                                "file_path": row[0],
-                                "imported_module": module_name,
-                                "called_symbol": symbol_name,
-                                "import_type": "module",
-                            })
+                    fp = row[0]
+                    if fp in all_def_files:
+                        continue
+                    if fp not in seen:
+                        seen.add(fp)
+                        # Find which module_name matched for this file
+                        imports_str = row[1] or ""
+                        matched_module = next(
+                            (mn for mn in module_names if mn in imports_str), module_names[0]
+                        )
+                        callers.append({
+                            "file_path": fp,
+                            "imported_module": matched_module,
+                            "called_symbol": symbol_name,
+                            "import_type": "module",
+                        })
             except Exception:
                 pass
 
