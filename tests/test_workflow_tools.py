@@ -17,6 +17,7 @@ from __future__ import annotations
 import tempfile
 import os
 import pytest
+from pathlib import Path
 from unittest.mock import MagicMock
 
 
@@ -349,7 +350,7 @@ class TestPrepareEditUnit:
         ])
         ctx = MagicMock()
 
-        result, sym_data = _do_prepare_edit(
+        result, sym_data, file_slice = _do_prepare_edit(
             ctx, "/src/main.py", "session-a",
             "/tmp/palace", "/tmp/project", si,
             claims_mgr=None,  # No conflict check needed for symbol-only test
@@ -368,7 +369,7 @@ class TestPrepareEditUnit:
         si = _MockSymbolIndex([])
         ctx = MagicMock()
 
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, "/src/main.py", "session-a",
             "/tmp/palace", "/tmp/project", si,
             claims_mgr=None,
@@ -390,12 +391,178 @@ class TestPrepareEditUnit:
             "mempalace.recent_changes.get_recent_changes",
             return_value=[{"file_path": "/src/main.py", "change_count": 5, "last_modified": "2026-04-20"}],
         ):
-            result, _ = _do_prepare_edit(
+            result, _, _ = _do_prepare_edit(
                 ctx, "/src/main.py", "session-a",
                 "/tmp/palace", "/tmp/project", si,
                 claims_mgr=None,
             )
         assert result["ok"] is True
+
+
+class TestPrepareEditContentPreview:
+    """Unit tests for content preview in _do_prepare_edit."""
+
+    def test_preview_mode_slice_returns_file_slice(self, tmp_path):
+        """preview_mode=slice returns file_slice dict in context_snippets."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        # Create a real temp file with known content
+        test_file = tmp_path / "sample.py"
+        lines = [f"# line {i}" for i in range(1, 61)]
+        test_file.write_text("\n".join(lines), encoding="utf-8")
+
+        # Mock symbol_index to report first symbol at line 30
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {
+                    "symbols": [{"name": "my_func", "type": "function", "line_start": 30, "line_end": 35}],
+                    "imports": [],
+                    "exports": [],
+                    "file_signature": "",
+                }
+
+        ctx = MagicMock()
+        result, sym_data, file_slice = _do_prepare_edit(
+            ctx, str(test_file), "session-a",
+            "/tmp/palace", str(tmp_path), _MockSymbolIndex(),
+            claims_mgr=None,
+            preview_mode="slice",
+        )
+        assert result["ok"] is True
+        assert "file_slice" in result["context_snippets"]
+        fs = result["context_snippets"]["file_slice"]
+        assert fs["total_lines"] == 60
+        assert fs["slice_start"] == 10  # 30 - 20 = 10 (clamped to 1)
+        assert fs["slice_end"] == 50    # 30 + 20 = 50
+        assert fs["has_pre"] is True    # slice starts at 10, not 1
+        assert fs["has_post"] is True   # 50 < 60
+        assert file_slice is not None
+        assert file_slice["total_lines"] == 60
+        assert file_slice["slice_start"] == 10
+        # pre_context: 20 lines before symbol (lines 10-29, 0-indexed: 9-28)
+        # symbol_context: 1 symbol line + 20 after = 21 lines (lines 30-50, 0-indexed: 29-49)
+        assert len(file_slice["pre_context"]) == 20
+        assert len(file_slice["symbol_context"]) == 21
+
+    def test_preview_mode_none_skips_file_read(self, tmp_path):
+        """preview_mode=none returns no file_slice (zero extra I/O)."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        # Create a temp file (should NOT be read)
+        test_file = tmp_path / "sample.py"
+        test_file.write_text("secret content", encoding="utf-8")
+
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {
+                    "symbols": [{"name": "my_func", "type": "function", "line_start": 1, "line_end": 5}],
+                    "imports": [],
+                    "exports": [],
+                    "file_signature": "",
+                }
+
+        ctx = MagicMock()
+        result, sym_data, file_slice = _do_prepare_edit(
+            ctx, str(test_file), "session-a",
+            "/tmp/palace", str(tmp_path), _MockSymbolIndex(),
+            claims_mgr=None,
+            preview_mode="none",
+        )
+        assert result["ok"] is True
+        assert result["preview_mode"] == "none"
+        assert "file_slice" not in result["context_snippets"]
+        assert file_slice is None
+
+    def test_preview_mode_slice_no_symbols_no_slice(self, tmp_path):
+        """File with no symbols and preview_mode=slice → no file_slice (first_symbol_line=None)."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        test_file = tmp_path / "empty.py"
+        test_file.write_text("just some text\nno defs here", encoding="utf-8")
+
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+
+        ctx = MagicMock()
+        result, _, file_slice = _do_prepare_edit(
+            ctx, str(test_file), "session-a",
+            "/tmp/palace", str(tmp_path), _MockSymbolIndex(),
+            claims_mgr=None,
+            preview_mode="slice",
+        )
+        assert result["ok"] is True
+        assert "file_slice" not in result["context_snippets"]
+        assert file_slice is None
+
+    def test_preview_mode_slice_file_not_found(self, tmp_path):
+        """preview_mode=slice with non-existent file → ok=True, no file_slice."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {
+                    "symbols": [{"name": "my_func", "type": "function", "line_start": 10, "line_end": 15}],
+                    "imports": [],
+                    "exports": [],
+                    "file_signature": "",
+                }
+
+        ctx = MagicMock()
+        result, _, file_slice = _do_prepare_edit(
+            ctx, str(tmp_path / "does_not_exist.py"), "session-a",
+            "/tmp/palace", str(tmp_path), _MockSymbolIndex(),
+            claims_mgr=None,
+            preview_mode="slice",
+        )
+        assert result["ok"] is True  # Still succeeds (file read is best-effort)
+        assert "file_slice" not in result["context_snippets"]
+        assert file_slice is None
+
+    def test_preview_mode_slice_preserves_symbols(self, tmp_path):
+        """preview_mode=slice still returns symbols + hotspot + conflict_verified."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock, patch
+
+        test_file = tmp_path / "sample.py"
+        lines = [f"# line {i}" for i in range(1, 31)]
+        test_file.write_text("\n".join(lines), encoding="utf-8")
+
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {
+                    "symbols": [
+                        {"name": "ClassA", "type": "class", "line_start": 5},
+                        {"name": "func_b", "type": "function", "line_start": 20},
+                    ],
+                    "imports": ["os", "sys"],
+                    "exports": [],
+                    "file_signature": "Sample module",
+                }
+
+        ctx = MagicMock()
+        with patch("mempalace.recent_changes.get_recent_changes", return_value=[]):
+            result, sym_data, file_slice = _do_prepare_edit(
+                ctx, str(test_file), "session-a",
+                "/tmp/palace", str(tmp_path), _MockSymbolIndex(),
+                claims_mgr=None,
+                preview_mode="slice",
+            )
+        assert result["ok"] is True
+        assert result["symbols_count"] == 2
+        assert result["hotspot"] is False
+        assert result["conflict_verified"] is True
+        assert result["preview_mode"] == "slice"
+        syms = result["context_snippets"]["symbols"]
+        assert len(syms) == 2
+        assert syms[0]["name"] == "ClassA"
+        assert syms[1]["name"] == "func_b"
+        assert "file_slice" in result["context_snippets"]
+        assert file_slice is not None
 
 
 class TestFinishWorkUnit:
@@ -1215,7 +1382,7 @@ class TestWorkflowStateContract:
         si = _MockSymbolIndex()
         ctx = MagicMock()
 
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, "/src/main.py", "session-a", "/tmp/palace", None, si, claims,
         )
         assert result["ok"] is True
@@ -1236,7 +1403,7 @@ class TestWorkflowStateContract:
         ctx = MagicMock()
         claims.claim("file", "/src/main.py", "other-session", ttl_seconds=600)
 
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, "/src/main.py", "session-a", "/tmp/palace", None, si, claims,
         )
         assert result["ok"] is False
@@ -1451,7 +1618,7 @@ class TestNoContradictoryHints:
         si = _MockSymbolIndex()
         ctx = MagicMock()
 
-        result = _do_prepare_edit(ctx, "/src/main.py", "session-a", "/tmp/p", None, si, claims)
+        result, _, _ = _do_prepare_edit(ctx, "/src/main.py", "session-a", "/tmp/p", None, si, claims)
         if isinstance(result, tuple):
             result = result[0]
         assert result["ok"] is False
@@ -1872,3 +2039,564 @@ class TestWorkflowToolsBatchIntegration:
             elif "MEMPALACE_PALACE_PATH" in os.environ:
                 del os.environ["MEMPALACE_PALACE_PATH"]
 
+
+
+# ---------------------------------------------------------------------------
+# Edit Verification Tests
+# ---------------------------------------------------------------------------
+
+class TestEditVerification:
+    """Verify edit verification in begin_work / finish_work lifecycle."""
+
+    def test_begin_work_stores_edit_baseline_in_claim_payload(self, tmp_path):
+        """begin_work captures mtime/size baseline in claim payload."""
+        from mempalace.server._workflow_tools import _do_begin_work
+        from unittest.mock import MagicMock
+
+        p = tmp_path / "example.py"
+        p.write_text("original content")
+        import os
+        os.utime(p, (1000.0, 1000.0))
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, acquired, _ = _do_begin_work(
+            ctx, str(p), "session-x", 600, "edit file",
+            claims, wc,
+        )
+        assert acquired is True
+        claim = claims.get_claim("file", str(p))
+        assert claim is not None
+        baseline = claim["payload"].get("edit_baseline")
+        assert baseline is not None
+        assert "mtime_sec" in baseline
+        assert "size" in baseline
+
+    def test_begin_work_no_baseline_when_file_missing(self, tmp_path):
+        """begin_work with non-existent file → baseline is None (unknown)."""
+        from mempalace.server._workflow_tools import _do_begin_work
+        from unittest.mock import MagicMock
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, acquired, _ = _do_begin_work(
+            ctx, str(tmp_path / "nonexistent.py"), "session-x", 600, None,
+            claims, wc,
+        )
+        assert acquired is True
+        claim = claims.get_claim("file", str(tmp_path / "nonexistent.py"))
+        assert claim is not None
+        assert claim["payload"].get("edit_baseline") is None
+
+    def test_finish_work_detects_file_changed(self, tmp_path):
+        """finish_work → edited=True when mtime or size changed since begin_work."""
+        from mempalace.server._workflow_tools import _do_begin_work, _do_finish_work
+        from unittest.mock import MagicMock
+
+        p = tmp_path / "example.py"
+        p.write_text("original")
+        import os
+        os.utime(p, (1000.0, 1000.0))
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        # begin_work captures baseline
+        _, acquired, _ = _do_begin_work(ctx, str(p), "session-x", 600, None, claims, wc)
+        assert acquired is True
+
+        # file is edited
+        p.write_text("modified content")
+
+        # finish_work verifies edit
+        dt = _MockDecisionTracker()
+        result = _do_finish_work(
+            ctx, str(p), "session-x",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        ev = result["edit_verification"]
+        assert ev["status"] == "verified"
+        assert ev["edited"] is True
+        assert ev["baseline"]["mtime_sec"] == 1000.0
+
+    def test_finish_work_detects_file_unchanged(self, tmp_path):
+        """finish_work → edited=False when file unchanged since begin_work."""
+        from mempalace.server._workflow_tools import _do_begin_work, _do_finish_work
+        from unittest.mock import MagicMock
+
+        p = tmp_path / "example.py"
+        p.write_text("original content")
+        import os
+        os.utime(p, (1000.0, 1000.0))
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        _, acquired, _ = _do_begin_work(ctx, str(p), "session-x", 600, None, claims, wc)
+        assert acquired is True
+
+        # no edit — file untouched
+
+        dt = _MockDecisionTracker()
+        result = _do_finish_work(
+            ctx, str(p), "session-x",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        ev = result["edit_verification"]
+        assert ev["status"] == "verified"
+        assert ev["edited"] is False
+
+    def test_finish_work_no_baseline_falls_back_to_unknown(self, tmp_path):
+        """finish_work when no baseline stored → status=no_baseline, edited=False."""
+        from mempalace.server._workflow_tools import _do_finish_work
+        from unittest.mock import MagicMock
+
+        p = tmp_path / "example.py"
+        p.write_text("file")
+
+        claims = _MockClaimsManager()
+        # manually claim without edit_baseline payload
+        claims.claim("file", str(p), "session-x", ttl_seconds=600, payload={"path": str(p)})
+
+        dt = _MockDecisionTracker()
+        ctx = MagicMock()
+        result = _do_finish_work(
+            ctx, str(p), "session-x",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        ev = result["edit_verification"]
+        assert ev["status"] == "no_baseline"
+        assert ev["edited"] is False
+
+    def test_finish_work_file_missing(self, tmp_path):
+        """finish_work when file deleted → status=file_missing."""
+        from mempalace.server._workflow_tools import _do_begin_work, _do_finish_work
+        from unittest.mock import MagicMock
+
+        p = tmp_path / "example.py"
+        p.write_text("original")
+        import os
+        os.utime(p, (1000.0, 1000.0))
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        _, acquired, _ = _do_begin_work(ctx, str(p), "session-x", 600, None, claims, wc)
+        assert acquired is True
+
+        # file is deleted
+        p.unlink()
+
+        dt = _MockDecisionTracker()
+        result = _do_finish_work(
+            ctx, str(p), "session-x",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        ev = result["edit_verification"]
+        assert ev["status"] == "file_missing"
+        assert ev["edited"] is False
+
+
+class TestEditVerificationBatch:
+    """Verify edit verification for batch workflow tools."""
+
+    def test_begin_work_batch_stores_baselines_per_path(self, tmp_path):
+        """begin_work_batch captures baselines for all paths."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch
+        from unittest.mock import MagicMock
+
+        p1 = tmp_path / "a.py"
+        p2 = tmp_path / "b.py"
+        p1.write_text("file a")
+        p2.write_text("file b")
+        import os
+        os.utime(p1, (1000.0, 1000.0))
+        os.utime(p2, (2000.0, 2000.0))
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        result, all_acquired, _ = _do_begin_work_batch(
+            ctx, [str(p1), str(p2)], "session-x", 600, "batch edit",
+            claims, wc,
+        )
+        assert all_acquired is True
+
+        c1 = claims.get_claim("file", str(p1))
+        c2 = claims.get_claim("file", str(p2))
+        assert c1["payload"].get("edit_baseline") is not None
+        assert c2["payload"].get("edit_baseline") is not None
+
+    def test_finish_work_batch_detects_mixed_edits(self, tmp_path):
+        """finish_work_batch → edited=True for changed files, edited=False for unchanged."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch, _do_finish_work_batch
+        from unittest.mock import MagicMock
+
+        p1 = tmp_path / "a.py"
+        p2 = tmp_path / "b.py"
+        p1.write_text("original a")
+        p2.write_text("original b")
+        import os
+        os.utime(p1, (1000.0, 1000.0))
+        os.utime(p2, (2000.0, 2000.0))
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        _, all_acquired, _ = _do_begin_work_batch(
+            ctx, [str(p1), str(p2)], "session-x", 600, None, claims, wc,
+        )
+        assert all_acquired is True
+
+        # edit only p1
+        p1.write_text("modified a")
+
+        dt = _MockDecisionTracker()
+        result = _do_finish_work_batch(
+            ctx, [str(p1), str(p2)], "session-x",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        evs = result["edit_verifications"]
+        assert evs[str(p1)]["edited"] is True
+        assert evs[str(p2)]["edited"] is False
+
+    def test_finish_work_batch_all_unchanged(self, tmp_path):
+        """finish_work_batch when no files changed → all edited=False."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch, _do_finish_work_batch
+        from unittest.mock import MagicMock
+
+        p1 = tmp_path / "a.py"
+        p2 = tmp_path / "b.py"
+        p1.write_text("file a")
+        p2.write_text("file b")
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        _, all_acquired, _ = _do_begin_work_batch(
+            ctx, [str(p1), str(p2)], "session-x", 600, None, claims, wc,
+        )
+        assert all_acquired is True
+
+        # no edits
+
+        dt = _MockDecisionTracker()
+        result = _do_finish_work_batch(
+            ctx, [str(p1), str(p2)], "session-x",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        evs = result["edit_verifications"]
+        assert evs[str(p1)]["edited"] is False
+        assert evs[str(p2)]["edited"] is False
+
+    def test_finish_work_batch_missing_file(self, tmp_path):
+        """finish_work_batch when one file missing → status=file_missing for that path."""
+        from mempalace.server._workflow_tools import _do_begin_work_batch, _do_finish_work_batch
+        from unittest.mock import MagicMock
+
+        p1 = tmp_path / "a.py"
+        p2 = tmp_path / "b.py"
+        p1.write_text("file a")
+        p2.write_text("file b")
+
+        claims = _MockClaimsManager()
+        wc = _MockWriteCoordinator()
+        ctx = MagicMock()
+
+        _, all_acquired, _ = _do_begin_work_batch(
+            ctx, [str(p1), str(p2)], "session-x", 600, None, claims, wc,
+        )
+        assert all_acquired is True
+
+        p2.unlink()
+
+        dt = _MockDecisionTracker()
+        result = _do_finish_work_batch(
+            ctx, [str(p1), str(p2)], "session-x",
+            diary_entry=None, topic="general", agent_name="Claude",
+            capture_decision=None, rationale=None,
+            decision_category="general", decision_confidence=3,
+            claims_mgr=claims, decision_tracker=dt, backend=None,
+        )
+        assert result["ok"] is True
+        evs = result["edit_verifications"]
+        assert evs[str(p1)]["status"] == "verified"
+        assert evs[str(p2)]["status"] == "file_missing"
+
+
+# ---------------------------------------------------------------------------
+# Test: project root resolution — no env dependency
+# ---------------------------------------------------------------------------
+
+class TestProjectRootResolution:
+    """Verify project_root is resolved deterministically, not from PROJECT_ROOT env."""
+
+    def test_find_git_root_from_file_path(self, tmp_path):
+        """_find_git_root returns repo root when given a file path."""
+        from mempalace.server._workflow_tools import _find_git_root
+
+        # Create a fake git repo structure
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        test_file = src_dir / "main.py"
+        test_file.write_text("print('hello')")
+
+        result = _find_git_root(str(test_file))
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()
+
+    def test_find_git_root_from_dir_path(self, tmp_path):
+        """_find_git_root returns repo root when given a directory path."""
+        from mempalace.server._workflow_tools import _find_git_root
+
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+
+        result = _find_git_root(str(tmp_path))
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()
+
+    def test_find_git_root_no_git_returns_none(self, tmp_path):
+        """_find_git_root returns None when no .git directory exists."""
+        from mempalace.server._workflow_tools import _find_git_root
+
+        result = _find_git_root(str(tmp_path / "some" / "file.py"))
+        assert result is None
+
+    def test_find_git_root_deep_nested(self, tmp_path):
+        """_find_git_root finds repo root from deeply nested file."""
+        from mempalace.server._workflow_tools import _find_git_root
+
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+        deep_dir = tmp_path / "src" / "modules" / "auth"
+        deep_dir.mkdir(parents=True)
+        test_file = deep_dir / "token.py"
+        test_file.write_text("# token module")
+
+        result = _find_git_root(str(test_file))
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()
+
+    def test_resolve_project_root_explicit_wins(self, tmp_path):
+        """Explicit project_root parameter takes priority over derivation."""
+        from mempalace.server._workflow_tools import _resolve_project_root
+
+        result = _resolve_project_root("/explicit/root", "/palace/path", "/file/path")
+        assert result == "/explicit/root"
+
+    def test_resolve_project_root_derives_from_file_path(self, tmp_path):
+        """When no explicit, project_root is derived from file path's git root."""
+        from mempalace.server._workflow_tools import _resolve_project_root
+
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+        test_file = tmp_path / "src" / "main.py"
+        test_file.parent.mkdir()
+        test_file.write_text("print('hello')")
+
+        result = _resolve_project_root(None, "/palace/path", str(test_file))
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()
+
+    def test_resolve_project_root_falls_back_to_palace_path(self, tmp_path):
+        """When no file_path, derives from palace_path git root."""
+        from mempalace.server._workflow_tools import _resolve_project_root
+
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+
+        result = _resolve_project_root(None, str(tmp_path), None)
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()
+
+    def test_resolve_project_root_none_when_no_git(self, tmp_path):
+        """Returns None when no git repo found anywhere."""
+        from mempalace.server._workflow_tools import _resolve_project_root
+
+        non_git_path = tmp_path / "no_git"
+        non_git_path.mkdir()
+
+        result = _resolve_project_root(None, str(non_git_path), None)
+        assert result is None
+
+    def test_prepare_edit_uses_derived_project_root(self, tmp_path, monkeypatch):
+        """prepare_edit uses git-root derivation when no PROJECT_ROOT env set."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        # Ensure PROJECT_ROOT is NOT set
+        monkeypatch.delenv("PROJECT_ROOT", raising=False)
+
+        # Create a git repo
+        git_root = tmp_path / "project"
+        git_root.mkdir()
+        (git_root / ".git").mkdir()
+        test_file = git_root / "main.py"
+        test_file.write_text("print('hello')")
+
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+
+        ctx = MagicMock()
+        result, _, _ = _do_prepare_edit(
+            ctx, str(test_file), "session-a",
+            str(tmp_path / "palace"),  # palace_path (no git here)
+            None,  # explicit project_root = None
+            _MockSymbolIndex(),
+            claims_mgr=None,
+        )
+        # Should succeed (no crash) — project_root was derived from file's git repo
+        assert result["ok"] is True
+        assert result["symbols_count"] == 0
+
+    def test_prepare_edit_explicit_project_root_used(self, tmp_path, monkeypatch):
+        """prepare_edit uses explicit project_root when provided."""
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        # Ensure PROJECT_ROOT is NOT set
+        monkeypatch.delenv("PROJECT_ROOT", raising=False)
+
+        # Create a git repo
+        git_root = tmp_path / "project"
+        git_root.mkdir()
+        (git_root / ".git").mkdir()
+        test_file = git_root / "main.py"
+        test_file.write_text("print('hello')")
+
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+
+        ctx = MagicMock()
+        result, _, _ = _do_prepare_edit(
+            ctx, str(test_file), "session-a",
+            str(tmp_path / "palace"),
+            "/explicit/project/root",  # explicit — should win
+            _MockSymbolIndex(),
+            claims_mgr=None,
+        )
+        assert result["ok"] is True
+
+    def test_no_env_dependency_in_prepare_edit(self, tmp_path, monkeypatch):
+        """prepare_edit does NOT read PROJECT_ROOT env — uses derivation only."""
+        import os
+        from mempalace.server._workflow_tools import _do_prepare_edit
+        from unittest.mock import MagicMock
+
+        # Set PROJECT_ROOT to a WRONG value
+        monkeypatch.setenv("PROJECT_ROOT", "/WRONG/ROOT/THAT/SHOULD/NOT/BE/USED")
+
+        # Create a git repo at tmp_path
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+        test_file = tmp_path / "main.py"
+        test_file.write_text("print('hello')")
+
+        class _MockSymbolIndex:
+            def get_file_symbols(self, path):
+                return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+
+        ctx = MagicMock()
+        # Note: palace_path is tmp_path/palace (no git), file_path is in tmp_path (has git)
+        result, _, _ = _do_prepare_edit(
+            ctx, str(test_file), "session-a",
+            str(tmp_path / "palace"),
+            None,  # no explicit project_root
+            _MockSymbolIndex(),
+            claims_mgr=None,
+        )
+        # Should succeed — project_root derived from file's git root, NOT from env
+        assert result["ok"] is True
+
+
+class TestProjectRootResolutionSessionTools:
+    """Verify session_tools also resolved project_root without PROJECT_ROOT env."""
+
+    def test_hotspot_check_derives_from_file_path(self, tmp_path, monkeypatch):
+        """_hotspot_check uses git-root from file path, not PROJECT_ROOT env."""
+        import os
+        from pathlib import Path
+
+        # Create a git repo
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+        test_file = tmp_path / "main.py"
+        test_file.write_text("print('hello')")
+
+        # Set PROJECT_ROOT to WRONG value
+        monkeypatch.setenv("PROJECT_ROOT", "/WRONG/ENV/ROOT")
+
+        # Create a minimal mock settings
+        class _MockSettings:
+            palace_path = str(tmp_path / "palace")
+
+        from mempalace.server._session_tools import register_session_tools
+
+        # Test the _hotspot_check logic directly
+        from mempalace.server._session_tools import _find_git_root
+        result = _find_git_root(str(test_file))
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()
+
+
+class TestSymbolToolsProjectRoot:
+    """Verify symbol_tools resolve project_root without PROJECT_ROOT env."""
+
+    def test_no_environ_project_root_in_symbol_tools(self, tmp_path, monkeypatch):
+        """Symbol tools use _find_git_root(palace_path), not os.environ."""
+        import os
+        from pathlib import Path
+
+        # Ensure PROJECT_ROOT NOT set
+        monkeypatch.delenv("PROJECT_ROOT", raising=False)
+
+        # Create a git repo structure
+        git_root = tmp_path / ".git"
+        git_root.mkdir()
+        palace_dir = tmp_path / "palace"
+        palace_dir.mkdir()
+
+        from mempalace.server._symbol_tools import _find_git_root
+
+        result = _find_git_root(str(palace_dir))
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()

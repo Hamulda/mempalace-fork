@@ -5,10 +5,26 @@ Path output contract:
 - source_file: canonical identity (always absolute path)
 - repo_rel_path: user-friendly display (relative to project_root, when determinable)
 """
-import os
+from pathlib import Path
 from fastmcp import Context
 
 from ..searcher import _compute_repo_rel_path
+
+
+# ── Project root resolution (no env dependency) ───────────────────────────────
+
+def _find_git_root(start_path: str) -> str | None:
+    """Find git repo root by walking up from start_path. No env dependency."""
+    try:
+        current = Path(start_path).expanduser().resolve()
+        if current.is_file():
+            current = current.parent
+        for parent in [current] + list(current.parents):
+            if (parent / ".git").is_dir():
+                return str(parent)
+    except Exception:
+        pass
+    return None
 
 
 def _make_path_result(file_path: str, project_root: str) -> dict:
@@ -43,7 +59,8 @@ def register_symbol_tools(server, backend, config, settings):
         if not symbol_name:
             return {"error": "symbol_name is required"}
         palace_path = palace_path or _get_palace_path()
-        project_root = project_root or os.environ.get("PROJECT_ROOT", "")
+        if not project_root:
+            project_root = _find_git_root(palace_path) or ""
         try:
             si = _get_symbol_index(palace_path)
             raw_results = si.find_symbol(symbol_name)
@@ -63,7 +80,8 @@ def register_symbol_tools(server, backend, config, settings):
         if not pattern:
             return {"error": "pattern is required"}
         palace_path = palace_path or _get_palace_path()
-        project_root = project_root or os.environ.get("PROJECT_ROOT", "")
+        if not project_root:
+            project_root = _find_git_root(palace_path) or ""
         try:
             si = _get_symbol_index(palace_path)
             raw_results = si.search_symbols(pattern)
@@ -86,7 +104,8 @@ def register_symbol_tools(server, backend, config, settings):
         if not symbol_name:
             return {"error": "symbol_name is required"}
         palace_path = palace_path or _get_palace_path()
-        project_root = project_root or os.environ.get("PROJECT_ROOT", "")
+        if not project_root:
+            project_root = _find_git_root(palace_path) or ""
         try:
             si = _get_symbol_index(palace_path)
             raw_callers = si.get_callers(symbol_name, project_root)
@@ -102,7 +121,7 @@ def register_symbol_tools(server, backend, config, settings):
     @server.tool(timeout=settings.timeout_read)
     def mempalace_recent_changes(ctx: Context, project_root: str | None = None, n: int = 20) -> dict:
         if not project_root:
-            project_root = os.environ.get("PROJECT_ROOT", "")
+            project_root = _find_git_root(_get_palace_path()) or ""
         if not project_root:
             return {"error": "project_root is required"}
         try:
@@ -124,7 +143,8 @@ def register_symbol_tools(server, backend, config, settings):
         if not file_path:
             return {"error": "file_path is required"}
         palace_path = palace_path or _get_palace_path()
-        project_root = project_root or os.environ.get("PROJECT_ROOT", "")
+        if not project_root:
+            project_root = _find_git_root(palace_path) or ""
         try:
             si = _get_symbol_index(palace_path)
             result = si.get_file_symbols(file_path)

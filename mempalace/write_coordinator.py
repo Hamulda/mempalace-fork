@@ -133,6 +133,7 @@ class WriteCoordinator:
         self._local = threading.local()
         self._connect()
         self._initialize()
+        atexit.register(self.close)
 
     # ------------------------------------------------------------------
     # Connection management
@@ -374,6 +375,10 @@ class WriteCoordinator:
                 conn.commit()
                 return True
 
+    # ------------------------------------------------------------------
+    # Write Intents
+    # ------------------------------------------------------------------
+
     def get_pending_intents(self, session_id: str = None) -> list[dict]:
         """Get all pending intents, optionally filtered by session."""
         with self._conn_ctx() as conn:
@@ -508,15 +513,3 @@ class WriteCoordinator:
             self.close()
         except Exception:
             pass
-
-    def __init__(self, palace_path: str = None):
-        if palace_path is None:
-            palace_path = os.environ.get("MEMPALACE_PATH", ".mempalace")
-        self._db_path = str(Path(palace_path) / "write_coordinator.sqlite3")
-        self._write_lock = threading.Lock()
-        self._stripe_lock = _StripedLock()
-        self._conn: sqlite3.Connection | None = None
-        self._local = threading.local()
-        self._connect()
-        self._initialize()
-        atexit.register(self.close)

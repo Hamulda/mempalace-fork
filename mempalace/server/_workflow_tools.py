@@ -23,12 +23,62 @@ Tool naming contract:
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastmcp import Context
 
 from ._session_tools import _require_session_id, _optional_session_id, _get_session_id_from_ctx
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Project root resolution — canonical source of truth
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _find_git_root(start_path: str) -> str | None:
+    """
+    Find the git repository root by walking up from start_path.
+
+    Returns the containing git repo root, or None if no .git directory found.
+    This is the canonical way to derive project_root from a file path — no env needed.
+    """
+    try:
+        current = Path(start_path).expanduser().resolve()
+        if current.is_file():
+            current = current.parent
+        # Walk up to find .git
+        for parent in [current] + list(current.parents):
+            if (parent / ".git").is_dir():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_project_root(explicit: str | None, palace_path: str, file_path: str | None = None) -> str | None:
+    """
+    Resolve project_root with explicit priority and deterministic fallback.
+
+    Resolution order:
+    1. explicit parameter (caller-provided, most specific)
+    2. git root from file_path (when editing a known file)
+    3. git root from palace_path (palace lives inside a project)
+    4. None (caller handles missing project context gracefully)
+
+    No env dependency — project_root is always derived or explicitly provided.
+    """
+    if explicit:
+        return explicit
+    if file_path:
+        git_root = _find_git_root(file_path)
+        if git_root:
+            return git_root
+    git_root = _find_git_root(palace_path)
+    if git_root:
+        return git_root
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -146,8 +196,19 @@ def _do_begin_work(
             conflict,
         )
 
-    # Step 2: acquire / refresh claim
-    payload = {"note": note, "path": path} if note else {"path": path}
+    # Step 2: capture baseline before claim (edit verification baseline)
+    baseline: dict | None = None
+    try:
+        stat = os.stat(path)
+        baseline = {
+            "mtime_sec": stat.st_mtime,
+            "size": stat.st_size,
+        }
+    except OSError:
+        pass  # file may not exist yet — unknown baseline
+
+    # Step 3: acquire / refresh claim
+    payload = {"note": note, "path": path, "edit_baseline": baseline} if note else {"path": path, "edit_baseline": baseline}
     claim_result = claims_mgr.claim("file", path, session_id, ttl_seconds=ttl_seconds, payload=payload)
 
     if not claim_result.get("acquired") and not conflict.get("is_self"):
@@ -193,6 +254,7 @@ def _do_begin_work(
         "intent_id": intent_id,
         "conflict_resolved": bool(conflict.get("has_conflict") and conflict.get("is_self")),
         "was_conflict": conflict.get("has_conflict", False),
+        "edit_baseline": baseline,  # mtime/size at begin_work — used by finish_work to detect actual edits
     }
 
     next_actions = [
@@ -222,6 +284,7 @@ def _do_begin_work(
                     "expected_outcome": note or "file edited",
                     "claim_ttl_seconds": ttl_seconds,
                     "edits_must_happen_before": expires_at,
+                    "edit_baseline": baseline,
                 },
             },
         ),
@@ -242,13 +305,18 @@ def _do_prepare_edit(
     project_root: str | None,
     symbol_index,
     claims_mgr,
-) -> dict:
+    preview_mode: str = "slice",
+) -> tuple[dict, dict, dict | None]:
     """
-    Internal: file_symbols + recent_changes + auto conflict_check.
+    Internal: file_symbols + recent_changes + auto conflict_check + optional content preview.
 
     Combines prepare_edit with conflict_check in one call — the model
     gets symbol context AND verification that no concurrent edit is in progress,
     without a separate explicit conflict_check call.
+
+    preview_mode controls content preview:
+      - "slice"  (default): read ~40 lines around the first symbol (M1-friendly, ≈3KB)
+      - "none"   : symbols only, no file read (backward-compatible, zero extra I/O)
     """
     snippets = {}
     next_actions_list = []
@@ -286,10 +354,12 @@ def _do_prepare_edit(
                     }],
                 ),
                 {},
+                None,
             )
 
     # Step 2: Symbols
     symbols_data = {}
+    first_symbol_line = None
     try:
         if symbol_index and path:
             symbols_data = symbol_index.get_file_symbols(path)
@@ -299,6 +369,7 @@ def _do_prepare_edit(
                     {"name": s["name"], "type": s.get("type", "?"), "line": s.get("line_start", 0)}
                     for s in sym_entries[:8]
                 ]
+                first_symbol_line = sym_entries[0].get("line_start", 1)
             else:
                 snippets["symbols"] = []
     except Exception:
@@ -323,6 +394,40 @@ def _do_prepare_edit(
     except Exception:
         pass
 
+    # Step 4: Content preview (optional, controlled by preview_mode)
+    file_slice = None
+    if preview_mode == "slice" and first_symbol_line is not None:
+        try:
+            from pathlib import Path
+            content = Path(path).read_text(encoding="utf-8", errors="replace")
+            lines = content.split("\n")
+            total = len(lines)
+            # Slice: 20 lines before first symbol, first symbol, 20 lines after
+            # Clamp to file boundaries
+            start = max(0, first_symbol_line - 21)  # 0-indexed, so -21 means 20 before (1-indexed line)
+            end = min(total, first_symbol_line + 20)
+            if end > start:
+                slice_lines = lines[start:end]
+                file_slice = {
+                    "total_lines": total,
+                    "slice_start": start + 1,   # 1-indexed for humans
+                    "slice_end": end,
+                    "pre_context": slice_lines[:20],
+                    "symbol_context": slice_lines[20:],
+                    "has_pre": start > 0,
+                    "has_post": end < total,
+                    "line_count": end - start,
+                }
+                snippets["file_slice"] = {
+                    "total_lines": total,
+                    "slice_start": start + 1,
+                    "slice_end": end,
+                    "has_pre": start > 0,
+                    "has_post": end < total,
+                }
+        except Exception:
+            pass
+
     # Step 4: Build next_actions
     if hotspot_detected:
         next_actions_list.append({
@@ -344,6 +449,7 @@ def _do_prepare_edit(
         "recent_change": recent_info,
         "hotspot": hotspot_detected,
         "conflict_verified": True,
+        "preview_mode": preview_mode,
     }
 
     return (
@@ -362,6 +468,7 @@ def _do_prepare_edit(
             },
         ),
         symbols_data,
+        file_slice,  # may be None
     )
 
 
@@ -407,7 +514,16 @@ def _do_finish_work(
     results = []
     errors = []
 
-    # Step 1: release claim
+    # Step 1: extract baseline from claim BEFORE releasing (edit verification needs it)
+    baseline: dict | None = None
+    try:
+        claim = claims_mgr.get_claim("file", path)
+        if claim:
+            baseline = claim.get("payload", {}).get("edit_baseline")
+    except Exception:
+        pass
+
+    # Step 1b: release claim
     release_result = {"success": False}
     try:
         release_result = claims_mgr.release_claim("file", path, session_id)
@@ -415,6 +531,29 @@ def _do_finish_work(
     except Exception as e:
         errors.append(f"claim_release:{e}")
         release_result = {"success": False, "error": str(e)}
+
+    # Step 1c: edit verification — detect whether file was actually changed
+    # Best-effort: compare current mtime/size against baseline captured at begin_work.
+    edit_verification = {"status": "unknown", "edited": False}
+    try:
+        if baseline:
+            current_stat = os.stat(path)
+            edited = (
+                current_stat.st_mtime != baseline.get("mtime_sec")
+                or current_stat.st_size != baseline.get("size")
+            )
+            edit_verification = {
+                "status": "verified",
+                "edited": edited,
+                "baseline": baseline,
+                "final": {"mtime_sec": current_stat.st_mtime, "size": current_stat.st_size},
+            }
+        else:
+            edit_verification = {"status": "no_baseline", "edited": False}
+    except OSError:
+        edit_verification = {"status": "file_missing", "edited": False}
+    except Exception as e:
+        edit_verification = {"status": "error", "edited": False, "error": str(e)}
 
     # Step 2: optional diary write — write immediately to backend
     diary_id = None
@@ -478,6 +617,7 @@ def _do_finish_work(
         "path": path,
         "session_id": session_id,
         "claim_released": release_result.get("success"),
+        "edit_verification": edit_verification,
         "diary_id": diary_id,
         "diary_entry": diary_entry,
         "decision_id": decision_id,
@@ -817,7 +957,16 @@ def _do_begin_work_batch(
             {},
         )
 
-    # Step 1: conflict check on ALL paths first (all-or-nothing)
+    # Step 1: capture baselines for all paths before claims (edit verification)
+    baselines: dict[str, dict] = {}
+    for path in paths:
+        try:
+            stat = os.stat(path)
+            baselines[path] = {"mtime_sec": stat.st_mtime, "size": stat.st_size}
+        except OSError:
+            baselines[path] = None  # file may not exist yet
+
+    # Step 2: conflict check on ALL paths first (all-or-nothing)
     conflict_map: dict[str, dict] = {}
     blocked_paths: list[dict] = []
     for path in paths:
@@ -860,7 +1009,8 @@ def _do_begin_work_batch(
     acquired_paths: list[dict] = []
     failed_paths: list[dict] = []
     for path in paths:
-        payload = {"note": note, "path": path} if note else {"path": path}
+        baseline = baselines.get(path)
+        payload = {"note": note, "path": path, "edit_baseline": baseline} if note else {"path": path, "edit_baseline": baseline}
         claim_result = claims_mgr.claim("file", path, session_id, ttl_seconds=ttl_seconds, payload=payload)
         if claim_result.get("acquired"):
             acquired_paths.append({"path": path, "owner": session_id, "expires_at": claim_result.get("expires_at")})
@@ -916,6 +1066,7 @@ def _do_begin_work_batch(
         "owner": session_id,
         "expires_at": expires_at,
         "intent_id": intent_id,
+        "edit_baselines": baselines,  # mtime/size per path at begin_work — used by finish_work_batch
     }
 
     next_actions = [{
@@ -942,6 +1093,7 @@ def _do_begin_work_batch(
                     "expected_outcome": note or f"{len(paths)} files edited",
                     "claim_ttl_seconds": ttl_seconds,
                     "edits_must_happen_before": expires_at,
+                    "edit_baselines": baselines,  # {path: {mtime_sec, size} | None}
                 },
             },
         ),
@@ -995,7 +1147,16 @@ def _do_finish_work_batch(
     results = []
     errors = []
 
-    # Step 1: release all claims
+    # Step 1: extract baselines from claims BEFORE releasing (edit verification needs them)
+    baselines: dict[str, dict | None] = {}
+    for path in paths:
+        try:
+            claim = claims_mgr.get_claim("file", path)
+            baselines[path] = claim.get("payload", {}).get("edit_baseline") if claim else None
+        except Exception:
+            baselines[path] = None
+
+    # Step 1b: release all claims
     released: list[dict] = []
     for path in paths:
         try:
@@ -1005,6 +1166,33 @@ def _do_finish_work_batch(
         except Exception as e:
             errors.append(f"claim_release:{path}:{e}")
             released.append({"path": path, "success": False, "error": str(e)})
+
+    # Step 1c: edit verification — detect whether files were actually changed
+    # Best-effort: compare current mtime/size against baselines captured at begin_work.
+    edit_verifications: dict[str, dict] = {}
+    for path in paths:
+        ev = {"status": "unknown", "edited": False}
+        baseline = baselines.get(path)
+        try:
+            if baseline:
+                current_stat = os.stat(path)
+                edited = (
+                    current_stat.st_mtime != baseline.get("mtime_sec")
+                    or current_stat.st_size != baseline.get("size")
+                )
+                ev = {
+                    "status": "verified",
+                    "edited": edited,
+                    "baseline": baseline,
+                    "final": {"mtime_sec": current_stat.st_mtime, "size": current_stat.st_size},
+                }
+            else:
+                ev = {"status": "no_baseline", "edited": False}
+        except OSError:
+            ev = {"status": "file_missing", "edited": False}
+        except Exception as e:
+            ev = {"status": "error", "edited": False, "error": str(e)}
+        edit_verifications[path] = ev
 
     # Step 2: write one diary entry for the batch
     diary_id = None
@@ -1069,6 +1257,7 @@ def _do_finish_work_batch(
         "session_id": session_id,
         "released_claims": released,
         "release_errors": errors,
+        "edit_verifications": edit_verifications,  # {path: {status, edited, baseline, final}}
         "diary_id": diary_id,
         "diary_entry": diary_entry,
         "decision_id": decision_id,
@@ -1191,6 +1380,7 @@ def register_workflow_tools(server, backend, config, settings):
         ctx: Context,
         path: str,
         session_id: str | None = None,
+        preview_mode: str = "slice",
     ) -> dict:
         """
         Prepare to edit a file — get symbol context, recent changes, AND verify no concurrent edit.
@@ -1199,12 +1389,18 @@ def register_workflow_tools(server, backend, config, settings):
           1. conflict_check  — is another session actively editing? (blocks if yes)
           2. file_symbols   — top-level definitions in the file
           3. recent_changes — has this file changed recently? (hot spot?)
+          4. file_slice     — ~40 lines around the first symbol (when preview_mode="slice")
+
+        preview_mode controls content preview:
+          - "slice" (default): read ~40 lines around the first symbol (M1-friendly, ≈3KB)
+          - "none"  : symbols only, no file read (backward-compatible, zero extra I/O)
 
         Returns a workflow_result with:
           - ok / error status
-          - path, symbols_count, hotspot, conflict_verified
+          - path, symbols_count, hotspot, conflict_verified, preview_mode
           - context_snippets.symbols: list of {name, type, line}
           - context_snippets.recent_change: change_count, last_modified
+          - context_snippets.file_slice: {total_lines, slice_start, slice_end, has_pre, has_post}
           - next_actions: search suggestions
           - failure_mode: claim_conflict if another session holds an active claim
 
@@ -1214,10 +1410,11 @@ def register_workflow_tools(server, backend, config, settings):
         resolved = _optional_session_id(ctx, session_id)
         si = _get_symbol_index()
 
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, path, resolved, settings.palace_path,
-            os.environ.get("PROJECT_ROOT"), si,
+            _resolve_project_root(None, settings.palace_path, path), si,
             claims_mgr,
+            preview_mode=preview_mode,
         )
         return result
 
@@ -1539,7 +1736,3 @@ class _EmptyDecisionTracker:
     """Passthrough for finish_work when decision_tracker is unavailable."""
     def capture_decision(self, **kwargs):
         return {"id": None, "error": "no decision tracker"}
-
-
-# ── needed in _do_prepare_edit ────────────────────────────────────────────
-import os

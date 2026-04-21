@@ -13,12 +13,27 @@ Phase 6 enrichment:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 from .claims_manager import ClaimsManager
 from .handoff_manager import HandoffManager
 from .decision_tracker import DecisionTracker
 from .session_registry import SessionRegistry
+
+
+def _find_git_root(start_path: str) -> str | None:
+    """Find git repo root by walking up from start_path. No env dependency."""
+    try:
+        current = Path(start_path).expanduser().resolve()
+        if current.is_file():
+            current = current.parent
+        for parent in [current] + list(current.parents):
+            if (parent / ".git").is_dir():
+                return str(parent)
+    except Exception:
+        pass
+    return None
 
 
 def build_wakeup_context(
@@ -48,7 +63,7 @@ def build_wakeup_context(
     if palace_path is None:
         palace_path = os.environ.get("MEMPALACE_PATH", os.path.expanduser("~/.mempalace"))
     if project_root is None:
-        project_root = os.environ.get("PROJECT_ROOT", "")
+        project_root = _find_git_root(palace_path) or ""
 
     claims_mgr = ClaimsManager(palace_path)
     handoff_mgr = HandoffManager(palace_path)

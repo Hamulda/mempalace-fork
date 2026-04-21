@@ -401,7 +401,7 @@ class TestTwoSessionsSameFile:
         ctx = MagicMock()
 
         # Session B calls prepare_edit on the same file
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, "/src/auth.py", "session-b",
             "/tmp/palace", "/tmp/project", si,
             claims,
@@ -731,7 +731,7 @@ class TestPrepareEditAutoConflictCheck:
         si = _MockSymbolIndex([])
         ctx = MagicMock()
 
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, "/src/main.py", "session-b",
             "/tmp/palace", "/tmp/project", si,
             claims,
@@ -750,7 +750,7 @@ class TestPrepareEditAutoConflictCheck:
         ])
         ctx = MagicMock()
 
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, "/src/main.py", "session-a",
             "/tmp/palace", "/tmp/project", si,
             claims,
@@ -769,7 +769,7 @@ class TestPrepareEditAutoConflictCheck:
         si = _MockSymbolIndex([])
         ctx = MagicMock()
 
-        result, _ = _do_prepare_edit(
+        result, _, _ = _do_prepare_edit(
             ctx, "/src/main.py", "session-a",
             "/tmp/palace", "/tmp/project", si,
             claims,

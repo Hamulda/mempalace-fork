@@ -2,7 +2,53 @@
 Session coordination tools: claims, handoffs, decisions, wakeup.
 """
 import os
+from pathlib import Path
 from fastmcp import Context
+
+
+# ── Project root resolution (shared, no env dependency) ───────────────────────
+
+def _find_git_root(start_path: str) -> str | None:
+    """
+    Find the git repository root by walking up from start_path.
+
+    Returns the containing git repo root, or None if no .git directory found.
+    Deterministic — no env variables required.
+    """
+    try:
+        current = Path(start_path).expanduser().resolve()
+        if current.is_file():
+            current = current.parent
+        for parent in [current] + list(current.parents):
+            if (parent / ".git").is_dir():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_project_root(explicit: str | None, palace_path: str, file_path: str | None = None) -> str | None:
+    """
+    Resolve project_root with explicit priority and deterministic fallback.
+
+    Resolution order:
+    1. explicit parameter (caller-provided)
+    2. git root from file_path (when editing a known file)
+    3. git root from palace_path (palace lives inside a project)
+    4. None (caller handles gracefully)
+
+    No env dependency.
+    """
+    if explicit:
+        return explicit
+    if file_path:
+        git_root = _find_git_root(file_path)
+        if git_root:
+            return git_root
+    git_root = _find_git_root(palace_path)
+    if git_root:
+        return git_root
+    return None
 
 
 # ── Session ID auto-detection ────────────────────────────────────────────────
@@ -100,7 +146,7 @@ def register_session_tools(server, backend, config, settings):
     def _hotspot_check(path: str, project_root: str | None) -> dict:
         """Return hotspot metadata for a path from recent git changes."""
         if not project_root:
-            project_root = os.environ.get("PROJECT_ROOT")
+            project_root = _find_git_root(path)
         if not project_root:
             return {}
         try:
@@ -187,7 +233,7 @@ def register_session_tools(server, backend, config, settings):
         mgr = _get_claims_manager()
         si = _get_symbol_index()
         resolved = _optional_session_id(ctx, session_id)
-        project_root = os.environ.get("PROJECT_ROOT")
+        project_root = _find_git_root(path)
 
         # Claim state
         claim = None
@@ -310,7 +356,7 @@ def register_session_tools(server, backend, config, settings):
             return {"error": "session coordination not available"}
 
         resolved = _optional_session_id(ctx, session_id)
-        project_root = os.environ.get("PROJECT_ROOT")
+        project_root = _resolve_project_root(None, settings.palace_path, workspace)
 
         all_claims = mgr.list_active_claims()
 
@@ -584,19 +630,19 @@ def register_session_tools(server, backend, config, settings):
         """
         Build a compact wake-up context bundle for session resume or takeover.
 
-        Improved UX — session_id and project_root are now auto-detected:
-        - session_id: from FastMCP context (Claude Code harness) or MEMPALACE_SESSION_ID env var
-        - project_root: from PROJECT_ROOT env var (defaults to "" if not set)
+        Improved UX — session_id is auto-detected from FastMCP context or
+        MEMPALACE_SESSION_ID env var. project_root is auto-detected via
+        git-root derivation from palace_path (no PROJECT_ROOT env dependency).
 
         Call with no arguments for full auto-detection:
             mempalace_wakeup_context()
         """
         try:
             resolved_sid = _require_session_id(ctx, session_id, "wakeup_context")
-            # project_root auto-detected inside build_wakeup_context from env/PROJECT_ROOT
+            # project_root auto-detected inside build_wakeup_context via git-root derivation
             result = build_wakeup_context(
                 session_id=resolved_sid,
-                project_root=project_root,  # None → build_wakeup_context uses PROJECT_ROOT env
+                project_root=project_root,
                 palace_path=config.palace_path,
             )
             return result

@@ -24,8 +24,8 @@ This returns:
 - Relevant decisions (linked to your file context)
 - Next checks (validation steps based on context)
 
-**session_id and project_root are auto-detected** from Claude Code harness context
-and `PROJECT_ROOT` env var respectively. No arguments needed for the common case.
+**session_id** is auto-detected from Claude Code harness context.
+**project_root** is auto-detected via git-root derivation from palace_path. No arguments needed for the common case.
 
 ## Step 2: Check Recent Changes
 
