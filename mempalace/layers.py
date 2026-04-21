@@ -447,7 +447,7 @@ class MemoryStack:
                 "description": "Wing/room filtered retrieval",
             },
             "L3_deep_search": {
-                "description": "Full semantic search via ChromaDB",
+                "description": "Full semantic search via LanceDB (canonical)",
             },
         }
 

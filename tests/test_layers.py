@@ -1,7 +1,20 @@
-"""Tests for mempalace.layers — Layer0, Layer1, Layer2, Layer3, MemoryStack."""
+"""
+Tests for mempalace.layers — Layer0, Layer1, Layer2, Layer3, MemoryStack.
+
+NOTE: These tests use mocked ChromaDB paths because Layer1/2/3 historically
+used ChromaDB directly. After the Lance-first refactor, the canonical path
+is `get_backend()` (from backends/__init__.py), but the tests still use
+`patch("mempalace.layers.chromadb.PersistentClient")` — this patch target
+no longer exists (layers.py imports via backends/__init__.py, not chromadb directly).
+
+FIX: patch `mempalace.layers.get_backend` instead of the non-existent chromadb path.
+A full rewrite of these mocks is tracked separately.
+"""
 
 import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from mempalace.layers import Layer0, Layer1, Layer2, Layer3, MemoryStack
 
@@ -105,7 +118,7 @@ def test_layer1_generates_essential_story():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -123,7 +136,7 @@ def test_layer1_empty_palace():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -139,7 +152,7 @@ def test_layer1_with_wing_filter():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake", wing="project_x")
@@ -158,7 +171,7 @@ def test_layer1_truncates_long_snippets():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -175,7 +188,7 @@ def test_layer1_respects_max_chars():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -197,7 +210,7 @@ def test_layer1_importance_from_various_keys():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -218,7 +231,7 @@ def test_layer1_batch_exception_breaks():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -249,7 +262,7 @@ def test_layer2_retrieve_with_wing():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -270,7 +283,7 @@ def test_layer2_retrieve_with_room():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -290,7 +303,7 @@ def test_layer2_retrieve_wing_and_room():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -309,7 +322,7 @@ def test_layer2_retrieve_empty():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -326,7 +339,7 @@ def test_layer2_retrieve_no_filter():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -345,7 +358,7 @@ def test_layer2_retrieve_error():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -365,7 +378,7 @@ def test_layer2_truncates_long_snippets():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -413,7 +426,7 @@ def test_layer3_search_with_results():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -432,7 +445,7 @@ def test_layer3_search_no_results():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -453,7 +466,7 @@ def test_layer3_search_with_wing_filter():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -475,7 +488,7 @@ def test_layer3_search_with_room_filter():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -497,7 +510,7 @@ def test_layer3_search_with_wing_and_room():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -515,7 +528,7 @@ def test_layer3_search_error():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -536,7 +549,7 @@ def test_layer3_search_truncates_long_docs():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -557,7 +570,7 @@ def test_layer3_search_raw_returns_dicts():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -582,7 +595,7 @@ def test_layer3_search_raw_with_filters():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -600,7 +613,7 @@ def test_layer3_search_raw_error():
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -706,7 +719,7 @@ def test_memory_stack_status_with_palace(tmp_path):
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers.get_backend", return_value=mock_client),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         stack = MemoryStack(

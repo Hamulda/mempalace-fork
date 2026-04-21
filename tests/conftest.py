@@ -196,8 +196,12 @@ def config(tmp_dir, palace_path):
 
 
 @pytest.fixture
-def collection(palace_path):
-    """A ChromaDB collection pre-seeded in the temp palace."""
+def collection_chroma(palace_path):
+    """A ChromaDB collection pre-seeded in the temp palace.
+
+    DEPRECATED: This fixture exists only for tests that still use ChromaDB.
+    All new tests should use LanceDB via the canonical write/read paths.
+    """
     client = chromadb.PersistentClient(path=palace_path)
     col = client.get_or_create_collection("mempalace_drawers")
     yield col
@@ -210,6 +214,10 @@ def collection(palace_path):
     except Exception:
         pass
     del client
+
+
+# Alias for backward compatibility with existing tests
+collection = collection_chroma
 
 
 @pytest.fixture
