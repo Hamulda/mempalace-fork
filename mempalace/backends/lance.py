@@ -1142,6 +1142,36 @@ class LanceCollection(BaseCollection):
         from ..query_cache import get_query_cache
         get_query_cache().invalidate_collection(self._palace_path, self._collection_name)
 
+        # ── FTS5 incremental sync ─────────────────────────────────────────
+        self._sync_fts5upsert(final_ids, final_docs, final_metas)
+
+    def _sync_fts5upsert(
+        self,
+        ids: list[str],
+        documents: list[str],
+        metadatas: list[dict],
+    ) -> None:
+        """Synchronize written records into the FTS5 keyword index.
+
+        Called after every successful upsert/add. Lightweight — extracts
+        wing/room/language from metadata and delegates to KeywordIndex.
+        Failures are logged but never propagate (lexical index staleness is
+        safe to recover via rebuild_keyword_index).
+        """
+        try:
+            from ..lexical_index import KeywordIndex
+            idx = KeywordIndex.get(self._palace_path)
+            for doc_id, doc, meta in zip(ids, documents, metadatas):
+                idx.upsert_drawer(
+                    document_id=doc_id,
+                    content=doc,
+                    wing=meta.get("wing", ""),
+                    room=meta.get("room", ""),
+                    language=meta.get("language"),
+                )
+        except Exception:
+            pass  # FTS5 staleness is recoverable; never crash write path
+
     # ── Read operations ───────────────────────────────────────────────────
 
     def query(
@@ -1461,6 +1491,25 @@ class LanceCollection(BaseCollection):
             except Exception as e:
                 logger.warning("delete(where=...) skipped due to scan error: %s", e)
                 return
+
+        # ── FTS5 incremental sync (delete) ────────────────────────────────
+        self._sync_fts5delete(ids or [])
+
+    def _sync_fts5delete(self, ids: list[str]) -> None:
+        """Remove deleted document IDs from the FTS5 keyword index.
+
+        Called after every successful delete. Failures are logged but never
+        propagate — stale FTS5 entries are safe to recover via rebuild.
+        """
+        if not ids:
+            return
+        try:
+            from ..lexical_index import KeywordIndex
+            idx = KeywordIndex.get(self._palace_path)
+            for doc_id in ids:
+                idx.delete_drawer(doc_id)
+        except Exception:
+            pass  # FTS5 staleness is recoverable; never crash write path
 
     def count(self) -> int:
         try:

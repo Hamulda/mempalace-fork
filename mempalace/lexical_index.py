@@ -64,7 +64,7 @@ class KeywordIndex:
             for inst in cls._instances.values():
                 try:
                     if inst._lock:
-                        inst._lock.acquire()
+                        inst._lock.release()
                 except Exception:
                     pass
             cls._instances.clear()
