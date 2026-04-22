@@ -66,7 +66,8 @@ def _create_embedding_model():
 def _create_mlx_model():
     """
     ModernBERT-embed-base 4-bit MLX.
-    MTEB 62.62, 8192 token context, ~85MB RAM, nativní Apple Silicon.
+    MTEB ~61.17 (256-dim Matryoshka truncation vs full 768-dim = 62.62),
+    8192 token context, ~85MB RAM, nativní Apple Silicon.
     """
     from mlx_embeddings import load, generate
     import numpy as np

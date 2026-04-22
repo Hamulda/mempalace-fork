@@ -103,9 +103,7 @@ class KeywordIndex:
             try:
                 conn = sqlite3.connect(self.db_path)
                 conn.execute("PRAGMA journal_mode=WAL")
-                # Delete existing entry
                 conn.execute("DELETE FROM drawers_fts WHERE document_id = ?", (document_id,))
-                # Insert new entry
                 conn.execute(
                     "INSERT INTO drawers_fts(document_id, content, wing, room, language) VALUES (?, ?, ?, ?, ?)",
                     (document_id, content, wing, room, language or ""),
@@ -114,6 +112,43 @@ class KeywordIndex:
                 conn.close()
             except sqlite3.Error as e:
                 logger.warning("FTS5 upsert failed for %s: %s", document_id, e)
+
+    def upsert_drawer_batch(
+        self,
+        entries: list[dict],
+    ) -> None:
+        """Upsert multiple drawers in one transaction.
+
+        Each entry: {document_id, content, wing, room, language}
+        Opens one connection and performs all DELETE+INSERT in one transaction.
+        Use this for bulk sync from LanceDB write path.
+        """
+        if not entries:
+            return
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                for entry in entries:
+                    conn.execute(
+                        "DELETE FROM drawers_fts WHERE document_id = ?",
+                        (entry["document_id"],),
+                    )
+                    conn.execute(
+                        "INSERT INTO drawers_fts(document_id, content, wing, room, language) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            entry["document_id"],
+                            entry["content"],
+                            entry.get("wing", ""),
+                            entry.get("room", ""),
+                            entry.get("language", ""),
+                        ),
+                    )
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.warning("FTS5 batch upsert failed: %s", e)
 
     def delete_drawer(self, document_id: str) -> None:
         """Remove a drawer from the FTS5 index."""

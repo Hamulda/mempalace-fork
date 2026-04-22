@@ -16,7 +16,8 @@ All rebuild_* functions backup before destructive action.
 Canonical lexical engine: SQLite FTS5 (KeywordIndex). LanceDB's native FTS
 capability is not queried by any search path and is not maintained. The
 KeywordIndex is updated incrementally by every add/upsert/delete write to
-LanceCollection — lexical freshness is maintained without rebuild.
+LanceCollection — FTS5 staleness is tolerated and recoverable via
+rebuild_keyword_index.
 """
 
 from __future__ import annotations
@@ -176,7 +177,7 @@ def validate_keyword_index(palace_path: str) -> dict:
             try:
                 backend = get_backend("lance")
                 col = backend.get_collection(palace_path, cfg.collection_name, create=False)
-                sample_data = col.get(ids=sample_ids[:5], include=["documents"])
+                sample_data = col.get(ids=sample_ids, include=["documents"])
                 found_ids = sample_data.get("ids", [])
                 result["sample_check_passed"] = len(found_ids) == len(sample_ids)
             except Exception as e:

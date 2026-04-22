@@ -274,6 +274,43 @@ class TestKeywordIndexPublicAPI:
 
         assert ki.count() == 2
 
+    def test_upsert_drawer_batch_replaces_existing(self, palace_path):
+        """upsert_drawer_batch replaces existing entries by document_id."""
+        from mempalace.lexical_index import KeywordIndex
+
+        ki = KeywordIndex.get(palace_path)
+        ki.clear()
+
+        ki.bulk_insert_batch([
+            {"document_id": "doc1", "content": "apple banana", "wing": "", "room": "", "language": ""},
+            {"document_id": "doc2", "content": "cherry date", "wing": "", "room": "", "language": ""},
+        ])
+        assert ki.count() == 2
+
+        # Batch-upsert doc1 with new content + add doc3 in same call
+        ki.upsert_drawer_batch([
+            {"document_id": "doc1", "content": "fig grape", "wing": "", "room": "", "language": ""},
+            {"document_id": "doc3", "content": "hazelnut", "wing": "", "room": "", "language": ""},
+        ])
+
+        assert ki.count() == 3
+        # doc1 content must be updated (no longer searchable as "apple")
+        results = ki.search("apple", n_results=5)
+        doc1_found_under_old = any(r["document_id"] == "doc1" for r in results)
+        assert not doc1_found_under_old, "doc1 still found under old term 'apple' — upsert did not replace"
+        # doc1 new content must be searchable
+        results_new = ki.search("fig", n_results=5)
+        assert any(r["document_id"] == "doc1" for r in results_new)
+
+    def test_upsert_drawer_batch_empty_list_noops(self, palace_path):
+        """upsert_drawer_batch with empty list does nothing (no connection opened)."""
+        from mempalace.lexical_index import KeywordIndex
+
+        ki = KeywordIndex.get(palace_path)
+        ki.clear()
+        ki.upsert_drawer_batch([])  # should not raise
+        assert ki.count() == 0
+
 
 class TestValidateRuntimeStateNoSideEffects:
     def test_memory_guard_get_if_running_does_not_create_instance(self, palace_path):
@@ -461,3 +498,48 @@ class TestValidateKeywordIndexPublicAPI:
 
         assert result["fts5_count"] == 2
         assert result["sample_check_passed"] is True
+
+    def test_validate_keyword_index_checks_all_sampled_ids(self, palace_path, monkeypatch):
+        """sample_ids(n=10) returns up to 10 IDs — all must be checked against LanceDB.
+
+        Regression test: previously the code sliced [:5] but compared against len(sample_ids),
+        causing sample_check_passed to be False whenever more than 5 IDs were sampled.
+        """
+        from mempalace.lexical_index import KeywordIndex
+        from mempalace.backends import get_backend
+
+        ki = KeywordIndex.get(palace_path)
+        ki.clear()
+        # Insert 7 documents so sample_ids(n=10) returns 7
+        for i in range(7):
+            ki.bulk_insert_batch([{
+                "document_id": f"doc_{i}",
+                "content": f"content {i}",
+                "wing": "t",
+                "room": "r",
+                "language": "en",
+            }])
+
+        class FakeCol:
+            def count(self):
+                return 7
+            def get(self, ids=None, include=None):
+                # FakeCol returns all requested IDs as found
+                return {"ids": list(ids), "documents": [f"content {i}" for i in range(len(ids))],
+                        "metadatas": [{"wing": "t", "room": "r", "language": "en"}] * len(ids)}
+
+        class FakeLanceBackend:
+            def get_collection(self, pp, cn, create=False):
+                return FakeCol()
+
+        monkeypatch.setattr("mempalace.backends.get_backend", lambda *a, **kw: FakeLanceBackend())
+
+        from mempalace.diagnostics import validate_keyword_index
+        result = validate_keyword_index(palace_path)
+
+        assert result["fts5_count"] == 7
+        # With 7 sampled IDs, the old [:5] bug would cause len(found_ids)=5 vs len(sample_ids)=7
+        assert result["sample_check_passed"] is True, (
+            f"sample_check_passed=False — likely [:5] slice still present, "
+            f"found {len(result.get('sample_errors', []))} errors: {result.get('sample_errors', [])}"
+        )

@@ -1156,22 +1156,25 @@ class LanceCollection(BaseCollection):
     ) -> None:
         """Synchronize written records into the FTS5 keyword index.
 
-        Called after every successful upsert/add. Lightweight — extracts
-        wing/room/language from metadata and delegates to KeywordIndex.
-        Failures are logged but never propagate (lexical index staleness is
-        safe to recover via rebuild_keyword_index).
+        Called after every successful upsert/add. Uses batch upsert for
+        efficiency — one sqlite connection, one transaction.
+        Failures are silently suppressed (lexical index staleness is
+        recoverable via rebuild_keyword_index).
         """
         try:
             from ..lexical_index import KeywordIndex
             idx = KeywordIndex.get(self._palace_path)
-            for doc_id, doc, meta in zip(ids, documents, metadatas):
-                idx.upsert_drawer(
-                    document_id=doc_id,
-                    content=doc,
-                    wing=meta.get("wing", ""),
-                    room=meta.get("room", ""),
-                    language=meta.get("language"),
-                )
+            entries = [
+                {
+                    "document_id": doc_id,
+                    "content": doc,
+                    "wing": meta.get("wing", ""),
+                    "room": meta.get("room", ""),
+                    "language": meta.get("language"),
+                }
+                for doc_id, doc, meta in zip(ids, documents, metadatas)
+            ]
+            idx.upsert_drawer_batch(entries)
         except Exception:
             pass  # FTS5 staleness is recoverable; never crash write path
 
@@ -1504,8 +1507,8 @@ class LanceCollection(BaseCollection):
     def _sync_fts5delete(self, ids: list[str]) -> None:
         """Remove deleted document IDs from the FTS5 keyword index.
 
-        Called after every successful delete. Failures are logged but never
-        propagate — stale FTS5 entries are safe to recover via rebuild.
+        Called after every successful delete. Failures are silently suppressed
+        — stale FTS5 entries are safe to recover via rebuild.
         """
         if not ids:
             return
