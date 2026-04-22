@@ -97,6 +97,12 @@ def _create_mlx_model():
 
         def _embed_batch(self, texts: list[str]) -> np.ndarray:
             output = generate(self._model, self._tokenizer, texts=texts)
+            # Force MLX to synchronize GPU→CPU transfer before clearing cache
+            try:
+                import mlx.core as mx
+                mx.eval(output.text_embeds)
+            except Exception:
+                pass  # mx.eval not available on all MLX builds
             embeddings = np.array(output.text_embeds)
             # Matryoshka truncation: prvních DIMS dimenzí + L2 normalizace
             embeddings = embeddings[:, : self.DIMS]
@@ -110,6 +116,15 @@ def _create_mlx_model():
             return iter(result)
 
     wrapper = ModernBERTWrapper(model, tokenizer)
+
+    # Post-load cache hygiene: evict KV cache after warmup to free ~0.75GB
+    try:
+        import mlx.core as mx
+        mx.eval(wrapper._embed_batch(["post_load"]))
+        mx.metal.clear_cache()
+    except Exception:
+        pass  # Only available on MLX with Metal backend
+
     return wrapper
 
 

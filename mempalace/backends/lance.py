@@ -830,7 +830,7 @@ class LanceCollection(BaseCollection):
     - Hybrid search: vector similarity + FTS on document text
     - Semantic deduplication: prevents duplicate/conflicting writes
     - LanceDB compaction: background optimize every 200 writes / 1 hour
-    - FTS throttling: rebuild index every 50 writes, not every write
+    - Canonical lexical search: SQLite FTS5 (KeywordIndex), incremental sync
     - M1 CPU: no GPU memory conflicts
     """
 
