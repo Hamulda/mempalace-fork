@@ -84,6 +84,7 @@ quote-style = "double"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-m 'not benchmark and not slow and not stress' --timeout=30"
+asyncio_mode = "auto"
 markers = [
     "benchmark: scale/performance benchmark tests",
     "slow: tests that take more than 30 seconds",

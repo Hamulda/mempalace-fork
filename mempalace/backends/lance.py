@@ -247,21 +247,52 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
 
     Prefers the Unix socket daemon. Falls back to in-process fastembed
     if the daemon is unavailable.
+
+    Caching: each text is checked against EmbeddingCache individually.
+    Cache hits avoid socket/fallback round-trips.
     """
     if not texts:
         return []
 
+    from ..query_cache import get_embedding_cache
+    cache = get_embedding_cache()
+
+    # Split texts into cached and uncached
+    uncached_texts: list[str] = []
+    emb_map: dict[str, list[float]] = {}  # text → embedding
+
+    for text in texts:
+        cached_emb = cache.get(text)
+        if cached_emb is not None:
+            emb_map[text] = cached_emb
+        else:
+            uncached_texts.append(text)
+
+    # All cached — return immediately in original order
+    if not uncached_texts:
+        return [emb_map[text] for text in texts]
+
+    # Compute embeddings for uncached texts
     daemon_ok = _start_daemon_if_needed()
 
     if daemon_ok:
         try:
-            return _embed_via_socket(texts)
+            computed = _embed_via_socket(uncached_texts)
         except Exception as e:
             logger.warning("Socket embedding failed (%s), using fallback", e)
             global _DAEMON_STARTED
             _DAEMON_STARTED = False
+            computed = _embed_texts_fallback(uncached_texts)
+    else:
+        computed = _embed_texts_fallback(uncached_texts)
 
-    return _embed_texts_fallback(texts)
+    # Store computed in cache and merge into result dict
+    for text, emb in zip(uncached_texts, computed):
+        cache.set(text, emb)
+        emb_map[text] = emb
+
+    # Return in original order
+    return [emb_map[text] for text in texts]
 
 
 # ── Semantic Deduplicator ──────────────────────────────────────────────────────
@@ -737,10 +768,15 @@ def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]])
         return df
 
     if "$or" in where:
-        mask = pandas.Series([False] * len(df), index=df.index)
+        # Collect matching ids from each sub-filter, then filter once
+        id_sets: list[set] = []
         for sub in where["$or"]:
-            mask = mask | _apply_where_filter(df, sub)["id"].isin(df["id"])
-        return df[mask]
+            sub_df = _apply_where_filter(df, sub)
+            id_sets.append(set(sub_df["id"].tolist()))
+        combined_ids = set()
+        for s in id_sets:
+            combined_ids.update(s)
+        return df[df["id"].isin(combined_ids)]
 
     for key, cond in where.items():
         if key == "id":
@@ -978,16 +1014,22 @@ class LanceCollection(BaseCollection):
                     f"{guard.used_ratio:.0%}. Close some apps and retry."
                 )
 
-        # Check for duplicate ids (with retry)
-        for doc_id in ids:
+        # Check for duplicate ids — batch query with $in instead of N separate queries
+        if ids:
+            id_list = list(ids)
+            if len(id_list) == 1:
+                where_clause = f"id = '{id_list[0]}'"
+            else:
+                where_clause = "id IN (" + ", ".join(repr(i) for i in id_list) + ")"
+
             def check_dup():
-                dup = self._table.search().where(f"id = '{doc_id}'").to_pandas()
-                return dup
+                return self._table.search().where(where_clause).to_pandas()
 
             result = self._write_with_retry(check_dup)
             if not result.empty:
+                existing = result["id"].tolist()
                 raise ValueError(
-                    f"Record with id '{doc_id}' already exists. Use upsert() to update."
+                    f"Record(s) {existing} already exist(s). Use upsert() to update."
                 )
 
         # BATCH Semantic deduplication – jeden embedding call pro celý batch
@@ -1184,6 +1226,7 @@ class LanceCollection(BaseCollection):
             ]
             idx.upsert_drawer_batch(entries)
         except Exception:
+            logger.warning("FTS5 upsert failed for %d entries: %s — index may be stale", len(ids), e)
             pass  # FTS5 staleness is recoverable; never crash write path
 
     # ── Read operations ───────────────────────────────────────────────────
@@ -1336,7 +1379,8 @@ class LanceCollection(BaseCollection):
                 while total_scanned < MAX_SCAN:
                     # Never request more rows than the remaining scan budget — this
                     # ensures we don't skip over the ceiling in one large page.
-                    batch_limit = min(SCAN_BATCH, MAX_SCAN - total_scanned)
+                    # Also cap at the user's effective_limit to avoid wasted I/O.
+                    batch_limit = min(SCAN_BATCH, MAX_SCAN - total_scanned, effective_limit + target_offset - total_scanned)
                     page = (
                         self._table.search()
                         .limit(batch_limit)
@@ -1546,6 +1590,7 @@ class LanceCollection(BaseCollection):
             for doc_id in ids:
                 idx.delete_drawer(doc_id)
         except Exception:
+            logger.warning("FTS5 delete failed for %d entries: %s — index may be stale", len(ids), e)
             pass  # FTS5 staleness is recoverable; never crash write path
 
     def count(self) -> int:

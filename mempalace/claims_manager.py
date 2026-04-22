@@ -171,7 +171,10 @@ class ClaimsManager:
                 )
                 self._conn_ctx.commit()
         except Exception:
-            pass
+            import logging
+            logging.getLogger("mempalace.claims").warning(
+                "Failed to log event %s/%s/%s: %s", session_id, target_type, target_id, str(e)
+            )
 
     def claim(
         self,

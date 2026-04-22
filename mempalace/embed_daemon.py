@@ -35,7 +35,28 @@ CACHE_DIR = os.path.expanduser("~/.cache/fastembed")
 # M1 8GB safety: chunk embeddings to avoid memory pressure during batch inference.
 # 32 texts × ~256 tokens × embedding_dim ≈ 32MB peak per chunk with MLX.
 # This prevents OOM when 6 parallel Claude Code sessions each send large batches.
-MAX_BATCH = 32
+MAX_BATCH = 32  # baseline — adaptive sizing via _get_embed_batch_size()
+
+
+def _get_embed_batch_size() -> int:
+    """
+    Return embedding batch size adapted to current memory pressure.
+
+    CRITICAL (>90% RAM used): 8  — minimal batch, prevent OOM
+    WARN (70-90%): 16            — reduced batch
+    NOMINAL (<70%): 64           — full speed, safe for 85MB model on 8GB M1
+    """
+    try:
+        from mempalace.memory_guard import MemoryGuard, MemoryPressure
+        guard = MemoryGuard.get()
+        if guard.pressure == MemoryPressure.CRITICAL:
+            return 8
+        elif guard.pressure == MemoryPressure.WARN:
+            return 16
+    except Exception:
+        pass
+    # Fallback: use env var or default 64 for nominal
+    return int(os.environ.get("MEMPALACE_EMBED_BATCH", "64"))
 
 
 def _create_embedding_model():
@@ -205,12 +226,12 @@ def _handle_client(conn: socket.socket, model) -> None:
         if not texts:
             response = {"embeddings": [], "error": None}
         else:
-            # Chunk to MAX_BATCH to prevent memory exhaustion on M1 8GB.
-            # Large batches with MLX models can consume ~2GB+ peak memory;
-            # chunking keeps peak under ~500MB per chunk.
+            # Chunk to adaptive batch size to prevent memory exhaustion on M1 8GB.
+            # Dynamic sizing via _get_embed_batch_size() adapts to memory pressure.
             all_embeddings = []
-            for i in range(0, len(texts), MAX_BATCH):
-                chunk = texts[i:i + MAX_BATCH]
+            batch_size = _get_embed_batch_size()
+            for i in range(0, len(texts), batch_size):
+                chunk = texts[i:i + batch_size]
                 chunk_embs = [emb.tolist() for emb in model.embed(chunk)]
                 all_embeddings.extend(chunk_embs)
             response = {"embeddings": all_embeddings, "error": None}

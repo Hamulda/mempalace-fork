@@ -32,18 +32,6 @@ os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 # Tests that intentionally test real embedding behavior should be marked @pytest.mark.slow.
 
 
-def _mock_embed_texts(texts):
-    """Deterministic fake embeddings — no MLX, no memory pressure, no daemon."""
-    import hashlib
-    dim = 256
-    result = []
-    for text in texts:
-        h = hashlib.sha256(text.encode()).digest()
-        vec = list(h[:dim]) + [0.0] * (dim - len(h))
-        result.append(vec)
-    return result
-
-
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402

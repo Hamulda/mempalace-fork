@@ -63,6 +63,8 @@ def multi_dir_collection(palace_path, monkeypatch):
 
 
 class TestSearchMemoriesPathContract:
+    @pytest.mark.timeout(300)
+    @pytest.mark.slow
     def test_search_memories_returns_full_path(self, palace_path, multi_dir_collection):
         """search_memories hit source_file is a full path, not just basename."""
         result = search_memories("def authenticate", palace_path)

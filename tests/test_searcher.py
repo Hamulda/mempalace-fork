@@ -324,7 +324,7 @@ class TestHybridSearch:
 
         assert "sources" in result
         assert "vector" in result["sources"]
-        assert "bm25" in result["sources"]
+        assert "fts5" in result["sources"]
         assert "kg" in result["sources"]
         assert isinstance(result["sources"]["vector"], int)
         assert isinstance(result["sources"]["kg"], int)

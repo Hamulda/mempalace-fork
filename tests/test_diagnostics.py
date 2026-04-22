@@ -144,6 +144,8 @@ class TestValidateSkillsRegistration:
 
 
 class TestRebuildKeywordIndex:
+    @pytest.mark.timeout(300)
+    @pytest.mark.slow
     def test_changes_fts5_count(self, palace_path, seeded_collection):
         """rebuild_keyword_index actually changes the FTS5 count."""
         from mempalace.lexical_index import KeywordIndex
@@ -406,6 +408,8 @@ class TestRebuildKeywordIndexBatching:
         assert isinstance(result["batches"], int)
         assert result["batches"] >= 1
 
+    @pytest.mark.timeout(300)
+    @pytest.mark.slow
     def test_rebuild_keyword_index_batches_flushed_immediately(self, palace_path, seeded_collection):
         """After each batch, FTS5 is flushed — ki.count() increases incrementally."""
         from mempalace.lexical_index import KeywordIndex
@@ -426,6 +430,8 @@ class TestRebuildKeywordIndexBatching:
         assert result["documents_indexed"] == total
         assert ki.count() == total
 
+    @pytest.mark.timeout(300)
+    @pytest.mark.slow
     def test_rebuild_keyword_index_backup_before_destructive(self, palace_path, seeded_collection):
         """backup_path is set before clear() or any destructive operation."""
         ki_path = str(Path(palace_path) / "keyword_index.sqlite3")

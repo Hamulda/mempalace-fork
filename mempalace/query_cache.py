@@ -302,12 +302,72 @@ class QueryCache:
         return result
 
 
-# Globální cache singleton sdílená v HTTP MCP serveru
+class EmbeddingCache:
+    """
+    LRU cache for embedding results keyed by content hash.
+
+    Reduces repeated embedding calls for identical texts (e.g., re-mining unchanged
+    files, or repeated queries on same content). Zero-cost cache hits.
+
+    TTL 300s (5 min) — embeddings are static for fixed text content.
+    Maxsize 512 — fits ~512 × 256-dim × 4bytes ≈ 0.5MB for embeddings alone.
+    """
+
+    _MAXSIZE = 512
+    _TTL = 300.0  # seconds
+
+    def __init__(self, maxsize: int = 512, ttl_seconds: float = 300.0):
+        self._maxsize = maxsize
+        self._ttl = ttl_seconds
+        self._cache: OrderedDict[str, tuple[list[float], float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _hash_text(self, text: str) -> str:
+        """Content hash as cache key — stable across process restarts."""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def get(self, text: str) -> Optional[list[float]]:
+        """Return cached embedding or None."""
+        key = self._hash_text(text)
+        with self._lock:
+            if key not in self._cache:
+                return None
+            emb, ts = self._cache[key]
+            if time.monotonic() - ts > self._ttl:
+                del self._cache[key]
+                return None
+            self._cache.move_to_end(key)
+            return emb
+
+    def set(self, text: str, embedding: list[float]) -> None:
+        """Store embedding with TTL."""
+        key = self._hash_text(text)
+        with self._lock:
+            self._cache[key] = (embedding, time.monotonic())
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
+
+    def clear(self) -> None:
+        """Clear all entries."""
+        with self._lock:
+            self._cache.clear()
+
+
+# Globální singletons
 _query_cache = QueryCache(
     maxsize=int(os.environ.get("MEMPALACE_CACHE_SIZE", "256")),
     ttl_seconds=float(os.environ.get("MEMPALACE_CACHE_TTL", "60.0")),
+)
+_embedding_cache = EmbeddingCache(
+    maxsize=int(os.environ.get("MEMPALACE_EMBED_CACHE_SIZE", "512")),
+    ttl_seconds=float(os.environ.get("MEMPALACE_EMBED_CACHE_TTL", "300.0")),
 )
 
 
 def get_query_cache() -> QueryCache:
     return _query_cache
+
+
+def get_embedding_cache() -> EmbeddingCache:
+    return _embedding_cache

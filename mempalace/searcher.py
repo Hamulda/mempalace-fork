@@ -95,15 +95,39 @@ def _add_repo_rel_path(hits: list[dict], source_files: list[str]) -> list[dict]:
     return hits
 
 def _get_reranker():
+    """Load BGE Reranker v2-m3 with MPS (Metal) acceleration on M1.
+
+    MPS = Metal GPU on Apple Silicon, detected automatically.
+    BEIR ~61 vs MiniLM ~57, multilingual (CZ ✅), ~600MB RAM.
+    Memory guard: refuse load below 1500MB free to avoid swap on 8GB M1.
+    """
     global _reranker
     if _reranker is None:
         with _reranker_lock:
             if _reranker is None:
+                # Memory guard: refuse load below 800MB free.
+                # Reranker loads lazily (not at startup) so this is a bonus, not a lockout.
+                # 1500MB was too conservative — would block reranking almost always on 8GB M1.
+                try:
+                    import psutil
+                    free_mb = psutil.virtual_memory().available // 1024 // 1024
+                    if free_mb < 800:
+                        logger.warning(
+                            "Low memory (%dMB free), reranking disabled", free_mb
+                        )
+                        _reranker = False
+                        return None
+                except ImportError:
+                    pass
+
                 try:
                     from sentence_transformers import CrossEncoder
+                    import torch
 
-                    _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-                    logger.info("Cross-encoder reranker loaded")
+                    # MPS = Metal GPU on M1/M2/M3, detected automatically
+                    device = "mps" if torch.backends.mps.is_available() else "cpu"
+                    _reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", device=device)
+                    logger.info("BGE Reranker v2-m3 loaded on %s", device.upper())
                 except ImportError:
                     _reranker = False
                     logger.info("sentence-transformers not installed, reranking disabled")
@@ -111,10 +135,10 @@ def _get_reranker():
 
 
 def warmup_reranker():
-    """Eagerly load the cross-encoder reranker.
+    """Eagerly load the Jina Reranker v3 MLX.
 
     Call this only if reranker_warmup=True in settings (opt-in only).
-    On M1 Air 8GB this costs ~90MB RAM + ~3s on first load.
+    On M1 Air 8GB this costs ~600MB RAM + ~5-10s on first load.
     Safe to call multiple times — no-op if already loaded.
     """
     _get_reranker()
@@ -330,8 +354,9 @@ def search_memories(
             }
         )
 
-    # Rerank: re-order using cross-encoder only for complex semantic queries.
-    # Budget-aware: skip rerank for simple/path/code queries; cap shortlist size.
+    # Rerank: re-order using BGE Reranker v2-m3 for complex semantic queries.
+    # MPS-accelerated on M1, multilingual (CZ ✅), BEIR ~61 vs ~57 for MiniLM.
+    # Memory-guarded: disabled below 1500MB free; shortlist capped at _RERANK_SHORTLIST_MAX.
     if rerank and _should_rerank(query, len(hits)):
         reranker = _get_reranker()
         if reranker is not None:
@@ -560,14 +585,80 @@ async def hybrid_search_async(
     n_results: int = 10, use_kg: bool = True, rerank: bool = False,
     agent_id: str = None, is_latest: bool | None = None,
 ) -> dict:
-    import asyncio, functools
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        _search_executor,
-        functools.partial(hybrid_search, query=query, palace_path=palace_path,
-            wing=wing, room=room, n_results=n_results, use_kg=use_kg,
-            rerank=rerank, agent_id=agent_id, is_latest=is_latest)
+    """Parallel 3-layer hybrid search: vector + FTS5 + KG run concurrently.
+
+    Latency = max(layer times) instead of sum. Uses asyncio.to_thread for
+    CPU-bound layers (vector search, FTS5) and direct call for KG.
+    """
+    import asyncio
+
+    from datetime import date
+    from .config import MempalaceConfig
+
+    def _vector_layer():
+        return search_memories(
+            query=query, palace_path=palace_path, wing=wing, room=room,
+            n_results=n_results, is_latest=is_latest, agent_id=agent_id, rerank=rerank
+        )
+
+    def _fts5_layer():
+        try:
+            cfg = MempalaceConfig()
+            backend = get_backend(cfg.backend)
+            collection_name = cfg.collection_name
+            col = backend.get_collection(palace_path, collection_name, create=False)
+            return _fts5_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
+        except Exception as e:
+            logger.warning("FTS5 layer failed: %s", e)
+            return []
+
+    def _kg_layer():
+        if not use_kg:
+            return []
+        try:
+            kg = _get_kg(palace_path)
+            if kg is None:
+                return []
+            today = date.today().isoformat()
+            tokens = [t.lower() for t in query.split() if len(t) > 3]
+            seen = set()
+            kg_hits = []
+            for token in tokens[:5]:
+                for triple in kg.query_entity(token, as_of=today)[:3]:
+                    key = f"{triple['subject']}_{triple['predicate']}_{triple['object']}"
+                    if key not in seen:
+                        seen.add(key)
+                        kg_hits.append({
+                            "text": f"{triple['subject']} {triple['predicate']} {triple['object']}",
+                            "wing": "knowledge_graph",
+                            "room": triple["predicate"],
+                            "source_file": "knowledge_graph.sqlite3",
+                            "similarity": triple.get("confidence", 0.8),
+                            "source": "kg",
+                        })
+            return kg_hits
+        except Exception as e:
+            logger.warning("KG layer failed in hybrid_search: %s", e)
+            return []
+
+    # Run all 3 layers concurrently — latency = max, not sum
+    vector_results, fts5_hits, kg_hits = await asyncio.gather(
+        asyncio.to_thread(_vector_layer),
+        asyncio.to_thread(_fts5_layer),
+        asyncio.to_thread(_kg_layer),
     )
+
+    hits = vector_results.get("results", [])
+
+    # RRF merge
+    merged = _rrf_merge([hits, fts5_hits, kg_hits])[:n_results]
+
+    return {
+        "query": query,
+        "filters": {"wing": wing, "room": room, "agent_id": agent_id},
+        "results": merged,
+        "sources": {"vector": len(hits), "fts5": len(fts5_hits), "kg": len(kg_hits)},
+    }
 
 
 # =============================================================================
@@ -622,7 +713,8 @@ _PATH_LIKE_RE = _re.compile(
     _re.IGNORECASE,
 )
 
-# Shortlist ceiling for rerank — keep small on M1 Air 8GB under concurrent pressure
+# Shortlist ceiling for rerank — Jina MLX is ~4x faster than MiniLM CPU,
+# safe to rerank more candidates on M1 Air 8GB
 _RERANK_SHORTLIST_MAX = 10
 
 
@@ -845,23 +937,24 @@ def code_search_async(
             n_results=n_results, language=language, symbol_name=symbol_name,
             file_path=file_path, include_prose=include_prose)
     )
-# Auto-routing: detect query type and route to appropriate specialized search
-def auto_search(
+
+
+async def auto_search(
     query: str,
     palace_path: str,
     n_results: int = 10,
 ) -> dict:
     """
-    Automatically detect query type and route to appropriate search path.
+    Automatically detect query type and route to appropriate specialized search.
 
     Detection rules:
-    - path-like query &rarr; FTS5-only path lookup (no vector, no rerank)
-    - code-like query pattern &rarr; code_search() (vector + FTS5)
-    - Otherwise &rarr; hybrid_search() (semantic + FTS5 + KG)
+    - path-like query → FTS5-only path lookup (no vector, no rerank)
+    - code-like query pattern → code_search() (vector + FTS5)
+    - Otherwise → hybrid_search_async() (semantic + FTS5 + KG, parallel)
 
     Rerank is only applied to complex semantic queries via _should_rerank().
 
-    This is the recommended entry point for Claude Code &mdash; it handles routing automatically.
+    This is the recommended entry point for Claude Code — it handles routing automatically.
     """
     complexity = _query_complexity(query)
     if complexity == "path":
@@ -881,11 +974,18 @@ def auto_search(
                 }
         except Exception:
             pass
-        # Fall back to code_search if FTS5 finds nothing
-        return code_search(query, palace_path, n_results=n_results)
+        # Fall back to code_search if FTS5 finds nothing — inject complexity into result
+        result = await code_search_async(query, palace_path, n_results=n_results)
+        result["filters"]["complexity"] = complexity
+        return result
     elif complexity == "code":
-        return code_search(query, palace_path, n_results=n_results)
+        # code_search returns its own filters dict — inject complexity
+        result = await code_search_async(query, palace_path, n_results=n_results)
+        result["filters"]["complexity"] = complexity
+        return result
     else:
-        # simple or complex &mdash; use hybrid_search, rerank decision deferred there
-        return hybrid_search(query, palace_path, n_results=n_results)
+        # simple or complex — parallel async layers
+        result = await hybrid_search_async(query, palace_path, n_results=n_results)
+        result["filters"]["complexity"] = complexity
+        return result
 

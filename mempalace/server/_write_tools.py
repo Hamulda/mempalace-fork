@@ -613,19 +613,17 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                 duplicates_with_ts.sort(key=lambda x: x["_timestamp"], reverse=True)
                 keeper = duplicates_with_ts[0]
                 to_remove = duplicates_with_ts[1:]
-                consolidate_failed = False
-                for dup in to_remove:
+                if to_remove:
                     try:
                         wal_log(
                             "consolidate_delete",
-                            {"deleted_id": dup["id"], "topic": topic, "keeper_id": keeper["id"]},
+                            {"deleted_ids": [d["id"] for d in to_remove], "topic": topic, "keeper_id": keeper["id"]},
                             wal_file=get_wal_path(settings.wal_dir),
                         )
-                        col.delete(ids=[dup["id"]])
-                        merged_count += 1
+                        col.delete(ids=[d["id"] for d in to_remove])
+                        merged_count = len(to_remove)
                     except Exception:
                         consolidate_failed = True
-                        break
                 if consolidate_failed:
                     _rollback_intent(consolidate_intent_id, session_id)
                 else:

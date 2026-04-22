@@ -109,29 +109,31 @@ class TestShouldRerank:
 
 
 class TestAutoSearchRouting:
-    """Integration tests for auto_search() routing decisions."""
+    """Integration tests for auto_search() async routing decisions."""
 
-    def test_auto_search_includes_complexity_filter(self, palace_path, seeded_collection):
+    @pytest.mark.asyncio
+    async def test_auto_search_includes_complexity_filter(self, palace_path, seeded_collection):
         from mempalace.searcher import auto_search
-        result = auto_search("how does the memory guard work under pressure", palace_path, n_results=5)
+        result = await auto_search("how does the memory guard work under pressure", palace_path, n_results=5)
         assert "filters" in result
         assert result["filters"].get("complexity") == "complex"
 
-    def test_auto_search_path_query(self, palace_path, seeded_collection):
+    @pytest.mark.asyncio
+    async def test_auto_search_path_query(self, palace_path, seeded_collection):
         from mempalace.searcher import auto_search
-        # Path query gets complexity="path" in filters
-        result = auto_search("src/utils", palace_path, n_results=5)
+        result = await auto_search("src/utils", palace_path, n_results=5)
         assert result["filters"].get("complexity") == "path"
 
-    def test_auto_search_code_query(self, palace_path, seeded_collection):
+    @pytest.mark.asyncio
+    async def test_auto_search_code_query(self, palace_path, seeded_collection):
         from mempalace.searcher import auto_search
-        result = auto_search("def authenticate", palace_path, n_results=5)
-        # code queries go to code_search
+        result = await auto_search("def authenticate", palace_path, n_results=5)
         assert result["filters"].get("complexity") == "code"
 
-    def test_auto_search_simple_query(self, palace_path, seeded_collection):
+    @pytest.mark.asyncio
+    async def test_auto_search_simple_query(self, palace_path, seeded_collection):
         from mempalace.searcher import auto_search
-        result = auto_search("JWT token", palace_path, n_results=5)
+        result = await auto_search("JWT token", palace_path, n_results=5)
         assert result["filters"].get("complexity") == "simple"
 
 

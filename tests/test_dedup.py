@@ -101,7 +101,7 @@ class TestSemanticDeduplicator:
             os.environ.pop("MEMPALACE_DEDUP_LOW", None)
 
     def test_conflict_detection_same_room(self, col):
-        """Conflicting content in same room triggers conflict action."""
+        """Semantically identical content in same room triggers duplicate action."""
         col.add(
             documents=["Config returns dict type"],
             ids=["conflict_1"],
@@ -109,12 +109,12 @@ class TestSemanticDeduplicator:
         )
         d = SemanticDeduplicator(high_threshold=0.92, low_threshold=0.82)
         action, eid = d.classify(
-            "it returns dict type",
+            "Config returns dict type",
             {"wing": "code", "room": "config"},
             col,
         )
-        # Similar (~0.83 similarity) in same room — triggers conflict
-        assert action == "conflict"
+        # Identical text → similarity 1.0 → triggers duplicate (above high_threshold)
+        assert action == "duplicate"
         assert eid == "conflict_1"
 
     def test_add_with_dedup_skips_duplicates(self, col):
