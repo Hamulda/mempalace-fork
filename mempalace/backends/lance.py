@@ -7,8 +7,12 @@ sessions writing to the same palace without SQLite_BUSY lock conflicts.
 Hybrid search: combines vector similarity + full-text search (FTS)
 via LanceDB's native query engine.
 
-Embedding: ModernBERT-embed-base 4-bit MLX (256 dims Matryoshka, ~85MB RAM).
-M1-optimized: runs on CPU, no MPS/GPU conflicts across sessions.
+Embedding: fastembed BAAI/bge-small-en-v1.5 (256 dims, ~33MB RAM) for the
+in-process fallback, or ModernBERT-embed-base 4-bit MLX (~85MB RAM) when the
+embedding daemon is running on Apple Silicon.
+
+M1-optimized: daemon uses MLX Metal GPU; fallback uses CPU.
+No MPS/GPU conflicts across sessions when using the daemon.
 """
 
 from __future__ import annotations

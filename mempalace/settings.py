@@ -40,7 +40,9 @@ class MemPalaceSettings(BaseSettings):
     """
 
     # Transport
-    transport: Literal["stdio", "http"] = "stdio"
+    # Transport — HTTP (streamable-http) is canonical for multi-session.
+    # Stdio is single-session/dev fallback, not recommended for Claude Code.
+    transport: Literal["stdio", "http"] = "http"
     host: str = "127.0.0.1"
     port: int = 8765
 

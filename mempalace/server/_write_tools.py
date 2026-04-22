@@ -413,9 +413,14 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     entries = entries[:last_n]
                 except (ImportError, AttributeError):
                     # FALLBACK: LanceDB version doesn't support sort() on .search()
-                    # Fall back to original load-all-sort-slice (less efficient)
+                    # Use heapq.nlargest to keep only the newest last_n entries in memory
+                    # instead of loading all entries then sorting everything.
+                    import heapq
                     _BATCH = 500
                     offset = 0
+                    # Maintain a bounded heap of the newest last_n entries seen.
+                    # heapq.nlargest gives us O(M log N) instead of O(M log M) full sort.
+                    top_entries: list[tuple[str, dict]] = []  # (timestamp, entry_dict)
                     while True:
                         batch = col.get(
                             where={"$and": [{"wing": wing}, {"room": "diary"}]},
@@ -427,15 +432,21 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                         if not docs:
                             break
                         for doc, meta in zip(docs, metas):
-                            entries.append({
-                                "date": meta.get("date", ""), "timestamp": meta.get("timestamp", ""),
+                            ts = meta.get("timestamp", "")
+                            entry = {
+                                "date": meta.get("date", ""), "timestamp": ts,
                                 "topic": meta.get("topic", ""), "content": doc,
-                            })
+                            }
+                            if ts:
+                                if len(top_entries) < last_n:
+                                    heapq.heappush(top_entries, (ts, entry))
+                                elif ts > top_entries[0][0]:
+                                    heapq.heapreplace(top_entries, (ts, entry))
                         if len(docs) < _BATCH:
                             break
                         offset += len(docs)
-                    entries.sort(key=lambda x: x["timestamp"], reverse=True)
-                    entries = entries[:last_n]
+                    # heap is min-heap by timestamp; nlargest gives newest-first order
+                    entries = [entry for _, entry in heapq.nlargest(last_n, top_entries)]
             except Exception:
                 pass
             if not entries:

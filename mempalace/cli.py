@@ -571,7 +571,9 @@ def _run_embed_benchmark():
 def cmd_serve(args):
     """Run MemPalace MCP server over HTTP — canonical streamable-http transport.
 
-    Single-session / dev mode: omit --serve or use stdio.
+    Stdio mode (single-session / dev only):
+        mcp = create_server(shared_server_mode=False)
+        mcp.run()   # stdio transport — NO session coordinators in this mode
     Multi-session (Claude Code coordination): use --serve, which activates
     SessionRegistry, WriteCoordinator, ClaimsManager, HandoffManager, and
     DecisionTracker on a shared streamable-http server.
@@ -810,20 +812,8 @@ Claude Code HTTP config (~/.claude/config.json):
 }}
 """)
         else:
-            print("""
-For stdio transport, add to ~/.claude/config.json:
-
-{{
-  "mcpServers": {{
-    "mempalace": {{
-      "command": "python",
-      "args": ["-m", "mempalace.fastmcp_server"]
-    }}
-  }}
-}}
-""")
-    else:
-        print("\nlaunchd is macOS-only. On Linux, use systemd.")
+            print("\nSkipping HTTP MCP server install.")
+    print("\nlaunchd is macOS-only. On Linux, use systemd.")
 
     print("\nSetup complete! Restart terminal or run:")
     print("  launchctl start ai.mempalace.embed-daemon")

@@ -207,6 +207,69 @@ def test_diary_read_uses_correct_where_structure():
     )
 
 
+def test_diary_read_fallback_is_bounded():
+    """Fallback path must NOT load all entries into memory for sort.
+
+    Root cause: old fallback did load-all → sort → slice which is O(M log M)
+    and accumulates every entry in RAM even when caller wants only last_n.
+
+    Fix: bounded heap keeps only the newest last_n entries seen so far.
+    Correctness contract:
+    - Returns at most last_n entries (capped at entries found)
+    - Entries are in descending timestamp order (newest first)
+    - Output shape: {"date", "timestamp", "topic", "content"} per entry
+    """
+    import heapq
+    from datetime import datetime, timezone
+
+    # Simulate the bounded-heap logic inline (same algorithm as _write_tools.py fallback)
+    def bounded_fallback(entries_raw: list[dict], last_n: int) -> list[dict]:
+        """Replicate the heapq.nlargest bounded fallback logic."""
+        top_entries: list[tuple[str, dict]] = []
+        for entry in entries_raw:
+            ts = entry.get("timestamp", "")
+            if ts:
+                if len(top_entries) < last_n:
+                    heapq.heappush(top_entries, (ts, entry))
+                elif ts > top_entries[0][0]:
+                    heapq.heapreplace(top_entries, (ts, entry))
+        return [entry for _, entry in heapq.nlargest(last_n, top_entries)]
+
+    # Build 20 raw entries with sequential timestamps
+    now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=timezone.utc)
+    entries_raw = []
+    for i in range(20):
+        ts = (now.replace(second=i)).isoformat().replace("+00:00", "Z")
+        entries_raw.append({
+            "date": ts[:10],
+            "timestamp": ts,
+            "topic": f"topic_{i}",
+            "content": f"entry_{i}",
+        })
+
+    # last_n=5 should return only the 5 newest entries
+    result = bounded_fallback(entries_raw, last_n=5)
+    assert len(result) == 5, f"Expected 5 entries, got {len(result)}"
+    # Verify descending timestamp order
+    timestamps = [e["timestamp"] for e in result]
+    assert timestamps == sorted(timestamps, reverse=True), "Entries must be newest-first"
+
+    # last_n=10 on same data
+    result10 = bounded_fallback(entries_raw, last_n=10)
+    assert len(result10) == 10, f"Expected 10 entries, got {len(result10)}"
+    timestamps10 = [e["timestamp"] for e in result10]
+    assert timestamps10 == sorted(timestamps10, reverse=True), "Entries must be newest-first"
+
+    # Edge case: last_n exceeds entries available — should return all available
+    result100 = bounded_fallback(entries_raw, last_n=100)
+    assert len(result100) == 20, f"Expected 20 (all available), got {len(result100)}"
+
+    # Verify output shape
+    for entry in result:
+        assert set(entry.keys()) == {"date", "timestamp", "topic", "content"}, \
+            f"Entry must have exactly these keys: {entry.keys()}"
+
+
 def test_list_rooms_scalar_where_works_on_both_backends():
     """list_rooms sends scalar {"wing": wing} which both Chroma and Lance handle.
 

@@ -12,8 +12,8 @@ Canonical multi-session HTTP path (6× Claude Code parallel sessions):
     mcp = create_server(shared_server_mode=True)
     mcp.run(transport="streamable-http", host="127.0.0.1", port=8765)
 
-Stdio path (single-session / dev):
-    mcp = create_server()
+Stdio fallback (single-session / dev only — NO session coordinators):
+    mcp = create_server(shared_server_mode=False)
     mcp.run()   # stdio transport
 
 DEPRECATED serve_http():

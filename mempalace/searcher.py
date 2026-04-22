@@ -95,11 +95,11 @@ def _add_repo_rel_path(hits: list[dict], source_files: list[str]) -> list[dict]:
     return hits
 
 def _get_reranker():
-    """Load BGE Reranker v2-m3 with MPS (Metal) acceleration on M1.
+    """Load BGE Reranker v2-m3 cross-encoder with MPS (Metal) acceleration on M1.
 
     MPS = Metal GPU on Apple Silicon, detected automatically.
     BEIR ~61 vs MiniLM ~57, multilingual (CZ ✅), ~600MB RAM.
-    Memory guard: refuse load below 1500MB free to avoid swap on 8GB M1.
+    Memory guard: refuse load below 800MB free to avoid swap on 8GB M1.
     """
     global _reranker
     if _reranker is None:
@@ -135,10 +135,10 @@ def _get_reranker():
 
 
 def warmup_reranker():
-    """Eagerly load the Jina Reranker v3 MLX.
+    """Eagerly load the BGE Reranker v2-m3 cross-encoder.
 
     Call this only if reranker_warmup=True in settings (opt-in only).
-    On M1 Air 8GB this costs ~600MB RAM + ~5-10s on first load.
+    On M1 Air 8GB this costs ~90MB RAM + ~3s on first load (torch + MPS).
     Safe to call multiple times — no-op if already loaded.
     """
     _get_reranker()
@@ -355,8 +355,8 @@ def search_memories(
         )
 
     # Rerank: re-order using BGE Reranker v2-m3 for complex semantic queries.
-    # MPS-accelerated on M1, multilingual (CZ ✅), BEIR ~61 vs ~57 for MiniLM.
-    # Memory-guarded: disabled below 1500MB free; shortlist capped at _RERANK_SHORTLIST_MAX.
+    # CrossEncoder on MPS (Metal) or CPU, multilingual (CZ ✅), BEIR ~61 vs ~57 for MiniLM.
+    # Memory-guarded: disabled below 800MB free; shortlist capped at _RERANK_SHORTLIST_MAX.
     if rerank and _should_rerank(query, len(hits)):
         reranker = _get_reranker()
         if reranker is not None:
@@ -713,9 +713,9 @@ _PATH_LIKE_RE = _re.compile(
     _re.IGNORECASE,
 )
 
-# Shortlist ceiling for rerank — Jina MLX is ~4x faster than MiniLM CPU,
+# Shortlist ceiling for rerank — BGE reranker-v2-m3 is fast on MPS,
 # safe to rerank more candidates on M1 Air 8GB
-_RERANK_SHORTLIST_MAX = 10
+_RERANK_SHORTLIST_MAX = 20
 
 
 def _query_complexity(query: str) -> str:
