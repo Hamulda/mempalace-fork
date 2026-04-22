@@ -177,6 +177,15 @@ def register_session_tools(server, backend, config, settings):
         ttl_seconds: int = 600,
         note: str | None = None,
     ) -> dict:
+        """
+        [Tier 2 — Escape Hatch] Claim a file path with TTL for exclusive editing.
+
+        Use this ONLY when:
+          - You need to refresh TTL on a claim you already hold (no conflict check needed)
+          - A workflow tool returned an error and you need fine-grained control
+
+        For normal editing: use mempalace_begin_work instead.
+        """
         mgr = _get_claims_manager()
         if mgr is None:
             return {"error": "session coordination not available"}
@@ -220,7 +229,7 @@ def register_session_tools(server, backend, config, settings):
         session_id: str | None = None,
     ) -> dict:
         """
-        Get a compact coordination snapshot for a single file.
+        [Tier 1 — Primary Workflow] Get a compact coordination snapshot for a single file.
 
         Returns:
           - claim: current claim holder, expires_at, or null

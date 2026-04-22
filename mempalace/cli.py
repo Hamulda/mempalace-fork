@@ -430,9 +430,12 @@ def cmd_repair(args):
         filed += len(batch_ids)
         print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
 
-    # Force FTS rebuild after repair
+    # Force keyword index rebuild after repair
+    # KeywordIndex (SQLite FTS5) is the canonical lexical engine.
     try:
-        new_col.rebuild_fts_index()
+        from .diagnostics import rebuild_keyword_index
+        result = rebuild_keyword_index(palace_path, batch_size=2000)
+        print(f"  KeywordIndex rebuilt: {result['documents_indexed']} documents, {result['batches']} batches")
     except Exception:
         pass
 

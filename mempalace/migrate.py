@@ -122,14 +122,17 @@ def migrate_chroma_to_lance(
             print(f"  Error migrating batch at offset {i}: {e}")
             raise
 
-    # ── Force FTS rebuild after migration ──────────────────────────────────
+    # ── Rebuild keyword index after migration ─────────────────────────────────
+    # KeywordIndex (SQLite FTS5) is the canonical lexical engine. LanceDB FTS
+    # is not queried by any search path and has been removed.
     try:
-        lance_col.rebuild_fts_index()
+        from .diagnostics import rebuild_keyword_index
+        result = rebuild_keyword_index(palace_path, batch_size=2000)
         if verbose:
-            print("  FTS index rebuilt after migration")
+            print(f"  KeywordIndex rebuilt: {result['documents_indexed']} documents, {result['batches']} batches")
     except Exception as e:
         if verbose:
-            print(f"  FTS rebuild warning (non-critical): {e}")
+            print(f"  KeywordIndex rebuild warning (non-critical): {e}")
 
     # ── Backup ChromaDB data ───────────────────────────────────────────────
     chroma_sqlite = Path(palace_path) / "chroma.sqlite3"

@@ -1398,7 +1398,7 @@ def register_workflow_tools(server, backend, config, settings):
         note: str | None = None,
     ) -> dict:
         """
-        Begin a working session on a file or path.
+        [Tier 1 — Primary Workflow] Begin a working session on a file or path.
 
         Combines in one call:
           1. conflict_check — is the path already claimed?
@@ -1416,7 +1416,6 @@ def register_workflow_tools(server, backend, config, settings):
         On claim_conflict failure_mode:
           - Wait for TTL expiry (check expires_at)
           - Or push a handoff to the owner requesting release
-          - Or use claim_mode='advisory' to proceed with a warning
 
         TTL guidance:
           Quick fix (< 5 min)  : 300s
@@ -1452,7 +1451,7 @@ def register_workflow_tools(server, backend, config, settings):
         preview_mode: str = "slice",
     ) -> dict:
         """
-        Prepare to edit a file — get symbol context, recent changes, AND verify no concurrent edit.
+        [Tier 1 — Primary Workflow] Prepare to edit — get symbol context + verify no concurrent edit.
 
         Combines in one call:
           1. conflict_check  — is another session actively editing? (blocks if yes)
@@ -1503,7 +1502,7 @@ def register_workflow_tools(server, backend, config, settings):
         decision_confidence: int = 3,
     ) -> dict:
         """
-        Finish a working session — release claim, optionally log diary and capture decision.
+        [Tier 1 — Primary Workflow] Finish a working session — release claim + optional diary + optional decision.
 
         Combines in one call:
           1. release_claim  — give up the path claim
@@ -1519,7 +1518,7 @@ def register_workflow_tools(server, backend, config, settings):
           - operations: list of operations performed
           - errors: any errors encountered
 
-        Unlike before, diary_entry is written immediately — no separate mempalace_diary_write call needed.
+        diary_entry is written immediately — no separate mempalace_diary_write call needed.
         """
         claims_mgr = _get_claims_manager()
         if claims_mgr is None:
@@ -1565,7 +1564,7 @@ def register_workflow_tools(server, backend, config, settings):
         from_session_id: str | None = None,
     ) -> dict:
         """
-        Publish a handoff and release all claims on touched paths.
+        [Tier 1 — Primary Workflow] Publish a handoff and release all claims on touched paths.
 
         Combines in one call:
           1. push_handoff  — create the handoff record
@@ -1625,7 +1624,7 @@ def register_workflow_tools(server, backend, config, settings):
         ttl_seconds: int = 600,
     ) -> dict:
         """
-        Take over work from a handoff — accept it and claim the relevant paths.
+        [Tier 1 — Primary Workflow] Take over work from a handoff — accept it and claim the relevant paths.
 
         Combines in one call:
           1. accept_handoff — mark ownership
@@ -1695,7 +1694,7 @@ def register_workflow_tools(server, backend, config, settings):
         note: str | None = None,
     ) -> dict:
         """
-        Begin a working session on multiple files atomically — all-or-nothing.
+        [Tier 1 — Primary Workflow] Begin a working session on multiple files atomically — all-or-nothing.
 
         Use for multi-file refactors where all files must be claimed together.
         If any path is blocked by another session, the ENTIRE batch fails

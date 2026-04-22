@@ -90,14 +90,14 @@ Every workflow tool result contains `workflow_state`:
 
 **`current_phase` values:**
 - `orienting` — `file_status` result, orienting before claiming
-- `claim_acquired` — `begin_work` succeeded, claim is held
-- `context_ready` — `prepare_edit` succeeded, safe to edit
+- `claim_acquired` — `begin_work` succeeded, claim is held → call `prepare_edit` next
+- `context_ready` — `prepare_edit` succeeded → call `MODEL_ACTION:edit` (make the edit, no tool needed)
 - `blocked` — conflict or error, model cannot proceed
 - `finished` — `finish_work` succeeded
 - `published` — `publish_handoff` succeeded
 - `takeover` — `takeover_work` succeeded
 
-**`next_tool`** is always set on success — it's the single best next action. After `prepare_edit`, `next_tool: "MODEL_ACTION:edit"` signals the model should make the edit (no tool call needed).
+**`next_tool`** is the single best next action. After `prepare_edit` succeeds with `current_phase: "context_ready"`, the model should make the edit directly — `next_tool: "MODEL_ACTION:edit"` signals no more tool calls are needed before editing.
 
 **`conflict_status` values:**
 - `none` — no conflicts

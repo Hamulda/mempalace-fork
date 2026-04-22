@@ -569,19 +569,13 @@ def _get_drawer_schema() -> pa.Schema:
 # ── Table creation ─────────────────────────────────────────────────────────────
 
 def _create_lance_table(db, collection_name: str) -> "lancedb.table.Table":
-    """Create a new LanceDB table with schema, vector index, and FTS index."""
+    """Create a new LanceDB table with schema and vector index."""
     schema = _get_drawer_schema()
     table = db.create_table(collection_name, schema=schema)
 
     # Vector index for fast similarity search
     try:
         table.create_index("vector")
-    except Exception:
-        pass
-
-    # FTS index for full-text search
-    try:
-        table.create_fts_index("document", replace=False)
     except Exception:
         pass
 
@@ -851,8 +845,6 @@ class LanceCollection(BaseCollection):
         collection_name: str = "mempalace_drawers",
     ):
         self._table = table
-        self._writes_since_reindex: int = 0
-        self._reindex_threshold: int = 50
         self._palace_path = palace_path or ""
         self._collection_name = collection_name
         self._optimizer: Optional[LanceOptimizer] = None
@@ -883,27 +875,6 @@ class LanceCollection(BaseCollection):
                     time.sleep(wait)
                     continue
                 raise
-
-    def _maybe_rebuild_fts(self) -> None:
-        """Throttled FTS index rebuild — runs every _reindex_threshold writes.
-
-        NOTE: LanceDB FTS auto-indexes new data on add(). This rebuild is only needed
-        as a safety measure after direct DB writes or migration scenarios where data
-        was inserted bypassing the normal write path. For normal add()/upsert() calls,
-        this is effectively a no-op from the searchability standpoint.
-        """
-        self._writes_since_reindex += 1
-        if self._writes_since_reindex >= self._reindex_threshold:
-            try:
-                self._table.create_fts_index("document", replace=True)
-            except Exception:
-                pass
-            self._writes_since_reindex = 0
-
-    def rebuild_fts_index(self) -> None:
-        """Force immediate FTS index rebuild. Call after bulk migration."""
-        self._table.create_fts_index("document", replace=True)
-        self._writes_since_reindex = 0
 
     def run_optimize(self) -> None:
         """Run synchronous LanceDB optimize. For CLI use."""

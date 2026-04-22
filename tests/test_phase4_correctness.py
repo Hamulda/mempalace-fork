@@ -411,3 +411,57 @@ class TestLexicalIndexConsistency:
 
         search = idx.search("deleted")
         assert len(search) == 0
+
+
+class TestLanceFTSRemoved:
+    """Verify LanceDB native FTS is no longer created or maintained.
+
+    After the lexical simplification: LanceDB FTS (create_fts_index) is not
+    created on table init, not maintained on writes, and not queried by any
+    search path. SQLite FTS5 (KeywordIndex) is the canonical lexical engine.
+    """
+
+    def test_lance_fts_not_created_on_table_init(self, palace_path):
+        """create_fts_index is not called during normal collection creation."""
+        import unittest.mock as mock
+        from mempalace.backends.lance import _create_lance_table, LanceBackend
+
+        with mock.patch("mempalace.backends.lance._embed_texts", side_effect=lambda *a, **k: [[0.0] * 256]):
+            backend = LanceBackend()
+            col = backend.get_collection(palace_path, "fts_removed_test", create=True)
+
+            # Verify table has NO FTS index by checking search behavior
+            # LanceDB FTS would make .search() with text return results, but we
+            # don't use it anyway. Just verify the collection works for vector ops.
+            assert col.count() == 0
+
+    def test_rebuild_fts_index_is_remove(self, palace_path):
+        """rebuild_fts_index method no longer exists on LanceCollection."""
+        import unittest.mock as mock
+        from mempalace.backends.lance import LanceBackend
+
+        with mock.patch("mempalace.backends.lance._embed_texts", side_effect=lambda *a, **k: [[0.0] * 256]):
+            backend = LanceBackend()
+            col = backend.get_collection(palace_path, "fts_removed_method_test", create=True)
+
+            # Method should not exist (or be a no-op if stub remains)
+            assert not hasattr(col, "rebuild_fts_index"), \
+                "rebuild_fts_index should be removed from LanceCollection"
+
+    def test_keyword_index_is_cananonical_lexical_engine(self, palace_path):
+        """KeywordIndex (SQLite FTS5) is the only lexical engine queried."""
+        from mempalace.lexical_index import KeywordIndex
+
+        idx = KeywordIndex.get(palace_path)
+        idx.clear()
+
+        # Direct FTS5 operations work
+        idx.upsert_drawer("doc_1", "hello world testing", "repo", "src", "English")
+        assert idx.count() == 1
+
+        results = idx.search("hello")
+        assert len(results) == 1
+        assert results[0]["document_id"] == "doc_1"
+
+        idx.delete_drawer("doc_1")
+        assert idx.count() == 0

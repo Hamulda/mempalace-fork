@@ -1,9 +1,3 @@
----
-name: mempalace
-description: MemPalace persistent memory — mine, search, and recall context across sessions.
-allowed-tools: Read
----
-
 # MemPalace
 
 Searchable memory palace for AI sessions. Mine projects, store decisions, recall context.
@@ -20,21 +14,59 @@ Searchable memory palace for AI sessions. Mine projects, store decisions, recall
 - Key architectural decision just made
 - Session exceeds 20 exchanges with code or design content
 
-## Tool reference
+## Tool Tiers
 
-| Tool | When to use | Key params |
-|------|-------------|------------|
-| `mempalace_search` | Semantic search across all memories | `query`, `limit=5`, `wing`, `room` |
-| `mempalace_add_drawer` | Store a single memory manually | `content`, `wing`, `room` |
-| `mempalace_check_duplicate` | Check if content already exists before storing | `content`, `threshold=0.9` |
-| `mempalace_status` | Palace overview: counts, wings, size | — |
-| `mempalace_list_wings` | List all wings | — |
-| `mempalace_list_rooms` | List rooms, optionally filtered by wing | `wing=None` |
-| `mempalace_kg_query` | Query knowledge graph entities | `query` |
-| `mempalace_kg_stats` | Knowledge graph statistics | — |
-| `mempalace_diary_write` | Write to agent diary | `content`, `agent_name` |
-| `mempalace_diary_read` | Read agent diary | `agent_name`, `last_n=10` |
-| `mempalace_export_claude_md` | Export palace as Claude.md | `project_path`, `output_dir` |
+### Tier 1 — Primary Workflow (use these almost always)
+
+| Tool | Phase | Purpose |
+|------|-------|---------|
+| `mempalace_file_status` | orient | Quick snapshot before claiming |
+| `mempalace_begin_work` | claim | Start editing session (conflict check + claim + log intent) |
+| `mempalace_prepare_edit` | edit | Get symbol context + hot-spot + auto conflict check |
+| `mempalace_finish_work` | finish | Release claim + diary write + decision capture (single-file) |
+| `mempalace_publish_handoff` | handoff | Atomic handoff + release all claims (multi-file) |
+| `mempalace_takeover_work` | takeover | Accept handoff + claim paths |
+
+### Tier 2 — Escape Hatch (only when Tier 1 won't do)
+
+| Tool | When to use |
+|------|-------------|
+| `mempalace_claim_path` | Refresh TTL on existing claim you already hold |
+| `mempalace_release_claim` | Manual release without diary/decision |
+| `mempalace_conflict_check` | Explicit check when workflow tools insufficient |
+| `mempalace_push_handoff` | Handoff without atomic claim release |
+| `mempalace_pull_handoffs` | List handoffs without accepting |
+| `mempalace_accept_handoff` | Accept without auto-claiming paths |
+| `mempalace_edit_guidance` | Convert any workflow_result → plain guidance |
+
+### Tier 3 — Search & Knowledge (use as needed)
+
+| Tool | When to use |
+|------|-------------|
+| `mempalace_search` | Semantic search across all memories |
+| `mempalace_hybrid_search` | Semantic + keyword + KG combined |
+| `mempalace_code_search` | Code-specialized search with language/symbol filters |
+| `mempalace_kg_query` | Query knowledge graph entities |
+| `mempalace_diary_read` | Read agent diary |
+| `mempalace_status` | Palace overview: counts, wings, size |
+
+## Workflow State
+
+Every workflow tool result contains `workflow_state`:
+
+```json
+{
+  "workflow_state": {
+    "current_phase": "claim_acquired",
+    "next_phase": "prepare",
+    "next_tool": "mempalace_prepare_edit",
+    "conflict_status": "none",
+    "handoff_pending": false
+  }
+}
+```
+
+**`next_tool`** is the single best next action. After `prepare_edit`, it becomes `"MODEL_ACTION:edit"` — the model makes the edit without any tool call.
 
 ## Organization patterns
 
@@ -49,7 +81,6 @@ Searchable memory palace for AI sessions. Mine projects, store decisions, recall
 ## Server not running?
 
 If MemPalace MCP tools return an error, start the server:
-<!-- Bash permitted only for server startup -->
 ```bash
 python3 -m mempalace.fastmcp_server
 ```
@@ -61,4 +92,4 @@ curl http://127.0.0.1:8765/health
 # → {"status": "ok", "service": "mempalace"}
 ```
 
-**Using the Claude Code plugin?** The plugin handles MCP registration persistently. After running `claude plugin install --scope user mempalace` and restarting Claude Code, tools appear automatically — no manual `claude mcp add` needed.
+**Using the Claude Code plugin?** The plugin handles MCP registration persistently. After running `claude plugin install --scope user mempalace` and restarting Claude Code, tools appear automatically.

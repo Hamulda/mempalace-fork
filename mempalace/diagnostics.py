@@ -7,11 +7,16 @@ Provides:
 - validate_keyword_index(): check FTS5 count vs LanceDB count for drift
 - validate_runtime_state(): query cache size, daemon status, memory pressure
 - rebuild_symbol_index(): clear + rebuild symbol index from source files
-- rebuild_keyword_index(): clear + rebuild FTS5 index from LanceDB content
+- rebuild_keyword_index(): clear + rebuild SQLite FTS5 from LanceDB content
 - validate_skills_registration(): verify all expected skill files exist
 
 All validate_* functions are diagnostics-only (no writes).
 All rebuild_* functions backup before destructive action.
+
+Canonical lexical engine: SQLite FTS5 (KeywordIndex). LanceDB's native FTS
+capability is not queried by any search path and is not maintained. The
+KeywordIndex FTS5 is populated exclusively via rebuild_keyword_index() —
+normal writes do not update it (stale entries are expected until rebuild).
 """
 
 from __future__ import annotations
