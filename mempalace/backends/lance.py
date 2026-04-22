@@ -1047,6 +1047,9 @@ class LanceCollection(BaseCollection):
         from ..query_cache import get_query_cache
         get_query_cache().invalidate_collection(self._palace_path, self._collection_name)
 
+        # ── FTS5 incremental sync (add) ───────────────────────────────────
+        self._sync_fts5upsert(final_ids, final_docs, final_metas)
+
     def upsert(
         self,
         *,
@@ -1493,7 +1496,10 @@ class LanceCollection(BaseCollection):
                 return
 
         # ── FTS5 incremental sync (delete) ────────────────────────────────
-        self._sync_fts5delete(ids or [])
+        # deleted_ids: explicit ids list when provided, otherwise the matching_ids
+        # collected from the where-filter scan (empty list when where filtered to zero).
+        deleted_ids = ids if ids else (matching_ids if where else [])
+        self._sync_fts5delete(deleted_ids)
 
     def _sync_fts5delete(self, ids: list[str]) -> None:
         """Remove deleted document IDs from the FTS5 keyword index.

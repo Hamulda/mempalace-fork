@@ -5,6 +5,7 @@ test_diagnostics.py — Smoke tests for mempalace.diagnostics module.
 import os
 import tempfile
 import shutil
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -100,6 +101,25 @@ class TestValidateRuntimeState:
         """Returns whether palace directory exists."""
         result = validate_runtime_state(palace_path)
         assert isinstance(result["palace_initialized"], bool)
+
+    def test_returns_cache_size_across_all_shards(self, palace_path):
+        """query_cache_size reflects total entries across all 8 shards."""
+        from mempalace.query_cache import QueryCache
+
+        fake_cache = QueryCache(maxsize=256, ttl_seconds=60.0)
+        for i in range(fake_cache._NUM_SHARDS):
+            fake_cache._shards[i]["cache"]["key_in_shard_%d" % i] = ("value", time.monotonic())
+
+        import mempalace.query_cache as qc_module
+        original_cache = qc_module._query_cache
+        qc_module._query_cache = fake_cache
+
+        try:
+            from mempalace.diagnostics import validate_runtime_state
+            result = validate_runtime_state(palace_path)
+            assert result["query_cache_size"] == fake_cache._NUM_SHARDS
+        finally:
+            qc_module._query_cache = original_cache
 
 
 class TestValidateSkillsRegistration:

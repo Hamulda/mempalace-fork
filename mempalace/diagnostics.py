@@ -15,8 +15,8 @@ All rebuild_* functions backup before destructive action.
 
 Canonical lexical engine: SQLite FTS5 (KeywordIndex). LanceDB's native FTS
 capability is not queried by any search path and is not maintained. The
-KeywordIndex FTS5 is populated exclusively via rebuild_keyword_index() —
-normal writes do not update it (stale entries are expected until rebuild).
+KeywordIndex is updated incrementally by every add/upsert/delete write to
+LanceCollection — lexical freshness is maintained without rebuild.
 """
 
 from __future__ import annotations
@@ -215,7 +215,8 @@ def validate_runtime_state(palace_path: str) -> dict:
     try:
         from .query_cache import get_query_cache
         cache = get_query_cache()
-        result["query_cache_size"] = len(cache._cache)
+        # QueryCache is 8-sharded; use the public total size method
+        result["query_cache_size"] = cache._total_size()
     except Exception:
         pass
 

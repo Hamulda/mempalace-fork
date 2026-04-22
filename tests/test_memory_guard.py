@@ -99,8 +99,41 @@ class TestMemoryPressure:
             assert pressure == MemoryPressure.CRITICAL
             assert ratio == 0.90
 
-    def test_psutil_fallback(self):
-        """Pokud memory_pressure CLI selže, použije se psutil fallback."""
+    def test_psutil_fallback_nominal(self):
+        """psutil fallback: <70% → NOMINAL."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError()
+            with mock.patch("psutil.virtual_memory") as mock_vm:
+                mock_vm.return_value = mock.Mock(percent=65.0)
+                pressure, ratio = _get_memory_pressure_macos()
+
+                assert pressure == MemoryPressure.NOMINAL
+                assert ratio == 0.65
+
+    def test_psutil_fallback_warn(self):
+        """psutil fallback: 70-90% → WARN (canonical policy, not 80-90%)."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError()
+            with mock.patch("psutil.virtual_memory") as mock_vm:
+                mock_vm.return_value = mock.Mock(percent=75.0)
+                pressure, ratio = _get_memory_pressure_macos()
+
+                assert pressure == MemoryPressure.WARN
+                assert ratio == 0.75
+
+    def test_psutil_fallback_critical(self):
+        """psutil fallback: >90% → CRITICAL."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError()
+            with mock.patch("psutil.virtual_memory") as mock_vm:
+                mock_vm.return_value = mock.Mock(percent=92.0)
+                pressure, ratio = _get_memory_pressure_macos()
+
+                assert pressure == MemoryPressure.CRITICAL
+                assert ratio == 0.92
+
+    def test_psutil_fallback_boundary_85(self):
+        """psutil fallback: 85% → WARN (within canonical 70-90% band, not 80%)."""
         with mock.patch("subprocess.run") as mock_run:
             mock_run.side_effect = FileNotFoundError()
             with mock.patch("psutil.virtual_memory") as mock_vm:

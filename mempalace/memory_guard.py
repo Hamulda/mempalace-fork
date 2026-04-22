@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 class MemoryPressure(Enum):
     NOMINAL = "nominal"   # <70% RAM – vše normálně
-    WARN    = "warn"      # 70-85% – ztlum batch mining
-    CRITICAL = "critical" # >85% – pausuj zápisy, jen čtení
+    WARN    = "warn"      # 70–90% – ztlum batch mining (psutil fallback: >70%)
+    CRITICAL = "critical" # >90% – pausuj zápisy, jen čtení
 
 
 def _get_memory_pressure_macos() -> tuple[MemoryPressure, float]:
@@ -46,14 +46,17 @@ def _get_memory_pressure_macos() -> tuple[MemoryPressure, float]:
     except Exception:
         pass
 
-    # Fallback: psutil
+    # Fallback: psutil (used when memory_pressure CLI is unavailable)
+    # Canonical policy: NOMINAL <70%, WARN 70-85%, CRITICAL >85%.
+    # psutil.percent is in [0,100]. Buffer below CRITICAL threshold to
+    # 90% (psutil) / 85% (canonical) to account for measurement noise.
     try:
         import psutil
         vm = psutil.virtual_memory()
         ratio = vm.percent / 100.0
         if ratio > 0.90:
             return MemoryPressure.CRITICAL, ratio
-        elif ratio > 0.80:
+        elif ratio > 0.70:
             return MemoryPressure.WARN, ratio
         else:
             return MemoryPressure.NOMINAL, ratio
