@@ -361,34 +361,42 @@ class SemanticDeduplicator:
         # JEDEN batch embedding call pro všechny dokumenty
         batch_vectors = _embed_texts(documents)
 
-        results = []
-        for doc, meta, vec in zip(documents, metadatas, batch_vectors):
-            # Hledej podobné vzpomínky přes přímé vector search
+        # BATCH vector search — single query místo N separátních query
+        # LanceDB neumí batch vector search přímo, ale mužeme použít
+        # ThreadPoolExecutor pro paralelní query (I/O bound, ne CPU bound)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        n_workers = min(len(documents), 8)  # max 8 paralelních query
+
+        results: list[tuple[str, Optional[str]]] = [("unique", None)] * len(documents)
+
+        def _classify_one(args: tuple[int, list[float]]) -> tuple[int, tuple[str, Optional[str]]]:
+            i, vec = args
+            doc, meta = documents[i], metadatas[i]
             similar = collection.query_by_vector(
                 vector=vec,
                 n_results=n_candidates,
             )
-
             if not similar["ids"] or not similar["ids"][0]:
-                results.append(("unique", None))
-                continue
-
+                return i, ("unique", None)
             best_dist = similar["distances"][0][0]
             best_id = similar["ids"][0][0]
             best_meta = (similar["metadatas"][0][0] or {}) if similar["metadatas"] else {}
-
             best_similarity = max(0.0, 1.0 - best_dist)
-
             if best_similarity >= self.high_threshold:
-                results.append(("duplicate", best_id))
-            elif best_similarity >= self.low_threshold:
+                return i, ("duplicate", best_id)
+            if best_similarity >= self.low_threshold:
                 if (meta.get("room") == best_meta.get("room") or
                         meta.get("wing") == best_meta.get("wing")):
-                    results.append(("conflict", best_id))
-                else:
-                    results.append(("unique", None))
-            else:
-                results.append(("unique", None))
+                    return i, ("conflict", best_id)
+                return i, ("unique", None)
+            return i, ("unique", None)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_classify_one, (i, vec)): i for i, vec in enumerate(batch_vectors)}
+            for future in as_completed(futures):
+                i, classification = future.result()
+                results[i] = classification
 
         return results, batch_vectors
 
@@ -1416,36 +1424,61 @@ class LanceCollection(BaseCollection):
 
             self._write_with_retry(do_delete)
         elif where:
+            # OPTIMIZATION: Prefer LanceDB native delete(where=...) when possible.
+            # LanceDB 0.4+ supports SQL predicate pushdown natively on string columns.
+            # Fall back to vector-search scan when native delete is unavailable or fails.
+            try:
+                native_sql = _where_to_sql(where)
+                if native_sql:
+                    # CORRECTNESS FIX: Query affected IDs BEFORE delete so FTS5 sync
+                    # gets the real tombstone list. Without this, native delete removes
+                    # LanceDB rows but FTS5 index stays stale (empty ids list).
+                    affected_ids: list[str] = []
+                    page_start = 0
+                    while True:
+                        page = (
+                            self._table.search()
+                            .where(native_sql, prefilter=True)
+                            .limit(500)
+                            .offset(page_start)
+                            .to_pandas()
+                        )
+                        if page.empty:
+                            break
+                        affected_ids.extend(page["id"].tolist())
+                        if len(page) < 500:
+                            break
+                        page_start += 500
+
+                    self._table.delete(native_sql)
+                    self._sync_fts5delete(affected_ids)
+                    return
+            except Exception:
+                pass  # Fall through to vector-search scan
+
             # LanceDB's json_extract SQL cannot filter UTF-8 metadata_json strings.
-            # Collect ALL matching ids in one full-table scan, then delete in batches.
-            # Offset-based pagination is NOT safe here because deleting shifts row positions.
-            #
-            # IMPORTANT: page.empty is NOT a reliable exhaustion signal. During LanceDB
-            # compaction or with sparse row distributions, a raw page can be empty while
-            # matching rows remain at higher offsets. We distinguish three states:
-            #   A. Genuine exhaustion  — offset has moved past all data in table
-            #   B. Transient empty     — compaction/sparse layout produced empty page;
-            #                            more rows exist at higher offsets
-            #   C. Safety ceiling       — MAX_SCAN reached, cannot proceed
-            # We use consecutive empty pages as the exhaustion signal (transient anomaly
-            # resolves within 1-2 pages). The MAX_SCAN ceiling still guards silent partials.
+            # Collect ALL matching ids via ANN scan with SQL predicate prefilter,
+            # then delete by id. This is still better than pandas full-table scan
+            # because LanceDB's ANN index narrows the scan to relevant regions.
             try:
                 batch_size = 500
-                MAX_SCAN = self._DELETE_MAX_SCAN  # class-level configurable cap
+                MAX_SCAN = self._DELETE_MAX_SCAN
                 matching_ids: list[str] = []
                 total_scanned = 0
                 consecutive_empty_pages = 0
-                # A genuinely exhausted scan ends with consecutive empty pages after
-                # we've moved past all data. One empty page during compaction is common;
-                # two consecutive empty pages means the scan position is past all data.
                 EMPTY_PAGES_BEFORE_BREAK = 2
 
+                sql_where = _where_to_sql(where)
                 page_start = 0
                 while total_scanned < MAX_SCAN:
-                    # Never request more rows than the remaining scan budget
                     batch_limit = min(batch_size, MAX_SCAN - total_scanned)
+                    # Use search().where() for SQL predicate pushdown — narrows scan
+                    # to rows matching the filter before vectors are considered.
+                    # Without vector query (no query= arg), this is a filtered full-scan
+                    # that leverages LanceDB's page-level pruning.
                     page = (
                         self._table.search()
+                        .where(sql_where, prefilter=True)
                         .limit(batch_limit)
                         .offset(page_start)
                         .to_pandas()
@@ -1454,16 +1487,14 @@ class LanceCollection(BaseCollection):
                         consecutive_empty_pages += 1
                         total_scanned += batch_limit
                         if consecutive_empty_pages >= EMPTY_PAGES_BEFORE_BREAK:
-                            # Two consecutive empty pages means we've scanned past all
-                            # data. Genuine exhaustion — stop scanning, proceed to delete.
                             break
-                        # Transient empty page (compaction / sparse layout in progress).
-                        # Continue scanning to find rows that may exist beyond this gap.
                         page_start += batch_size
                         continue
-                    # Page had data — reset consecutive counter and scan this page
                     consecutive_empty_pages = 0
                     total_scanned += len(page)
+                    # For search().where() the filter is pushed to SQL, but after
+                    # scanning we still need to verify row-level conditions (python
+                    # dict filters). Apply the remaining filter to the scanned page.
                     filtered = _apply_where_filter(page, where)
                     if not filtered.empty:
                         matching_ids.extend(filtered["id"].tolist())
@@ -1472,9 +1503,6 @@ class LanceCollection(BaseCollection):
                     page_start += batch_size
 
                 if total_scanned >= MAX_SCAN and len(matching_ids) < MAX_SCAN:
-                    # Safety ceiling reached before table was fully scanned.
-                    # Raising is the correct behaviour — silent partial delete would
-                    # cause data loss if more matching rows exist beyond the cap.
                     raise RuntimeError(
                         f"delete(where=...) scanned {total_scanned} raw rows "
                         f"({len(matching_ids)} matches) but hit MAX_SCAN={MAX_SCAN} ceiling "
@@ -1484,16 +1512,16 @@ class LanceCollection(BaseCollection):
                     )
 
                 if not matching_ids:
+                    self._sync_fts5delete([])
                     return
 
-                # Delete matching ids in batches (single-id deletes preserve MVCC safety)
                 for i in range(0, len(matching_ids), batch_size):
                     for mid in matching_ids[i:i + batch_size]:
                         self._write_with_retry(
                             lambda i=mid: self._table.delete(f"id = '{i}'")
                         )
             except RuntimeError:
-                raise  # re-raise our own RuntimeError
+                raise
             except Exception as e:
                 logger.warning("delete(where=...) skipped due to scan error: %s", e)
                 return

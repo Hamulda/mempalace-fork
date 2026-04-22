@@ -1,68 +1,86 @@
-# MemPalace MCP Setup
+# MemPalace MCP Setup — Canonical Guide
 
-## Quick Start
+## Target Setup: 6 Parallel Claude Code Sessions + 1 Shared Server
 
-**Install + start in one line:**
-```bash
-pip install mempalace && python -m mempalace.fastmcp_server &
+```
+┌──────────────────────────────────────────┐
+│  Claude Code session 1..6 (localhost)    │
+│  MCP tools → http://127.0.0.1:8765/mcp  │
+└──────────────────────────────────────────┘
+                    │
+                    ▼ (shared HTTP)
+┌──────────────────────────────────────────┐
+│  mempalace serve --port 8765 (1 process)  │
+│  SessionRegistry, ClaimsManager, WAL...   │
+└──────────────────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│  LanceDB (~/.mempalace/)                  │
+└──────────────────────────────────────────┘
 ```
 
-**Verify it's running:**
+## Install
+
+```bash
+# 1. Install Python package
+pip install git+https://github.com/Hamulda/mempalace-fork
+
+# 2. Initialize palace
+mempalace init ~/palace
+
+# 3. Start shared MCP server
+mempalace serve --host 127.0.0.1 --port 8765
+```
+
+## Connect Claude Code
+
+```bash
+# Install plugin (provides skills + hooks only)
+claude plugin marketplace add hamulda/mempalace-fork
+claude plugin install --scope user mempalace
+```
+
+Plugin connects to MCP server via `.claude-plugin/.mcp.json` (already configured for `http://127.0.0.1:8765/mcp`).
+
+## Verify
+
 ```bash
 curl http://127.0.0.1:8765/health
 # → {"status": "ok", "service": "mempalace"}
 ```
 
-## Two Ways to Connect
+Then in Claude Code: `/mempalace:status`
 
-### Option A — Claude Code Plugin (recommended)
+## Auto-start (Optional)
 
-```bash
-# Install once
-claude plugin marketplace add hamulda/mempalace-fork  # or your fork URL
-claude plugin install --scope user mempalace
-
-# Restart Claude Code — MemPalace tools appear automatically
-```
-
-The plugin path is recommended because it handles MCP registration persistently and does not require manual `claude mcp add` commands.
-
-### Option B — Manual MCP registration
+To start the server automatically on login, use `launchd` on macOS:
 
 ```bash
-claude mcp add mempalace -- python -m mempalace.fastmcp_server
+# Create plist at ~/Library/LaunchAgents/com.mempalace.server.plist
+# See: https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Concepts/CreatingLaunchdPlists.html
 ```
 
-Works for any MCP-compatible tool (Cursor, Continue, Zed, etc.).
+Or add to your shell profile:
 
-## Session Coordination (multi-session)
-
-When running MemPalace for 6× parallel Claude Code sessions, the server runs in **shared mode** with session coordinators active:
-
-- **SessionRegistry** — tracks active sessions, prevents split-brain
-- **WriteCoordinator** — coalesces concurrent writes via WAL
-- **ClaimsManager** — enforces file-level mutual exclusion
-- **HandoffManager** — atomic handoff between sessions
-- **DecisionTracker** — captures architectural decisions
-
-These are auto-activated when you use `mempalace serve` (CLI) or `python -m mempalace.fastmcp_server` (HTTP transport). Stdio mode (default for development) does not activate coordinators.
-
-## Backend
-
-Default backend is **LanceDB** (local, zero API calls). ChromaDB is available via `MEMPALACE_BACKEND=chroma` but LanceDB is recommended for reliability.
+```bash
+# ~/.zshrc or ~/.bashrc
+alias mempalace-start='mempalace serve --host 127.0.0.1 --port 8765'
+```
 
 ## Troubleshooting
 
-**Port 8765 already in use:**
-```bash
-pkill -f mempalace.fastmcp_server
-python -m mempalace.fastmcp_server &
-```
+| Symptom | Fix |
+|---------|-----|
+| `fastmcp` not found | `pip install git+https://github.com/Hamulda/mempalace-fork` |
+| Server not running | `mempalace serve --host 127.0.0.1 --port 8765` |
+| Wrong port | Check `.mcp.json` port matches server port |
+| Plugin installed but no tools | `/reload-plugins` in Claude Code |
+| Tools not appearing | Restart Claude Code after plugin install |
 
-**Palace not found:**
-```bash
-mempalace init ~/projects/myapp
-python -m mempalace.fastmcp_server
-```
+## Port Canonicalization
 
-**MCP tools not appearing in Claude Code:** Restart Claude Code after installing the plugin or adding the MCP server.
+- Default server port: **8765**
+- `.mcp.json` always: `http://127.0.0.1:8765/mcp`
+- `mempalace serve` default: `--port 8765`
+- No other port is canonical for shared-server mode.

@@ -1,26 +1,21 @@
 {
   "name": "mempalace",
   "version": "3.1.0",
-  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 56 MCP tools, session coordination, and guided workflow. LanceDB-backed, runs locally.",
+  "description": "Give your AI a persistent memory — mine projects and conversations into a searchable palace. 56 MCP tools, session coordination, and guided workflow. LanceDB-backed, runs locally.",
   "author": {
-    "name": "milla-jovovich"
+    "name": "Hamulda"
   },
   "license": "MIT",
-  "commands": [],
-  "mcpServers": {
-    "mempalace": {
-      "transport": "http",
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  },
+  "repository": "https://github.com/Hamulda/mempalace-fork",
   "keywords": [
     "memory",
     "ai",
     "rag",
     "mcp",
-    "chromadb",
     "palace",
-    "search"
+    "search",
+    "lancedb"
   ],
-  "repository": "https://github.com/milla-jovovich/mempalace"
+  "skills": "./skills/",
+  "commands": "./commands/"
 }

@@ -789,7 +789,7 @@ def cmd_setup(args):
         # 4. HTTP MCP server (opt-in)
         http_setup = input("\nInstall HTTP MCP server for shared multi-session access? [y/N]: ")
         if http_setup.lower() == "y":
-            port = input("   Port (default 8766): ").strip() or "8766"
+            port = input("   Port (default 8765): ").strip() or "8765"
             _install_launchd_plist(
                 label="ai.mempalace.mcp-server",
                 program=[sys.executable, "-m", "mempalace", "serve", "--port", port],
@@ -1357,8 +1357,8 @@ def main():
     p_serve.add_argument(
         "--port",
         type=int,
-        default=8766,
-        help="Port to listen on (default: 8766)",
+        default=8765,
+        help="Port to listen on (default: 8765)",
     )
 
     # optimize

@@ -6,11 +6,12 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [
-    {name = "milla-jovovich"},
+    {name = "Hamulda"},
 ]
 keywords = [
-    "ai", "memory", "llm", "rag", "chromadb", "mcp",
-    "vector-database", "claude", "chatgpt", "embeddings",
+    "ai", "memory", "llm", "rag", "mcp",
+    "vector-database", "claude", "embeddings",
+    "lancedb", "palace",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -34,9 +35,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/milla-jovovich/mempalace"
-Repository = "https://github.com/milla-jovovich/mempalace"
-"Bug Tracker" = "https://github.com/milla-jovovich/mempalace/issues"
+Homepage = "https://github.com/Hamulda/mempalace-fork"
+Repository = "https://github.com/Hamulda/mempalace-fork"
+"Bug Tracker" = "https://github.com/Hamulda/mempalace-fork/issues"
 
 [project.scripts]
 mempalace = "mempalace:main"

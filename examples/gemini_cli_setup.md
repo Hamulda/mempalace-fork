@@ -13,7 +13,7 @@ On many Linux systems, installing Python packages globally is restricted. We rec
 
 ```bash
 # Clone the repository (if you haven't already)
-git clone https://github.com/milla-jovovich/mempalace.git
+git clone https://github.com/Hamulda/mempalace-fork.git
 cd mempalace
 
 # Create a virtual environment

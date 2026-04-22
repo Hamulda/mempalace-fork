@@ -3,10 +3,10 @@
   "version": "3.0.14",
   "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 56 MCP tools, auto-save hooks, session coordination, and guided workflow. LanceDB-backed, runs locally.",
   "author": {
-    "name": "milla-jovovich"
+    "name": "Hamulda"
   },
-  "homepage": "https://github.com/milla-jovovich/mempalace",
-  "repository": "https://github.com/milla-jovovich/mempalace",
+  "homepage": "https://github.com/Hamulda/mempalace-fork",
+  "repository": "https://github.com/Hamulda/mempalace-fork",
   "license": "MIT",
   "keywords": [
     "memory",
@@ -32,16 +32,16 @@
     "displayName": "MemPalace",
     "shortDescription": "AI memory system for Codex",
     "longDescription": "Give your AI a persistent memory — mine projects and conversations into a searchable palace backed by LanceDB, with 56 MCP tools, session coordination, auto-save hooks, and guided workflow tools.",
-    "developerName": "milla-jovovich",
+    "developerName": "Hamulda",
     "category": "Coding",
     "capabilities": [
       "Interactive",
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/milla-jovovich/mempalace",
-    "privacyPolicyURL": "https://github.com/milla-jovovich/mempalace",
-    "termsOfServiceURL": "https://github.com/milla-jovovich/mempalace",
+    "websiteURL": "https://github.com/Hamulda/mempalace-fork",
+    "privacyPolicyURL": "https://github.com/Hamulda/mempalace-fork",
+    "termsOfServiceURL": "https://github.com/Hamulda/mempalace-fork",
     "defaultPrompt": [
       "Search my memories for recent decisions",
       "Mine this project into my memory palace",

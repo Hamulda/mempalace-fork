@@ -383,32 +383,63 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         try:
             entries = []
             try:
-                _BATCH = 500
-                offset = 0
-                while True:
-                    batch = col.get(
-                        where={"$and": [{"wing": wing}, {"room": "diary"}]},
-                        include=["documents", "metadatas"],
-                        limit=_BATCH, offset=offset,
+                # FIX: Use .search().where() + .sort() + .limit() for server-side
+                # ordering and early-exit — avoids loading all entries into RAM
+                # and sorting Python-side. Sort by timestamp DESC, limit to last_n*2
+                # (over-fetch slightly in case some are filtered) then slice to last_n.
+                over_fetch = last_n * 2
+                try:
+                    # LanceDB 0.4+: native sort + limit on metadata queries
+                    from lancedb.query import AsyncQuery, LanceQueryBuilder
+                    results = (
+                        col.search()
+                        .where(f"wing = '{wing}' AND room = 'diary'", prefilter=True)
+                        .sort("timestamp", ascending=False)
+                        .limit(over_fetch)
+                        .to_pandas()
                     )
-                    docs = batch.get("documents", [])
-                    metas = batch.get("metadatas", [])
-                    if not docs:
-                        break
-                    for doc, meta in zip(docs, metas):
-                        entries.append({
-                            "date": meta.get("date", ""), "timestamp": meta.get("timestamp", ""),
-                            "topic": meta.get("topic", ""), "content": doc,
-                        })
-                    if len(docs) < _BATCH:
-                        break
-                    offset += len(docs)
+                    if not results.empty:
+                        for _, row in results.iterrows():
+                            try:
+                                meta = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+                            except (json.JSONDecodeError, TypeError):
+                                meta = {}
+                            entries.append({
+                                "date": meta.get("date", ""),
+                                "timestamp": meta.get("timestamp", ""),
+                                "topic": meta.get("topic", ""),
+                                "content": str(row["document"]),
+                            })
+                    entries = entries[:last_n]
+                except (ImportError, AttributeError):
+                    # FALLBACK: LanceDB version doesn't support sort() on .search()
+                    # Fall back to original load-all-sort-slice (less efficient)
+                    _BATCH = 500
+                    offset = 0
+                    while True:
+                        batch = col.get(
+                            where={"$and": [{"wing": wing}, {"room": "diary"}]},
+                            include=["documents", "metadatas"],
+                            limit=_BATCH, offset=offset,
+                        )
+                        docs = batch.get("documents", [])
+                        metas = batch.get("metadatas", [])
+                        if not docs:
+                            break
+                        for doc, meta in zip(docs, metas):
+                            entries.append({
+                                "date": meta.get("date", ""), "timestamp": meta.get("timestamp", ""),
+                                "topic": meta.get("topic", ""), "content": doc,
+                            })
+                        if len(docs) < _BATCH:
+                            break
+                        offset += len(docs)
+                    entries.sort(key=lambda x: x["timestamp"], reverse=True)
+                    entries = entries[:last_n]
             except Exception:
                 pass
             if not entries:
                 return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
-            entries.sort(key=lambda x: x["timestamp"], reverse=True)
-            entries = entries[:last_n]
             return {"agent": agent_name, "entries": entries, "total": len(entries), "showing": len(entries)}
         except Exception as e:
             return {"error": str(e)}

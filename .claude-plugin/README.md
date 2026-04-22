@@ -1,57 +1,96 @@
 # MemPalace Claude Code Plugin
 
-A Claude Code plugin that gives your AI a persistent memory system. Mine projects and conversations into a searchable palace backed by ChromaDB, with 19 MCP tools, auto-save hooks, and 5 guided skills.
+A Claude Code plugin that gives your AI a persistent memory system powered by MemPalace — the local, LanceDB-backed memory palace with session coordination for 6× parallel Claude Code sessions.
+
+## What This Plugin Does
+
+- **Skills**: `/mempalace:help`, `/mempalace:init`, `/mempalace:search`, `/mempalace:mine`, `/mempalace:status`
+- **Hooks**: Auto-save on Stop, PreCompact preservation, SessionStart health check
+- **No MCP servers started by plugin** — plugin provides UX, MCP tools connect to a shared server
 
 ## Prerequisites
 
 - Python 3.9+
+- MemPalace installed: `pip install git+https://github.com/Hamulda/mempalace-fork`
+- Shared MemPalace MCP server running on `http://127.0.0.1:8765/mcp`
 
 ## Installation
 
-### Claude Code Marketplace
-
 ```bash
-claude plugin marketplace add milla-jovovich/mempalace
+# Install MemPalace Python package first
+pip install git+https://github.com/Hamulda/mempalace-fork
+
+# Install the Claude Code plugin
+claude plugin marketplace add hamulda/mempalace-fork
 claude plugin install --scope user mempalace
 ```
 
-### Local Clone
+## Starting the Shared MCP Server
+
+Run **one** shared server for all Claude Code sessions:
 
 ```bash
-claude plugin add /path/to/mempalace
+mempalace serve --host 127.0.0.1 --port 8765
 ```
 
-## Post-Install Setup
+Or:
 
-After installing the plugin, run the init command to complete setup (pip install, MCP configuration, etc.):
-
+```bash
+python -m mempalace serve --host 127.0.0.1 --port 8765
 ```
-/mempalace:init
+
+The server starts on `http://127.0.0.1:8765/mcp` with all session coordinators active
+(SessionRegistry, WriteCoordinator, ClaimsManager, HandoffManager, DecisionTracker).
+
+## Verify
+
+```bash
+curl http://127.0.0.1:8765/health
+# → {"status": "ok", "service": "mempalace"}
 ```
 
 ## Available Slash Commands
 
 | Command | Description |
 |---------|-------------|
-| `/mempalace:help` | Show available tools, skills, and architecture |
-| `/mempalace:init` | Set up MemPalace -- install, configure MCP, onboard |
-| `/mempalace:search` | Search your memories across the palace |
-| `/mempalace:mine` | Mine projects and conversations into the palace |
-| `/mempalace:status` | Show palace overview -- wings, rooms, drawer counts |
+| `/mempalace:help` | Show tools, skills, and architecture |
+| `/mempalace:init` | Install package, initialize palace, configure server |
+| `/mempalace:search` | Search memories across the palace |
+| `/mempalace:mine` | Mine projects and conversations |
+| `/mempalace:status` | Palace overview — wings, rooms, counts |
 
 ## Hooks
 
-MemPalace registers two hooks that run automatically:
+- **Stop** — Auto-saves conversation context every 15 messages
+- **PreCompact** — Preserves memories before context compaction
+- **SessionStart** — Verifies MCP server is reachable
 
-- **Stop** -- Saves conversation context every 15 messages.
-- **PreCompact** -- Preserves important memories before context compaction.
+Set `MEMPAL_DIR` environment variable to auto-ingest a directory on each save.
 
-Set the `MEMPAL_DIR` environment variable to a directory path to automatically run `mempalace mine` on that directory during each save trigger.
+## Architecture
 
-## MCP Server
-
-The plugin automatically configures a local MCP server with 19 tools for storing, searching, and managing memories. No manual MCP setup is required -- `/mempalace:init` handles everything.
+```
+┌─────────────────────────────────────────────────────┐
+│  Claude Code (session 1..6)                         │
+│  /mempalace:search → MCP call → http://localhost:8765│
+└─────────────────────────────────────────────────────┘
+                     │
+                     ▼ (shared HTTP)
+┌─────────────────────────────────────────────────────┐
+│  mempalace serve (1 process, port 8765)             │
+│  ├── SessionRegistry (shared across sessions)       │
+│  ├── WriteCoordinator (WAL coalescing)              │
+│  ├── ClaimsManager (file-level mutual exclusion)    │
+│  ├── HandoffManager (atomic handoff)               │
+│  └── DecisionTracker (architectural decisions)       │
+└─────────────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────┐
+│  LanceDB (~/.mempalace/)                           │
+└─────────────────────────────────────────────────────┘
+```
 
 ## Full Documentation
 
-See the main [README](../README.md) for complete documentation, architecture details, and advanced usage.
+See the main [README](../README.md).

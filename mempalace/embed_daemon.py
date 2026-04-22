@@ -32,6 +32,11 @@ SOCKET_PATH = os.path.expanduser("~/.mempalace/embed.sock")
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 CACHE_DIR = os.path.expanduser("~/.cache/fastembed")
 
+# M1 8GB safety: chunk embeddings to avoid memory pressure during batch inference.
+# 32 texts × ~256 tokens × embedding_dim ≈ 32MB peak per chunk with MLX.
+# This prevents OOM when 6 parallel Claude Code sessions each send large batches.
+MAX_BATCH = 32
+
 
 def _create_embedding_model():
     """
@@ -200,8 +205,15 @@ def _handle_client(conn: socket.socket, model) -> None:
         if not texts:
             response = {"embeddings": [], "error": None}
         else:
-            embeddings = [emb.tolist() for emb in model.embed(texts)]
-            response = {"embeddings": embeddings, "error": None}
+            # Chunk to MAX_BATCH to prevent memory exhaustion on M1 8GB.
+            # Large batches with MLX models can consume ~2GB+ peak memory;
+            # chunking keeps peak under ~500MB per chunk.
+            all_embeddings = []
+            for i in range(0, len(texts), MAX_BATCH):
+                chunk = texts[i:i + MAX_BATCH]
+                chunk_embs = [emb.tolist() for emb in model.embed(chunk)]
+                all_embeddings.extend(chunk_embs)
+            response = {"embeddings": all_embeddings, "error": None}
 
         payload = json.dumps(response).encode("utf-8")
         conn.sendall(len(payload).to_bytes(4, "big") + payload)
