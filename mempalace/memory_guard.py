@@ -132,12 +132,14 @@ class MemoryGuard:
         """
         Blokuje dokud není memory pressure nominal nebo timeout.
         Vrátí True pokud nominal, False pokud timeout.
+        Non-blocking: polls every 0.1s so memory pressure clears are detected
+        quickly without blocking the thread for full 1s intervals.
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._pressure == MemoryPressure.NOMINAL:
                 return True
-            time.sleep(1.0)
+            time.sleep(0.1)
         return False
 
     def _monitor_loop(self):

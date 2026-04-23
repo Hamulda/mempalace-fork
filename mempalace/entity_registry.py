@@ -15,6 +15,7 @@ Usage:
     # → {"type": "person", "confidence": 1.0, "source": "onboarding"}
 """
 
+import asyncio
 import json
 import re
 import urllib.request
@@ -502,9 +503,9 @@ class EntityRegistry:
 
     # ── Research unknown words ───────────────────────────────────────────────
 
-    def research(self, word: str, auto_confirm: bool = False) -> dict:
+    async def research(self, word: str, auto_confirm: bool = False) -> dict:
         """
-        Research an unknown word via Wikipedia.
+        Research an unknown word via Wikipedia (non-blocking).
         Caches result. If auto_confirm=False, marks as unconfirmed (needs user review).
         Returns the lookup result.
         """
@@ -513,7 +514,8 @@ class EntityRegistry:
         if word in cache:
             return cache[word]
 
-        result = _wikipedia_lookup(word)
+        # Run blocking network call in thread pool — does not stall event loop
+        result = await asyncio.to_thread(_wikipedia_lookup, word)
         result["word"] = word
         result["confirmed"] = auto_confirm
 

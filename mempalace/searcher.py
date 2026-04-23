@@ -6,6 +6,7 @@ Semantic search against the palace.
 Returns verbatim text — the actual words, never summaries.
 """
 
+import asyncio
 import functools
 import hashlib
 import logging
@@ -23,6 +24,7 @@ _search_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp_sear
 
 _reranker = None
 _reranker_lock = threading.Lock()
+_RERANKER_LOCK_TIMEOUT = 5.0  # max seconds to wait for reranker init
 
 
 def _path_contains(haystack: str, needle: str) -> bool:
@@ -103,7 +105,11 @@ def _get_reranker():
     """
     global _reranker
     if _reranker is None:
-        with _reranker_lock:
+        acquired = _reranker_lock.acquire(timeout=_RERANKER_LOCK_TIMEOUT)
+        if not acquired:
+            logger.warning("Reranker lock timeout after %.0fs — skipping init", _RERANKER_LOCK_TIMEOUT)
+            return None
+        try:
             if _reranker is None:
                 # Memory guard: refuse load below 800MB free.
                 # Reranker loads lazily (not at startup) so this is a bonus, not a lockout.
@@ -131,6 +137,11 @@ def _get_reranker():
                 except ImportError:
                     _reranker = False
                     logger.info("sentence-transformers not installed, reranking disabled")
+        finally:
+            try:
+                _reranker_lock.release()
+            except RuntimeError:
+                pass  # Lock was not held
     return _reranker if _reranker is not False else None
 
 
@@ -920,7 +931,7 @@ def code_search(
     }
 
 
-def code_search_async(
+async def code_search_async(
     query: str,
     palace_path: str,
     n_results: int = 10,
@@ -929,9 +940,8 @@ def code_search_async(
     file_path: str = None,
     include_prose: bool = False,
 ) -> dict:
-    import asyncio, functools
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(
+    import functools
+    return await asyncio.get_event_loop().run_in_executor(
         _search_executor,
         functools.partial(code_search, query=query, palace_path=palace_path,
             n_results=n_results, language=language, symbol_name=symbol_name,

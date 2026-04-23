@@ -3,9 +3,12 @@ Write tools: add_drawer, delete_drawer, diary_write, diary_read, consolidate.
 """
 import hashlib
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from fastmcp import Context
+
+logger = logging.getLogger(__name__)
 
 
 def _is_shared_server_mode(server) -> bool:
@@ -119,7 +122,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             return None
         try:
             return _wc.log_intent(session_id, operation, target_type, target_id, payload)
-        except Exception:
+        except Exception as e:
+            logger.warning("_log_intent failed (fail-open, intent dropped): %s", e)
             return None
 
     def _commit_intent(intent_id, session_id):
@@ -128,8 +132,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             return
         try:
             _wc.commit_intent(intent_id, session_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("_commit_intent failed (fail-open): %s", e)
 
     def _rollback_intent(intent_id, session_id):
         """Rollback intent — fail-open."""
@@ -137,8 +141,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             return
         try:
             _wc.rollback_intent(intent_id, session_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("_rollback_intent failed (fail-open): %s", e)
 
     @server.tool(timeout=settings.timeout_write)
     def mempalace_add_drawer(
@@ -592,6 +596,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     seen.add(drawer_id)
             merged_count = 0
             consolidate_intent_id = None
+            claim_warning = None
             if merge and len(duplicates) > 1:
                 # Enforce claim before any write (delete) in merge path.
                 if claim_mode is None and _is_shared_server_mode(server):
@@ -602,7 +607,6 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     effective_mode = "advisory"
                 consolidate_target = f"{settings.palace_path}/_consolidate/{topic}"
                 claim_err = _claim_check(server, consolidate_target, session_id, effective_mode)
-                claim_warning = None
                 if claim_err:
                     if "error" in claim_err:
                         return claim_err
@@ -613,17 +617,21 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     {"topic": topic, "duplicates_count": len(duplicates)}
                 )
 
-                duplicates_with_ts = []
-                for dup in duplicates:
-                    try:
-                        raw = col.get(ids=[dup["id"]], include=["metadatas"])
-                        ts = raw["metadatas"][0].get("timestamp", "") if raw["metadatas"] else ""
-                    except Exception:
-                        ts = ""
-                    duplicates_with_ts.append({**dup, "_timestamp": ts})
+                # Fetch all timestamps in one batch call instead of N individual col.get()
+                all_ids = [dup["id"] for dup in duplicates]
+                ts_map: dict[str, str] = {}
+                try:
+                    raw = col.get(ids=all_ids, include=["metadatas"])
+                    for i, mid in enumerate(raw["ids"][0] if raw["ids"] else []):
+                        meta = raw["metadatas"][0][i] if raw["metadatas"] and i < len(raw["metadatas"][0]) else {}
+                        ts_map[mid] = meta.get("timestamp", "") if meta else ""
+                except Exception:
+                    ts_map = {}
+                duplicates_with_ts = [{**dup, "_timestamp": ts_map.get(dup["id"], "")} for dup in duplicates]
                 duplicates_with_ts.sort(key=lambda x: x["_timestamp"], reverse=True)
                 keeper = duplicates_with_ts[0]
                 to_remove = duplicates_with_ts[1:]
+                consolidate_failed = False
                 if to_remove:
                     try:
                         wal_log(

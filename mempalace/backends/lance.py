@@ -460,6 +460,43 @@ class LanceOptimizer:
         self._last_optimize_time = 0.0
         self._lock = threading.Lock()
         self._lock_file = Path(palace_path) / ".optimize_lock"
+        self._optimize_loop: asyncio.AbstractEventLoop | None = None
+        self._optimize_thread: threading.Thread | None = None
+        self._optimize_lock = threading.Lock()  # guard _optimize_loop access
+
+    def _get_optimize_loop(self) -> asyncio.AbstractEventLoop:
+        """Lazily start a persistent daemon thread with one event loop.
+
+        Unlike asyncio.run() which creates a new loop per call, this keeps one
+        loop alive across all optimize calls — no nested loop creation, no
+        orphaned tasks when the loop closes.
+        """
+        with self._optimize_lock:
+            if self._optimize_loop is None or not self._optimize_loop.is_running():
+                self._stop_optimize_loop()
+                ev = asyncio.new_event_loop()
+                self._optimize_loop = ev
+
+                def _run_loop():
+                    asyncio.set_event_loop(ev)
+                    ev.run_forever()
+
+                t = threading.Thread(target=_run_loop, daemon=True, name="mp_optimize")
+                t.start()
+                # Give the loop a moment to start so we don't schedule on a closed loop
+                while not ev.is_running():
+                    time.sleep(0.01)
+            return self._optimize_loop
+
+    def _stop_optimize_loop(self) -> None:
+        """Stop and close the optimize event loop."""
+        loop = self._optimize_loop
+        if loop is None:
+            return
+        self._optimize_loop = None
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        # Don't join — daemon thread exits when process exits
 
     def record_write(self) -> None:
         """Call after every successful write. Triggers async optimize if needed."""
@@ -475,11 +512,18 @@ class LanceOptimizer:
             if should_optimize:
                 self._writes_since_optimize = 0
                 self._last_optimize_time = now
-                t = threading.Thread(target=self._run_optimize, daemon=True)
-                t.start()
+                loop = self._get_optimize_loop()
+                loop.call_soon_threadsafe(self._schedule_optimize)
 
-    def _run_optimize(self) -> None:
-        """Compacts delta files. Runs in background thread."""
+    def _schedule_optimize(self) -> None:
+        """Schedule one optimize run on the persistent loop. Runs fire-and-forget."""
+        if self._lock_file.exists():
+            logger.debug("LanceDB optimize already running, skipping")
+            return
+        asyncio.ensure_future(self._run_optimize())
+
+    async def _run_optimize(self) -> None:
+        """Compacts delta files. Runs on the persistent optimize event loop."""
         if self._lock_file.exists():
             logger.debug("LanceDB optimize already running, skipping")
             return
@@ -488,7 +532,7 @@ class LanceOptimizer:
             self._lock_file.touch()
             logger.info("Starting LanceDB optimize for %s", self._collection_name)
 
-            asyncio.run(self._async_optimize())
+            await self._async_optimize()
 
             # Clean up .tmp* directories left by optimize
             palace = Path(self._palace_path)
@@ -575,7 +619,10 @@ class LanceOptimizer:
 # ── Retry helper ───────────────────────────────────────────────────────────────
 
 def _write_with_retry(fn, max_retries: int = 7):
-    """Exponential backoff retry for LanceDB commit conflicts (MVCC)."""
+    """Retry with logarithmic backoff for LanceDB commit conflicts (MVCC).
+    Non-blocking: max wait at peak is ~0.16s (vs ~6.4s with exponential),
+    keeping the thread active and responsive to memory pressure checks.
+    """
     for attempt in range(max_retries):
         try:
             return fn()
@@ -583,7 +630,10 @@ def _write_with_retry(fn, max_retries: int = 7):
             err = str(e).lower()
             if any(kw in err for kw in ("commit conflict", "conflict", "retry", "transaction")) \
                     and attempt < max_retries - 1:
-                wait = 0.05 * (2 ** attempt) + random.random() * 0.05
+                # Logarithmic backoff: wait = 0.08 * ln(2^attempt) + jitter
+                # attempt=0 → ~0.06s, attempt=3 → ~0.11s, attempt=6 → ~0.16s
+                import math as _math
+                wait = 0.08 * _math.log(2 ** attempt + 1) + random.random() * 0.01
                 time.sleep(wait)
                 continue
             raise
@@ -911,7 +961,7 @@ class LanceCollection(BaseCollection):
         self._query_cache = None
 
     def _write_with_retry(self, fn, max_retries: int = 7):
-        """Exponential backoff retry for LanceDB commit conflicts."""
+        """Retry with logarithmic backoff for LanceDB commit conflicts."""
         for attempt in range(max_retries):
             try:
                 return fn()
@@ -919,7 +969,8 @@ class LanceCollection(BaseCollection):
                 err = str(e).lower()
                 if any(kw in err for kw in ("commit conflict", "conflict", "retry", "transaction")) \
                         and attempt < max_retries - 1:
-                    wait = 0.05 * (2 ** attempt) + random.random() * 0.05
+                    import math as _math
+                    wait = 0.08 * _math.log(2 ** attempt + 1) + random.random() * 0.01
                     time.sleep(wait)
                     continue
                 raise
@@ -1591,8 +1642,7 @@ class LanceCollection(BaseCollection):
         try:
             from ..lexical_index import KeywordIndex
             idx = KeywordIndex.get(self._palace_path)
-            for doc_id in ids:
-                idx.delete_drawer(doc_id)
+            idx.delete_drawer_batch(ids)
         except Exception:
             logger.warning("FTS5 delete failed for %d entries: %s — index may be stale", len(ids), e)
             pass  # FTS5 staleness is recoverable; never crash write path

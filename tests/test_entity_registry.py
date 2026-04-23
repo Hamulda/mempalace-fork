@@ -1,5 +1,6 @@
 """Tests for mempalace.entity_registry."""
 
+import pytest
 from unittest.mock import patch
 
 from mempalace.entity_registry import (
@@ -216,7 +217,8 @@ def test_lookup_ambiguous_word_as_concept(tmp_path):
 # ── research (Wikipedia) — mocked ──────────────────────────────────────
 
 
-def test_research_caches_result(tmp_path):
+@pytest.mark.asyncio
+async def test_research_caches_result(tmp_path):
     registry = EntityRegistry.load(config_dir=tmp_path)
     registry.seed(mode="personal", people=[], projects=[])
 
@@ -228,7 +230,7 @@ def test_research_caches_result(tmp_path):
     }
 
     with patch("mempalace.entity_registry._wikipedia_lookup", return_value=mock_result):
-        result = registry.research("Saoirse", auto_confirm=True)
+        result = await registry.research("Saoirse", auto_confirm=True)
     assert result["inferred_type"] == "person"
 
     # Second call should use cache, not call Wikipedia again
@@ -236,11 +238,12 @@ def test_research_caches_result(tmp_path):
         "mempalace.entity_registry._wikipedia_lookup",
         side_effect=AssertionError("should not be called"),
     ):
-        cached = registry.research("Saoirse")
+        cached = await registry.research("Saoirse")
     assert cached["inferred_type"] == "person"
 
 
-def test_confirm_research_adds_to_people(tmp_path):
+@pytest.mark.asyncio
+async def test_confirm_research_adds_to_people(tmp_path):
     registry = EntityRegistry.load(config_dir=tmp_path)
     registry.seed(mode="personal", people=[], projects=[])
 
@@ -251,7 +254,7 @@ def test_confirm_research_adds_to_people(tmp_path):
         "wiki_title": "Saoirse",
     }
     with patch("mempalace.entity_registry._wikipedia_lookup", return_value=mock_result):
-        registry.research("Saoirse", auto_confirm=False)
+        await registry.research("Saoirse", auto_confirm=False)
 
     registry.confirm_research("Saoirse", entity_type="person", relationship="friend")
     assert "Saoirse" in registry.people

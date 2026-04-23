@@ -766,6 +766,250 @@ class TestConsolidateWritePath:
         # No deletes should have happened
         assert fake_col.delete.call_count == 0
 
+    def test_consolidate_merge_empty_to_remove_no_unbound_error(self, tmp_path):
+        """consolidate merge=True with only 1 duplicate → to_remove=[] → consolidate_failed must not raise UnboundLocalError."""
+        from unittest.mock import MagicMock
+        from mempalace.server._write_tools import register_write_tools
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = str(tmp_path)
+        settings = _MockSettings(tmp)
+        settings.db_path = tmp
+        settings.palace_path = tmp
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._claims_manager = _MockClaimsManager()
+
+        fake_col = MagicMock()
+        # Only 1 result → after sort: keeper=[dup1], to_remove=[] (empty)
+        fake_col.query.return_value = {
+            "ids": [["dup1"]],
+            "documents": [["only one doc"]],
+            "metadatas": [[{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"}]],
+            "distances": [[0.0]],
+        }
+        fake_col.get.return_value = {
+            "ids": ["dup1"],
+            "documents": ["only one doc"],
+            "metadatas": [{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"}],
+        }
+        fake_col.delete.return_value = None
+
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+
+        config = MagicMock()
+        config.palace_path = tmp
+
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        captured = {}
+        _orig_tool = server.tool
+        def capture(**kwargs):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig_tool
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_consolidate"]
+        # merge=True + only 1 duplicate → to_remove is empty → consolidate_failed accessed
+        result = tool(dummy_ctx, topic="single doc", merge=True, threshold=0.85, session_id="session-a")
+        # Must NOT raise UnboundLocalError; returns a valid response
+        assert "error" not in result
+        # delete should NOT have been called (nothing to remove)
+        assert fake_col.delete.call_count == 0
+        # merged_count must be 0 (no deletion happened)
+        assert result.get("merged", 0) == 0
+
+    def test_consolidate_no_merge_no_claim_warning_unbound(self, tmp_path):
+        """consolidate merge=False → claim_warning must not raise UnboundLocalError."""
+        from unittest.mock import MagicMock
+        from mempalace.server._write_tools import register_write_tools
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = str(tmp_path)
+        settings = _MockSettings(tmp)
+        settings.db_path = tmp
+        settings.palace_path = tmp
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._claims_manager = _MockClaimsManager()
+        # Non-shared mode so no claim checking path is entered
+        server._shared_server_mode = False
+
+        fake_col = MagicMock()
+        fake_col.query.return_value = {
+            "ids": [["dup1", "dup2"]],
+            "documents": [["doc1", "doc2"]],
+            "metadatas": [[{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"},
+                          {"wing": "w", "room": "r", "timestamp": "2026-01-02T00:00:00Z"}]],
+            "distances": [[0.0, 0.1]],
+        }
+
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+
+        config = MagicMock()
+        config.palace_path = tmp
+
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        captured = {}
+        _orig_tool = server.tool
+        def capture(**kwargs):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig_tool
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_consolidate"]
+        # merge=False → skips the merge block → claim_warning must be in scope
+        result = tool(dummy_ctx, topic="JWT tokens", merge=False, threshold=0.85, session_id="session-a")
+        # Must NOT raise UnboundLocalError; must return valid response
+        assert result.get("error") in (None, "claim_conflict")
+        # claim_warning must not appear in error
+        assert "claim_warning" not in result.get("error", "")
+        # merge=False → merged stays None, total_found reflects all duplicates
+        assert result.get("merged") is None
+        assert result.get("total_found") == 2
+
+    def test_consolidate_merge_delete_exception_sets_consolidate_failed(self, tmp_path):
+        """col.delete() raises → consolidate_failed=True, error response returned."""
+        from unittest.mock import MagicMock
+        from mempalace.server._write_tools import register_write_tools
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = str(tmp_path)
+        settings = _MockSettings(tmp)
+        settings.db_path = tmp
+        settings.palace_path = tmp
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._claims_manager = _MockClaimsManager()
+
+        fake_col = MagicMock()
+        # 2 results → to_remove=[dup2], keeper=[dup1]
+        fake_col.query.return_value = {
+            "ids": [["dup1", "dup2"]],
+            "documents": [["doc1", "doc2"]],
+            "metadatas": [[{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"},
+                          {"wing": "w", "room": "r", "timestamp": "2026-01-02T00:00:00Z"}]],
+            "distances": [[0.0, 0.1]],
+        }
+        fake_col.get.side_effect = [
+            {"ids": ["dup1"], "documents": ["doc1"], "metadatas": [{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"}]},
+            {"ids": ["dup2"], "documents": ["doc2"], "metadatas": [{"wing": "w", "room": "r", "timestamp": "2026-01-02T00:00:00Z"}]},
+        ]
+        fake_col.delete.side_effect = RuntimeError("LanceDB write error")
+
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+
+        config = MagicMock()
+        config.palace_path = tmp
+
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        captured = {}
+        _orig_tool = server.tool
+        def capture(**kwargs):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig_tool
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_consolidate"]
+        result = tool(dummy_ctx, topic="dup pair", merge=True, threshold=0.85, session_id="session-a")
+        # No exception raised — consolidate_failed=True handled gracefully
+        # resp still returned with merged=0
+        assert "error" not in result
+        assert result.get("merged", 0) == 0
+        assert result.get("total_found") == 2
+        # delete was attempted and threw
+        assert fake_col.delete.call_count == 1
+
+    def test_consolidate_merge_single_result_no_merge_block(self, tmp_path):
+        """merge=True with 1 result → outer condition false → no merge block, valid response."""
+        from unittest.mock import MagicMock
+        from mempalace.server._write_tools import register_write_tools
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = str(tmp_path)
+        settings = _MockSettings(tmp)
+        settings.db_path = tmp
+        settings.palace_path = tmp
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._claims_manager = _MockClaimsManager()
+
+        fake_col = MagicMock()
+        # 1 result below threshold → duplicates stays empty → len(duplicates) > 1 is False
+        fake_col.query.return_value = {
+            "ids": [["dup1"]],
+            "documents": [["only doc"]],
+            "metadatas": [[{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"}]],
+            "distances": [[0.85]],  # exactly at threshold, similarity=0.15 → < threshold
+        }
+        fake_col.get.return_value = {
+            "ids": ["dup1"],
+            "documents": ["only doc"],
+            "metadatas": [{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"}],
+        }
+
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+
+        config = MagicMock()
+        config.palace_path = tmp
+
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        captured = {}
+        _orig_tool = server.tool
+        def capture(**kwargs):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig_tool
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_consolidate"]
+        # merge=True but only 1 result → outer condition len(duplicates) > 1 is False
+        result = tool(dummy_ctx, topic="single", merge=True, threshold=0.85, session_id="session-a")
+        # merge=True but 0 duplicates (similarity < threshold) → no merge block entered
+        # merged_count stays at initial 0, returned as 0 (not None since merge=True)
+        assert "error" not in result
+        assert result.get("merged") == 0
+        assert result.get("total_found") == 0  # similarity 0.15 < threshold 0.85
+        assert result.get("duplicates") == []
+
 
 class TestErrorContract:
     """Verify error response shape is consistent and actionable."""

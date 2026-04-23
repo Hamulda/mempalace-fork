@@ -161,6 +161,26 @@ class KeywordIndex:
             except sqlite3.Error as e:
                 logger.warning("FTS5 delete failed for %s: %s", document_id, e)
 
+    def delete_drawer_batch(self, document_ids: list[str]) -> None:
+        """Remove multiple drawers in one transaction.
+
+        Opens one connection and executes all DELETEs in one transaction.
+        Use this for bulk deletes from the LanceDB write path.
+        """
+        if not document_ids:
+            return
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                for doc_id in document_ids:
+                    conn.execute("DELETE FROM drawers_fts WHERE document_id = ?", (doc_id,))
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.warning("FTS5 batch delete failed for %d entries: %s", len(document_ids), e)
+
     def search(
         self,
         query: str,
