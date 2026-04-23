@@ -182,10 +182,9 @@ def register_code_tools(server, backend, config, settings):
         try:
             if query:
                 # Mode 1: Vector similarity search with project filtering.
-                # ChromaDB 0.6.x col.query() only supports a SINGLE equality filter in
-                # the where clause. We skip DB-level filtering entirely and apply all
-                # filters (wing, is_latest, language, project_path) in Python to support
-                # both wing="repo" (canonical) and wing="project" (legacy seeded data).
+                # We skip DB-level filtering entirely and apply all filters (wing,
+                # is_latest, language, project_path) in Python to support both
+                # wing="repo" (canonical) and wing="project" (legacy seeded data).
                 n_fetch = min(limit * 3, 150)
                 q_result = col.query(
                     query_texts=[query],
@@ -221,8 +220,7 @@ def register_code_tools(server, backend, config, settings):
 
             else:
                 # Mode 2: Deterministic metadata retrieval (no vector search).
-                # ChromaDB 0.6.x only supports single-equality where clause, so we
-                # fetch without DB-level filtering and apply all filters in Python:
+                # We fetch without DB-level filtering and apply all filters in Python:
                 # wing=repo, is_latest=True, language, project_path.
                 matched = []
                 offset = 0

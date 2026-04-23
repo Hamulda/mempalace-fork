@@ -58,6 +58,8 @@ Restart Claude Code after installing. MemPalace tools appear automatically — n
 ```bash
 claude mcp add mempalace -- python -m mempalace.fastmcp_server
 ```
+> **Single-session only.** For multi-session coordination (up to 6 parallel Claude Code
+> sessions), use `mempalace serve` instead — HTTP on port 8765 with session coordinators.
 If this fails, report the error but continue to the next step (MCP
 configuration can be done manually later).
 

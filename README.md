@@ -465,6 +465,10 @@ claude plugin install --scope user mempalace
 claude mcp add mempalace -- python -m mempalace.fastmcp_server
 ```
 
+> **Single-session only** — `claude mcp add` spawns a stdio-mode server. For multi-session
+> coordination (up to 6 parallel Claude Code sessions), use `mempalace serve` instead
+> (HTTP on port 8765, with session coordinators active). See [Session Coordination](#session-coordination) below.
+
 ### Session Coordination
 
 When running with multiple parallel Claude Code sessions (up to 6), the server
