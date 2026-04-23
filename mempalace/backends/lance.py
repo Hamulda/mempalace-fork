@@ -1161,7 +1161,7 @@ class LanceCollection(BaseCollection):
         documents: List[str],
         ids: List[str],
         metadatas: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
+    ) -> Optional[str]:
         if not documents:
             return
 
@@ -1251,21 +1251,24 @@ class LanceCollection(BaseCollection):
         get_query_cache().invalidate_collection(self._palace_path, self._collection_name)
 
         # ── FTS5 incremental sync ─────────────────────────────────────────
-        self._sync_fts5upsert(final_ids, final_docs, final_metas)
+        return self._sync_fts5upsert(final_ids, final_docs, final_metas)
 
     def _sync_fts5upsert(
         self,
         ids: list[str],
         documents: list[str],
         metadatas: list[dict],
-    ) -> None:
+    ) -> Optional[str]:
         """Synchronize written records into the FTS5 keyword index.
 
         Called after every successful upsert/add. Uses batch upsert for
         efficiency — one sqlite connection, one transaction.
+        Returns None on success, or a warning string on failure.
         Failures are silently suppressed (lexical index staleness is
         recoverable via rebuild_keyword_index).
         """
+        if not ids:
+            return None
         try:
             from ..lexical_index import KeywordIndex
             idx = KeywordIndex.get(self._palace_path)
@@ -1280,9 +1283,10 @@ class LanceCollection(BaseCollection):
                 for doc_id, doc, meta in zip(ids, documents, metadatas)
             ]
             idx.upsert_drawer_batch(entries)
-        except Exception:
+            return None
+        except Exception as e:
             logger.warning("FTS5 upsert failed for %d entries: %s — index may be stale", len(ids), e)
-            pass  # FTS5 staleness is recoverable; never crash write path
+            return "FTS5 index sync failed — keyword search may be stale; run rebuild_keyword_index()"
 
     # ── Read operations ───────────────────────────────────────────────────
 
@@ -1511,7 +1515,7 @@ class LanceCollection(BaseCollection):
         ids: Optional[List[str]] = None,
         where: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> None:
+    ) -> Optional[str]:
         if ids:
             if len(ids) == 1:
                 where_clause = f"id = '{ids[0]}'"
@@ -1550,8 +1554,7 @@ class LanceCollection(BaseCollection):
                         page_start += 500
 
                     self._table.delete(native_sql)
-                    self._sync_fts5delete(affected_ids)
-                    return
+                    return self._sync_fts5delete(affected_ids)
             except Exception:
                 pass  # Fall through to vector-search scan
 
@@ -1611,8 +1614,7 @@ class LanceCollection(BaseCollection):
                     )
 
                 if not matching_ids:
-                    self._sync_fts5delete([])
-                    return
+                    return self._sync_fts5delete([])
 
                 for i in range(0, len(matching_ids), batch_size):
                     for mid in matching_ids[i:i + batch_size]:
@@ -1629,23 +1631,25 @@ class LanceCollection(BaseCollection):
         # deleted_ids: explicit ids list when provided, otherwise the matching_ids
         # collected from the where-filter scan (empty list when where filtered to zero).
         deleted_ids = ids if ids else (matching_ids if where else [])
-        self._sync_fts5delete(deleted_ids)
+        return self._sync_fts5delete(deleted_ids)
 
-    def _sync_fts5delete(self, ids: list[str]) -> None:
+    def _sync_fts5delete(self, ids: list[str]) -> Optional[str]:
         """Remove deleted document IDs from the FTS5 keyword index.
 
-        Called after every successful delete. Failures are silently suppressed
+        Called after every successful delete. Returns None on success,
+        or a warning string on failure. Failures are silently suppressed
         — stale FTS5 entries are safe to recover via rebuild.
         """
         if not ids:
-            return
+            return None
         try:
             from ..lexical_index import KeywordIndex
             idx = KeywordIndex.get(self._palace_path)
             idx.delete_drawer_batch(ids)
-        except Exception:
+            return None
+        except Exception as e:
             logger.warning("FTS5 delete failed for %d entries: %s — index may be stale", len(ids), e)
-            pass  # FTS5 staleness is recoverable; never crash write path
+            return "FTS5 index sync failed — keyword search may be stale; run rebuild_keyword_index()"
 
     def count(self) -> int:
         try:

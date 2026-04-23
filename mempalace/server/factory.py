@@ -120,8 +120,29 @@ def create_server(settings=None, shared_server_mode=False):
     # ── Health check ────────────────────────────────────────────────────────
     @server.custom_route("/health", methods=["GET"], name="health")
     async def health_check(request):
-        from starlette.requests import Request
-        return JSONResponse({"status": "ok", "service": "mempalace"})
+        from ..version import __version__
+
+        # Collect lightweight fingerprint — no heavy queries
+        shared_mode = getattr(server, "_shared_server_mode", False)
+        transport = "http" if shared_mode else "stdio"
+        memory_pressure = "unknown"
+        try:
+            guard = MemoryGuard.get_if_running()
+            if guard is not None:
+                memory_pressure = guard.pressure.value
+        except Exception:
+            pass
+
+        return JSONResponse({
+            "status": "ok",
+            "service": "mempalace",
+            "version": __version__,
+            "transport": transport,
+            "shared_server_mode": shared_mode,
+            "palace_path": palace_path,
+            "backend": settings.db_backend,
+            "memory_pressure": memory_pressure,
+        })
 
     # ── Skills resource ─────────────────────────────────────────────────────
     try:

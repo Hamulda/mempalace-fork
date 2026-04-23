@@ -25,7 +25,7 @@ If `pip install mempalace` fails, try these fallbacks in order:
 1. Try `pip3 install mempalace`
 2. Try `python -m pip install mempalace` (or `python3 -m pip install mempalace`)
 3. If the error mentions missing build tools or compilation failures (commonly
-   from chromadb or its native dependencies):
+   from LanceDB or its native dependencies):
    - On Linux/macOS: suggest `sudo apt-get install build-essential python3-dev`
      (Debian/Ubuntu) or `xcode-select --install` (macOS)
    - On Windows: suggest installing Microsoft C++ Build Tools from
