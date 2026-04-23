@@ -570,6 +570,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         col = _get_collection()
         if not col:
             return _no_palace()
+        consolidate_intent_id = None
+        claim_warning = None
         try:
             results = col.query(
                 query_texts=[topic],
@@ -595,8 +597,6 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     })
                     seen.add(drawer_id)
             merged_count = 0
-            consolidate_intent_id = None
-            claim_warning = None
             if merge and len(duplicates) > 1:
                 # Enforce claim before any write (delete) in merge path.
                 if claim_mode is None and _is_shared_server_mode(server):

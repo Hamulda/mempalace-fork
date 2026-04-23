@@ -694,6 +694,58 @@ class TestSharedServerMode:
 # Test: consolidation write path (merge deletes)
 # ---------------------------------------------------------------------------
 
+def test_consolidate_query_exception_no_unbound_local_error(tmp_path):
+        """col.query() raises BEFORE consolidate_intent_id init → outer except must not raise UnboundLocalError."""
+        from unittest.mock import MagicMock
+        from mempalace.server._write_tools import register_write_tools
+        from mempalace.server._infrastructure import make_status_cache
+
+        tmp = str(tmp_path)
+        settings = _MockSettings(tmp)
+        settings.db_path = tmp
+        settings.palace_path = tmp
+
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._claims_manager = _MockClaimsManager()
+
+        fake_col = MagicMock()
+        fake_col.query.side_effect = RuntimeError("LanceDB connection refused")
+        # Also ensure col.get does NOT get called (early exception)
+        fake_col.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+
+        config = MagicMock()
+        config.palace_path = tmp
+
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        captured = {}
+        _orig_tool = server.tool
+        def capture(**kwargs):
+            def dec(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return dec
+        server.tool = capture
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _orig_tool
+
+        dummy_ctx = MagicMock()
+        tool = captured["mempalace_consolidate"]
+        # col.query() throws before consolidate_intent_id is initialized
+        result = tool(dummy_ctx, topic="any topic", merge=True, threshold=0.85, session_id="session-a")
+        # Must NOT raise UnboundLocalError — must return error dict
+        assert result.get("error") is not None
+        assert result.get("error_code") == "LANCE_WRITE_FAILED"
+        # consolidate_intent_id was None at exception time — rollback must be safe (no-op)
+        assert fake_col.get.call_count == 0  # batch get never called
+
+
 class TestConsolidateWritePath:
     """consolidate tool deletes duplicates — same claim semantics apply."""
 
