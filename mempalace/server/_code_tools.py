@@ -99,6 +99,25 @@ def register_code_tools(server, backend, config, settings):
         file_path: str | None = None,
         limit: int = 10,
     ) -> dict:
+        """
+        Search code using vector similarity within the palace.
+
+        Uses hybrid FTS5 + semantic search (reranked) to find code chunks
+        matching the query. Returns chunks with source location, language,
+        and symbol context.
+
+        Args:
+            query: Natural-language or keyword search query.
+            language: Optional language filter (e.g., "python", "javascript").
+            symbol_name: Optional symbol name to scope results to.
+            file_path: Optional file path to restrict results to that file.
+            limit: Maximum number of results to return (default 10).
+
+        Returns:
+            dict with query, language, chunks list, and count.
+            Each chunk contains: source_file, language, line_start, line_end,
+            symbol_name, chunk_kind, doc (content).
+        """
         return await code_search_async(
             query=query, palace_path=settings.db_path, n_results=limit,
             language=language, symbol_name=symbol_name, file_path=file_path,
@@ -106,6 +125,20 @@ def register_code_tools(server, backend, config, settings):
 
     @server.tool(timeout=settings.timeout_read)
     async def mempalace_auto_search(ctx: Context, query: str, limit: int = 10) -> dict:
+        """
+        Unified search that automatically routes to the best retrieval strategy.
+
+        Uses is_code_query heuristic to decide:
+        - Code query → mempalace_search_code (vector similarity)
+        - General query → hybrid_search_async (FTS5 + vector + KG)
+
+        Args:
+            query: Natural-language search query.
+            limit: Maximum number of results to return (default 10).
+
+        Returns:
+            Search results dict from the appropriate search strategy.
+        """
         return await code_search_async(
             query=query, palace_path=settings.db_path, n_results=limit,
         ) if is_code_query(query) else await hybrid_search_async(
@@ -120,6 +153,22 @@ def register_code_tools(server, backend, config, settings):
         line_end: int | None = None,
         context_lines: int = 5,
     ) -> dict:
+        """
+        Read a file with surrounding context lines.
+
+        Args:
+            file_path: Absolute path to the file to read.
+            line_start: Optional 1-based line number to center context around.
+            line_end: Optional 1-based end line (inclusive) for the focused range.
+            context_lines: Number of extra lines to include around the range
+                (default 5). Applied on both sides when line_start/line_end
+                are specified.
+
+        Returns:
+            dict with file_path, total_lines, range_start, range_end,
+            has_more_before, has_more_after, and lines list with
+            line_num and text for each line in the slice.
+        """
         p = Path(file_path).expanduser().resolve()
         if not p.exists():
             return {"error": f"File not found: {file_path}"}

@@ -1616,11 +1616,14 @@ class LanceCollection(BaseCollection):
                 if not matching_ids:
                     return self._sync_fts5delete([])
 
+                # Batch delete using WHERE id IN (...) instead of per-ID deletes
                 for i in range(0, len(matching_ids), batch_size):
-                    for mid in matching_ids[i:i + batch_size]:
-                        self._write_with_retry(
-                            lambda i=mid: self._table.delete(f"id = '{i}'")
-                        )
+                    batch = matching_ids[i:i + batch_size]
+                    if len(batch) == 1:
+                        where_clause = f"id = '{batch[0]}'"
+                    else:
+                        where_clause = "id IN (" + ", ".join(repr(j) for j in batch) + ")"
+                    self._write_with_retry(lambda wc=where_clause: self._table.delete(wc))
             except RuntimeError:
                 raise
             except Exception as e:

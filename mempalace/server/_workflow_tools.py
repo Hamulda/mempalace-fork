@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
 
 from fastmcp import Context
 
@@ -36,49 +34,7 @@ from ._session_tools import _require_session_id, _optional_session_id, _get_sess
 # ────────────────────────────────────────────────────────────────────────────────
 # Project root resolution — canonical source of truth
 # ────────────────────────────────────────────────────────────────────────────────
-
-def _find_git_root(start_path: str) -> str | None:
-    """
-    Find the git repository root by walking up from start_path.
-
-    Returns the containing git repo root, or None if no .git directory found.
-    This is the canonical way to derive project_root from a file path — no env needed.
-    """
-    try:
-        current = Path(start_path).expanduser().resolve()
-        if current.is_file():
-            current = current.parent
-        # Walk up to find .git
-        for parent in [current] + list(current.parents):
-            if (parent / ".git").is_dir():
-                return str(parent)
-    except Exception:
-        pass
-    return None
-
-
-def _resolve_project_root(explicit: str | None, palace_path: str, file_path: str | None = None) -> str | None:
-    """
-    Resolve project_root with explicit priority and deterministic fallback.
-
-    Resolution order:
-    1. explicit parameter (caller-provided, most specific)
-    2. git root from file_path (when editing a known file)
-    3. git root from palace_path (palace lives inside a project)
-    4. None (caller handles missing project context gracefully)
-
-    No env dependency — project_root is always derived or explicitly provided.
-    """
-    if explicit:
-        return explicit
-    if file_path:
-        git_root = _find_git_root(file_path)
-        if git_root:
-            return git_root
-    git_root = _find_git_root(palace_path)
-    if git_root:
-        return git_root
-    return None
+from ._project_root import _find_git_root, _resolve_project_root
 
 
 # ────────────────────────────────────────────────────────────────────────────────

@@ -13,27 +13,13 @@ Phase 6 enrichment:
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Optional
 
 from .claims_manager import ClaimsManager
 from .handoff_manager import HandoffManager
 from .decision_tracker import DecisionTracker
 from .session_registry import SessionRegistry
-
-
-def _find_git_root(start_path: str) -> str | None:
-    """Find git repo root by walking up from start_path. No env dependency."""
-    try:
-        current = Path(start_path).expanduser().resolve()
-        if current.is_file():
-            current = current.parent
-        for parent in [current] + list(current.parents):
-            if (parent / ".git").is_dir():
-                return str(parent)
-    except Exception:
-        pass
-    return None
+from .server._project_root import _find_git_root
 
 
 def build_wakeup_context(

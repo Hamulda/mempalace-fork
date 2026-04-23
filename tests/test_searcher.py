@@ -360,9 +360,9 @@ class TestHybridSearch:
         assert result["filters"]["priority_lte"] == 7
 
     def test_search_memories_uses_cache(self, palace_path, seeded_collection):
-        """search_memories calls get_backend (not mocked, real backend)."""
-        # This test verifies the cache accessor exists and is callable.
-        # Full cache behavior tested via integration in other tests.
+        """search_memories uses the canonical query cache."""
+        # Verifies the cache accessor exists and is callable (was: `cache is not None`).
+        # The actual cache-hit behavior is tested via integration in other tests.
         import mempalace.searcher as sr
         from mempalace.query_cache import get_query_cache
         cache = get_query_cache()
@@ -638,25 +638,30 @@ class TestRepoRelPath:
         assert "repo_rel_path" not in result[0]
 
     def test_search_memories_includes_repo_rel_path(self, palace_path, seeded_collection):
-        """search_memories results should include repo_rel_path when applicable."""
-        from mempalace.searcher import search_memories
-        from mempalace.backends import get_backend
+        """_add_repo_rel_path computes relative paths from a common project prefix."""
+        from mempalace.searcher import _add_repo_rel_path, _compute_repo_rel_path
 
-        backend = get_backend("chroma")
-        col = backend.get_collection(palace_path, "mempalace_drawers")
-        col.add(
-            ids=["repo_rel_test"],
-            documents=["test document for repo rel path"],
-            metadatas=[{
-                "wing": "repo", "room": "code", "is_latest": True,
-                "source_file": "/test_project/src/main.py"
-            }],
-        )
+        # Unit test the helper directly — avoids ONNX embedding slowness
+        hits = [
+            {"source_file": "/myproject/src/module_a.py"},
+            {"source_file": "/myproject/src/module_b.py"},
+            {"source_file": "/myproject/src/module_c.py"},
+        ]
+        source_files = [h["source_file"] for h in hits]
 
-        result = search_memories("repo rel path", palace_path, n_results=5)
-        hits = result.get("results", [])
-        if hits and hits[0].get("source_file"):
-            # repo_rel_path should be present (or absent if no common prefix)
-            # Just verify the field exists or doesn't as appropriate
-            assert "repo_rel_path" in hits[0] or "repo_rel_path" not in hits[0]
+        result = _add_repo_rel_path(hits, source_files)
+
+        # All three share /myproject/src as common prefix → repo_rel_path must be added
+        for h in result:
+            assert "repo_rel_path" in h, f"Expected repo_rel_path in {h}"
+            # Path must be relative (not absolute)
+            assert not h["repo_rel_path"].startswith("/"), \
+                f"repo_rel_path must be relative, got: {h['repo_rel_path']}"
+            # Must be just the filename (common prefix /myproject/src stripped)
+            assert h["repo_rel_path"] in ("module_a.py", "module_b.py", "module_c.py"), \
+                f"Unexpected rel path: {h['repo_rel_path']}"
+
+        # Also verify _compute_repo_rel_path directly
+        assert _compute_repo_rel_path("/myproject/src/module_a.py", "/myproject/src") == "module_a.py"
+        assert _compute_repo_rel_path("/myproject/src/module_b.py", "/myproject/src") == "module_b.py"
 

@@ -11,20 +11,8 @@ from fastmcp import Context
 from ..searcher import _compute_repo_rel_path
 
 
-# ── Project root resolution (no env dependency) ───────────────────────────────
-
-def _find_git_root(start_path: str) -> str | None:
-    """Find git repo root by walking up from start_path. No env dependency."""
-    try:
-        current = Path(start_path).expanduser().resolve()
-        if current.is_file():
-            current = current.parent
-        for parent in [current] + list(current.parents):
-            if (parent / ".git").is_dir():
-                return str(parent)
-    except Exception:
-        pass
-    return None
+# ── Project root resolution (imported from canonical source) ───────────────────
+from ._project_root import _find_git_root
 
 
 def _make_path_result(file_path: str, project_root: str) -> dict:

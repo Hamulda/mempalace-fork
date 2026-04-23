@@ -919,18 +919,26 @@ def process_file(
                 if sid:
                     superseded_ids.add(sid)
 
-    # Tombstone every old chunk that was NOT superseded
+    # Tombstone every old chunk that was NOT superseded — single batch upsert
+    tombstone_ids, tombstone_docs, tombstone_metas = [], [], []
     for old_hash, old_list in old_chunks_by_hash.items():
         for old_id, old_meta in old_list:
             if old_id not in superseded_ids:
-                try:
-                    collection.upsert(
-                        documents=[old_meta.get("source_content", old_meta.get("document", ""))],
-                        ids=[old_id],
-                        metadatas=[{"is_latest": False}]
-                    )
-                except Exception:
-                    pass  # Best-effort tombstone
+                tombstone_ids.append(old_id)
+                tombstone_docs.append(
+                    old_meta.get("source_content", old_meta.get("document", ""))
+                )
+                tombstone_metas.append({"is_latest": False})
+
+    if tombstone_ids:
+        try:
+            collection.upsert(
+                documents=tombstone_docs,
+                ids=tombstone_ids,
+                metadatas=tombstone_metas,
+            )
+        except Exception:
+            pass  # Best-effort tombstone
 
     return len(documents), room
 

@@ -9,7 +9,6 @@ Verifies that /health returns the expected operational fingerprint:
 
 import os
 import pytest
-from unittest.mock import MagicMock
 
 pytest.importorskip("lancedb", reason="LanceDB required")
 
@@ -62,7 +61,7 @@ class TestHealthEndpointFingerprint:
             lance_module._embed_texts = original
 
     def test_health_response_keys(self, temp_palace):
-        """Health response dict has all required fingerprint keys."""
+        """Health endpoint returns all required fingerprint keys in real response."""
         os.environ["MEMPALACE_COALESCE_MS"] = "0"
         os.environ["MEMPALACE_PALACE_PATH"] = temp_palace
         os.environ["MEMPALACE_DB_BACKEND"] = "lance"
@@ -73,50 +72,61 @@ class TestHealthEndpointFingerprint:
 
         from mempalace.server.factory import create_server
         from starlette.requests import Request
-        from unittest.mock import AsyncMock
-        import asyncio
+        import asyncio, json
 
         try:
             server = create_server(shared_server_mode=True)
 
-            # Collect the registered custom routes
-            routes = []
-            server.custom_route("/health", methods=["GET"])(lambda: None)
+            # Extract the actual health_check handler from registered routes
+            health_handler = None
+            for r in server._additional_http_routes:
+                if getattr(r, "name", None) == "health":
+                    health_handler = getattr(r, "endpoint", None)
+                    break
+            assert health_handler is not None, "health route not found"
 
-            # Build a mock request
-            mock_request = MagicMock(spec=Request)
-            mock_request.method = "GET"
-            mock_request.url = "http://localhost/health"
-
-            # We can't easily call the FastMCP route directly, so instead
-            # verify the logic by calling the health_check function directly.
-            # First, let's verify the health response dict structure by testing
-            # the underlying logic that health_check uses.
-            from mempalace.version import __version__
-            from mempalace.settings import MemPalaceSettings
-
-            shared_mode = getattr(server, "_shared_server_mode", False)
-            transport = "http" if shared_mode else "stdio"
-            settings = MemPalaceSettings()
-
-            expected_keys = {
-                "status": "ok",
-                "service": "mempalace",
-                "version": __version__,
-                "transport": transport,
-                "shared_server_mode": shared_mode,
-                "palace_path": settings.palace_path,
-                "backend": settings.db_backend,
+            # Construct a request scope for the handler
+            scope = {
+                "type": "http",
+                "method": "GET",
+                "path": "/health",
+                "query_string": b"",
+                "headers": [],
+                "root_path": "",
+                "server": ("testclient", 80),
             }
 
-            for key in expected_keys:
-                assert key in expected_keys, f"Missing key: {key}"
+            async def mock_receive():
+                return {"type": "http.request", "body": b""}
 
-            # Verify transport correctly reflects shared mode
-            assert transport == "http"
+            # Call the actual handler — it returns a JSONResponse directly
+            async def call_handler():
+                request = Request(scope, mock_receive)
+                return await health_handler(request)
 
-            # Verify version matches
-            assert __version__ == "3.1.0"
+            response = asyncio.run(call_handler())
+
+            # Parse the real JSON response body
+            result = json.loads(response.body)
+
+            # Verify all required fingerprint keys are present in the REAL response
+            required_keys = {
+                "status", "service", "version", "transport",
+                "shared_server_mode", "palace_path", "backend",
+            }
+            assert isinstance(result, dict), "health endpoint must return a dict"
+            for key in required_keys:
+                assert key in result, f"Missing required fingerprint key: {key}"
+
+            # Verify values make sense
+            assert result["status"] == "ok"
+            assert result["service"] == "mempalace"
+            assert result["transport"] == "http"
+            assert isinstance(result["version"], str)
+            assert len(result["version"].split(".")) == 3, "version must be semver"
+            assert result["shared_server_mode"] is True
+            assert result["palace_path"] == temp_palace
+            assert result["backend"] == "lance"
         finally:
             lance_module._embed_texts = original
 
