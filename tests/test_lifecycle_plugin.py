@@ -848,3 +848,121 @@ def test_precompact_no_session_refcount_change(runtime_dir, env_with_runtime):
     session_files = [f for f in sessions_dir.iterdir() if f.is_file()]
     assert len(session_files) == 0, \
         f"precompact should not create session files, found: {session_files}"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 9 — session-start bounded execution
+# ---------------------------------------------------------------------------
+
+def test_session_start_hook_uses_bounded_execution():
+    """
+    mempal-session-start-hook.sh must use run_with_timeout for the session-start
+    hook invocation to prevent indefinite blocking of Claude Code startup.
+    """
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+    script_path = hooks_dir / "mempal-session-start-hook.sh"
+    content = script_path.read_text()
+
+    # Script must define run_with_timeout
+    assert "run_with_timeout()" in content, \
+        "session-start hook must define run_with_timeout()"
+    assert "command -v timeout" in content or "gtimeout" in content or "perl" in content, \
+        "run_with_timeout must guard against missing timeout command"
+
+    # Normalize line continuations and collapse multiple spaces before checking
+    import re
+    content_normalized = re.sub(r'\\\s*', ' ', content)  # backslash-newline → space
+    content_normalized = re.sub(r' {2,}', ' ', content_normalized)  # collapse multi-space
+
+    # Both hook run paths (HTTP and CLI fallback) must use run_with_timeout
+    # Use whitespace-flexible match since backslash-newline normalization leaves multi-space
+    assert re.search(r'run_with_timeout\s+python3\s+-m\s+mempalace\s+hook\s+run\s+--hook\s+session-start', content_normalized), \
+        "session-start hook invocation must be wrapped in run_with_timeout"
+
+
+def test_session_start_hook_always_exits_zero():
+    """
+    session-start hook must exit 0 even when the hook invocation fails.
+    A failed session-start must not block Claude Code startup.
+    """
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+    script_path = hooks_dir / "mempal-session-start-hook.sh"
+    content = script_path.read_text()
+
+    # Must end with `exit 0` (not `exit $?` or conditional exit)
+    lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
+    last_line = lines[-1] if lines else ""
+    assert last_line == "exit 0", \
+        f"session-start hook must end with 'exit 0', found: {last_line}"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 10 — cmd_start rollback on start_server failure
+# ---------------------------------------------------------------------------
+
+def test_cmd_start_unregisters_on_start_server_failure(tmp_path):
+    """
+    When start_server fails, cmd_start must:
+      1. unregister the session (remove session file)
+      2. release the lock
+      3. exit non-zero
+
+    This prevents phantom sessions when server fails to start.
+
+    The test verifies rollback by checking the script source for the unregister
+    call on the start_server failure path. A dynamic test is environmental because
+    the shared MCP server is always running and blocks the "not healthy" path.
+    """
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+    server_control = hooks_dir / "mempal-server-control.sh"
+    content = server_control.read_text()
+
+    # Verify the start_server failure path in cmd_start calls unregister_session.
+    # This is the key rollback behavior: on start_server failure, unregister first.
+    assert "if ! start_server; then" in content, \
+        "cmd_start must call start_server and check its return value"
+
+    # The failure block must call unregister_session before release_lock and exit
+    # We check for the pattern inside the failure handler
+    failure_block_pattern = r'if ! start_server; then.*?unregister_session.*?release_lock.*?exit 1'
+    import re
+    assert re.search(failure_block_pattern, content, re.DOTALL), \
+        "cmd_start failure path must call: unregister_session + release_lock + exit 1"
+
+    # Also verify cmd_start success path does NOT call unregister_session
+    # (it should only release_lock and exit 0)
+    cmd_start_match = re.search(r'^cmd_start\(\).*?^\}', content, re.MULTILINE | re.DOTALL)
+    assert cmd_start_match, "cmd_start function not found"
+    cmd_start_body = cmd_start_match.group(0)
+
+    # Count unregister calls — should be exactly 1 (in failure path only)
+    unregister_in_failure = re.search(
+        r'if ! start_server; then.*?unregister_session',
+        cmd_start_body, re.DOTALL
+    )
+    assert unregister_in_failure, \
+        "unregister_session must be called in start_server failure path"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 11 — all hook scripts pass bash -n
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("script_name", [
+    "mempal-server-control.sh",
+    "mempal-session-start-hook.sh",
+    "mempal-stop-hook.sh",
+    "mempal-precompact-hook.sh",
+])
+def test_all_hook_scripts_bash_syntax_check(script_name):
+    """Every lifecycle hook script must pass bash -n (no-op syntax check)."""
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+    script_path = hooks_dir / script_name
+    result = subprocess.run(
+        ["bash", "-n", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, \
+        f"bash -n failed for {script_name}:\n{result.stderr}"

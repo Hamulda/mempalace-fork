@@ -414,6 +414,7 @@ cmd_start() {
         fi
         if ! start_server; then
             log_msg "ERROR: start failed to spawn server"
+            unregister_session "$session_id"
             release_lock "$lock_token"
             exit 1
         fi

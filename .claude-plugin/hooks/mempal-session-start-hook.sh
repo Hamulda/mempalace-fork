@@ -7,10 +7,34 @@
 # 3. Calls mempalace hook run via HTTP (with CLI fallback)
 #===============================================================================
 
-set -euo pipefail
+set -uo pipefail  # no -e: hook failure must not block Claude Code startup
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_CONTROL="$SCRIPT_DIR/mempal-server-control.sh"
+
+#-------------------------------------------------------------------------------
+# run_with_timeout — bash 3.2/macOS-compatible timeout wrapper (30s)
+#-------------------------------------------------------------------------------
+run_with_timeout() {
+    local cmd="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 30s "$cmd" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout 30s "$cmd" "$@"
+    else
+        # macOS fallback: use perl alarm (works on all Unix)
+        perl -e '
+use strict;
+$SIG{ALRM} = sub {
+    print STDERR "[session-start-hook] timeout after 30s\n";
+    exit(124);
+};
+alarm 30;
+exec(@ARGV) or die "exec failed: $!";
+' -- "$cmd" "$@"
+    fi
+}
 
 #-------------------------------------------------------------------------------
 # Derive SESSION_ID — reads stdin once, uses raw content for fallback hash.
@@ -85,14 +109,19 @@ fi
 MCP_HOST="http://127.0.0.1:8765"
 
 if curl -sf --max-time 1 "$MCP_HOST/health" > /dev/null 2>&1; then
-    python3 -m mempalace hook run \
+    run_with_timeout python3 -m mempalace hook run \
         --hook session-start --harness claude-code --transport http <<< "$INPUT" \
         && EXIT_CODE=0 || EXIT_CODE=$?
 else
     echo "WARNING: MCP server not reachable, falling back to CLI transport" >&2
-    python3 -m mempalace hook run \
+    run_with_timeout python3 -m mempalace hook run \
         --hook session-start --harness claude-code <<< "$INPUT" \
         && EXIT_CODE=0 || EXIT_CODE=$?
+fi
+
+# A failed session-start hook must NOT block Claude Code startup
+if [[ "${EXIT_CODE:-0}" -ne 0 ]]; then
+    echo "WARNING: session-start hook failed (exit=$EXIT_CODE), continuing without memory injection" >&2
 fi
 
 exit 0
