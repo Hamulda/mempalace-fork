@@ -4,8 +4,8 @@ LanceDB backend for MemPalace.
 Multi-version concurrency control (MVCC) enables 6+ parallel Claude Code
 sessions writing to the same palace without SQLite_BUSY lock conflicts.
 
-Hybrid search: combines vector similarity + full-text search (FTS)
-via LanceDB's native query engine.
+LanceDB stores documents and vector embeddings.  SQLite FTS5 via the
+KeywordIndex provides canonical full-text (BM25/lexical) search.
 
 Embedding: fastembed BAAI/bge-small-en-v1.5 (256 dims, ~33MB RAM) for the
 in-process fallback, or ModernBERT-embed-base 4-bit MLX (~85MB RAM) when the

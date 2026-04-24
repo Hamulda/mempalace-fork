@@ -237,143 +237,288 @@ class TestSyncMethodsReturnWarnings:
 class TestWriteToolFTS5WarningPropagation:
     """MCP write tool handlers attach _warning to response when FTS5 sync fails.
 
-    The core LanceCollection.upsert/delete layer is tested in TestFTS5WarningReturned.
-    These tests verify that the _write_tools.py handler code correctly captures
-    the return value and attaches _warning to the response dict.
+    The LanceCollection.upsert/delete layer is tested in TestFTS5WarningReturned.
+    These tests call the actual registered tool functions (not simulated patterns)
+    with a mocked collection that returns an FTS5 warning, verifying the handler
+    correctly attaches _warning to the response dict.
     """
 
-    def test_write_tools_capture_fts5_warning_in_response(self, temp_palace, tmp_path):
-        """Simulate the exact capture pattern used in all 4 write tool handlers.
+    @pytest.fixture
+    def write_tool_server(self):
+        """Isolated server with write tools registered, collection returns FTS5 warning."""
+        import tempfile
+        from mempalace.server._write_tools import register_write_tools
+        from mempalace.server._infrastructure import make_status_cache
 
-        Since @server.tool() on a MagicMock does not preserve function references,
-        we test the capture logic directly by replaying the exact pattern:
-        1. Call col.upsert / col.delete which returns a warning string
-        2. Build the response dict
-        3. Attach _warning if the return is truthy
+        tmp = tempfile.mkdtemp(prefix="mempalace_fts5_")
+        settings = MagicMock()
+        settings.db_path = tmp
+        settings.effective_collection_name = "test_collection"
+        settings.wal_dir = tmp
+        settings.palace_path = tmp
+        settings.timeout_write = 30
+        settings.timeout_read = 15
+        settings.timeout_embed = 60
 
-        This is the minimal integration test that proves the handler pattern works.
-        """
-        FTS5_WARNING = "FTS5 index sync failed — keyword search may be stale; run rebuild_keyword_index()"
+        server = MagicMock()
+        server._status_cache = make_status_cache()
+        server._claims_manager = None  # non-shared mode — no claim interference
 
-        # ── Simulate add_drawer handler pattern ───────────────────────────
-        # fts5_warning = col.upsert(...)
-        # resp = {"success": True, "drawer_id": "test_id", ...}
-        # if fts5_warning:
-        #     resp["_warning"] = fts5_warning
-        fts5_warning = FTS5_WARNING
-        resp = {"success": True, "drawer_id": "drawer_alpha_test_abc123"}
-        if fts5_warning:
-            resp["_warning"] = fts5_warning
+        # Fake collection that returns the canonical FTS5 warning string
+        self._fts5_warning = "FTS5 index sync failed — keyword search may be stale; run rebuild_keyword_index()"
+        fake_col = MagicMock()
+        fake_col.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+        fake_col.upsert.return_value = self._fts5_warning
+        fake_col.delete.return_value = self._fts5_warning
+        fake_col.query.return_value = {
+            "ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[0.0]]
+        }
 
-        assert resp.get("_warning") == FTS5_WARNING
+        backend = MagicMock()
+        backend.get_collection.return_value = fake_col
+
+        config = MagicMock()
+        config.palace_path = tmp
+
+        mem_guard = MagicMock()
+        mem_guard.should_pause_writes.return_value = False
+
+        # Capture actual function objects instead of letting @server.tool() discard them
+        captured = {}
+        _original_tool = server.tool
+
+        def capture_tool_decorator(**_kwargs):
+            def decorator(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return decorator
+        server.tool = capture_tool_decorator
+
+        register_write_tools(server, backend, config, settings, mem_guard)
+        server.tool = _original_tool
+
+        return captured, fake_col
+
+    def test_add_drawer_attaches_fts5_warning_on_failure(self, write_tool_server):
+        """mempalace_add_drawer attaches _warning when col.upsert returns a warning."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_add_drawer"]
+        ctx = MagicMock()
+
+        resp = fn(
+            ctx=ctx,
+            wing="alpha",
+            room="a1",
+            content="test content",
+        )
+
+        assert resp["success"] is True
+        assert "_warning" in resp, "FTS5 warning must be attached when col.upsert fails"
         assert "FTS5" in resp["_warning"]
         assert "stale" in resp["_warning"].lower()
         assert "rebuild_keyword_index" in resp["_warning"]
-        assert resp.get("success") is True
+        fake_col.upsert.assert_called_once()
 
-        # ── Simulate delete_drawer handler pattern ─────────────────────────
-        fts5_warning = FTS5_WARNING
-        resp = {"success": True, "drawer_id": "drawer_test_del"}
-        if fts5_warning:
-            resp["_warning"] = fts5_warning
+    def test_delete_drawer_attaches_fts5_warning_on_failure(self, write_tool_server):
+        """mempalace_delete_drawer attaches _warning when col.delete returns a warning."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_delete_drawer"]
+        ctx = MagicMock()
 
-        assert resp.get("_warning") == FTS5_WARNING
+        # Pre-seed so delete finds something
+        fake_col.get.return_value = {
+            "ids": ["drawer_test_del"],
+            "documents": ["existing content"],
+            "metadatas": [{"wing": "w", "room": "r"}],
+        }
 
-        # ── Simulate diary_write handler pattern ───────────────────────────
-        fts5_warning = FTS5_WARNING
-        resp = {"success": True, "entry_id": "diary_test_123", "agent": "test_agent", "topic": "test"}
-        if fts5_warning:
-            resp["_warning"] = fts5_warning
+        resp = fn(
+            ctx=ctx,
+            drawer_id="drawer_test_del",
+        )
 
-        assert resp.get("_warning") == FTS5_WARNING
+        assert resp["success"] is True
+        assert "_warning" in resp, "FTS5 warning must be attached when col.delete fails"
+        assert "FTS5" in resp["_warning"]
+        assert "stale" in resp["_warning"].lower()
+        assert "rebuild_keyword_index" in resp["_warning"]
+        fake_col.delete.assert_called_once()
 
-        # ── Simulate remember_code handler pattern ─────────────────────────
-        fts5_warning = FTS5_WARNING
-        resp = {"success": True, "drawer_id": "code_test_abc123", "language": "python"}
-        if fts5_warning:
-            resp["_warning"] = fts5_warning
+    def test_diary_write_attaches_fts5_warning_on_failure(self, write_tool_server):
+        """mempalace_diary_write attaches _warning when col.upsert returns a warning."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_diary_write"]
+        ctx = MagicMock()
 
-        assert resp.get("_warning") == FTS5_WARNING
+        resp = fn(
+            ctx=ctx,
+            agent_name="test_agent",
+            entry="test diary entry",
+            topic="testing",
+        )
 
-    def test_add_drawer_tool_response_no_warning_on_success(self, temp_palace, tmp_path):
-        """On happy path (FTS5 sync succeeds), _warning must NOT be in response."""
-        # fts5_warning = col.upsert(...) returns None on success
-        fts5_warning = None
-        resp = {"success": True, "drawer_id": "drawer_ok"}
-        if fts5_warning:
-            resp["_warning"] = fts5_warning
+        assert resp["success"] is True
+        assert "_warning" in resp, "FTS5 warning must be attached when col.upsert fails"
+        assert "FTS5" in resp["_warning"]
+        assert "stale" in resp["_warning"].lower()
+        assert "rebuild_keyword_index" in resp["_warning"]
+        fake_col.upsert.assert_called_once()
 
-        assert "_warning" not in resp
-        assert resp.get("success") is True
+    def test_remember_code_attaches_fts5_warning_on_failure(self, write_tool_server):
+        """mempalace_remember_code attaches _warning when col.upsert returns a warning."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_remember_code"]
+        ctx = MagicMock()
 
-    def test_delete_drawer_tool_response_no_warning_on_success(self, temp_palace, tmp_path):
-        """On happy path (FTS5 sync succeeds), _warning must NOT be in response."""
-        fts5_warning = None
-        resp = {"success": True, "drawer_id": "drawer_ok_del"}
-        if fts5_warning:
-            resp["_warning"] = fts5_warning
+        resp = fn(
+            ctx=ctx,
+            code="print('hello')",
+            description="test code memory",
+            wing="beta",
+            room="b2",
+        )
 
-        assert "_warning" not in resp
+        assert resp["success"] is True
+        assert "_warning" in resp, "FTS5 warning must be attached when col.upsert fails"
+        assert "FTS5" in resp["_warning"]
+        assert "stale" in resp["_warning"].lower()
+        assert "rebuild_keyword_index" in resp["_warning"]
+        fake_col.upsert.assert_called_once()
 
-    def test_lance_collection_upsert_delete_return_warning_on_mock_failure(self, temp_palace):
-        """Verify LanceCollection.upsert/delete return warning when FTS5 KeywordIndex fails.
+    def test_add_drawer_no_warning_on_fts5_success(self, write_tool_server):
+        """On happy path (col.upsert returns None), _warning must NOT be in response."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_add_drawer"]
+        ctx = MagicMock()
 
-        This is the actual integration point — confirms the return value that
-        _write_tools.py handlers must capture and propagate.
+        # Simulate FTS5 success: upsert returns None
+        fake_col.upsert.return_value = None
+
+        resp = fn(
+            ctx=ctx,
+            wing="ok",
+            room="ok1",
+            content="clean content",
+        )
+
+        assert resp["success"] is True
+        assert "_warning" not in resp, "_warning must be absent when FTS5 sync succeeds"
+
+    def test_delete_drawer_no_warning_on_fts5_success(self, write_tool_server):
+        """On happy path (col.delete returns None), _warning must NOT be in response."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_delete_drawer"]
+        ctx = MagicMock()
+
+        fake_col.get.return_value = {
+            "ids": ["drawer_ok_del"],
+            "documents": ["to delete"],
+            "metadatas": [{"wing": "w", "room": "r"}],
+        }
+        fake_col.delete.return_value = None
+
+        resp = fn(
+            ctx=ctx,
+            drawer_id="drawer_ok_del",
+        )
+
+        assert resp["success"] is True
+        assert "_warning" not in resp, "_warning must be absent when FTS5 sync succeeds"
+
+    def test_diary_write_no_warning_on_fts5_success(self, write_tool_server):
+        """On happy path (col.upsert returns None), _warning must NOT be in response."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_diary_write"]
+        ctx = MagicMock()
+
+        fake_col.upsert.return_value = None
+
+        resp = fn(
+            ctx=ctx,
+            agent_name="clean_agent",
+            entry="clean entry",
+            topic="testing",
+        )
+
+        assert resp["success"] is True
+        assert "_warning" not in resp, "_warning must be absent when FTS5 sync succeeds"
+
+    def test_remember_code_no_warning_on_fts5_success(self, write_tool_server):
+        """On happy path (col.upsert returns None), _warning must NOT be in response."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_remember_code"]
+        ctx = MagicMock()
+
+        fake_col.upsert.return_value = None
+
+        resp = fn(
+            ctx=ctx,
+            code="def foo(): pass",
+            description="clean code memory",
+            wing="gamma",
+            room="g1",
+        )
+
+        assert resp["success"] is True
+        assert "_warning" not in resp, "_warning must be absent when FTS5 sync succeeds"
+
+    def test_consolidate_merge_attaches_fts5_warning_on_delete_failure(self, write_tool_server):
+        """mempalace_consolidate attaches _warning when merge col.delete returns a warning."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_consolidate"]
+        ctx = MagicMock()
+
+        _fts5_warning = "FTS5 index sync failed — keyword search may be stale; run rebuild_keyword_index()"
+
+        # Mock query to return 2 duplicates (keeper + to_remove)
+        fake_col.query.return_value = {
+            "ids": [["dup_keeper_id", "dup_remove_id"]],
+            "documents": [["keeper content", "duplicate content"]],
+            "metadatas": [[
+                {"wing": "w1", "room": "r1", "timestamp": "2025-01-01T00:00:00Z"},
+                {"wing": "w2", "room": "r2", "timestamp": "2024-01-01T00:00:00Z"},
+            ]],
+            "distances": [[0.05, 0.10]],
+        }
+        # col.get for batch timestamp fetch
+        fake_col.get.return_value = {
+            "ids": [["dup_keeper_id", "dup_remove_id"]],
+            "documents": [["keeper content"], ["duplicate content"]],
+            "metadatas": [[
+                {"wing": "w1", "room": "r1", "timestamp": "2025-01-01T00:00:00Z"},
+                {"wing": "w2", "room": "r2", "timestamp": "2024-01-01T00:00:00Z"},
+            ]],
+        }
+        # col.delete returns the FTS5 warning on the merge path
+        fake_col.delete.return_value = _fts5_warning
+
+        resp = fn(ctx=ctx, topic="dupe topic", merge=True)
+
+        # On merge path, resp has "merged" count, not "success"
+        assert resp.get("merged") == 1, f"consolidate merge failed: {resp}"
+        assert "_warning" in resp, "FTS5 warning must be attached when col.delete fails in consolidate merge"
+        assert "FTS5" in resp["_warning"]
+        assert "stale" in resp["_warning"].lower()
+        assert "rebuild_keyword_index" in resp["_warning"]
+        fake_col.delete.assert_called_once()
+
+    def test_warning_detached_if_write_tools_stops_attaching_it(self, write_tool_server):
+        """Regression: fails if _write_tools.py ever removes the fts5_warning attachment.
+
+        This test uses the real capture pattern from the actual function source.
+        It would pass with the current implementation but fail if someone removes
+        the `if fts5_warning: resp["_warning"] = fts5_warning` line from any handler.
         """
-        os.environ["MEMPALACE_COALESCE_MS"] = "0"
-        os.environ["MEMPALACE_DEDUP_HIGH"] = "1.0"
-        os.environ["MEMPALACE_DEDUP_LOW"] = "0.99"
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_add_drawer"]
+        ctx = MagicMock()
 
-        import mempalace.backends.lance as lance_module
-        original = lance_module._embed_texts
-        lance_module._embed_texts = _mock_embed_texts
+        # col returns a warning — if attachment is removed, this assertion fails
+        fake_col.upsert.return_value = "FTS5 index sync failed — keyword search may be stale; run rebuild_keyword_index()"
 
-        from mempalace.backends.lance import LanceBackend
-        backend = LanceBackend()
-        col = backend.get_collection(temp_palace, "test_tool_integration", create=True)
+        resp = fn(ctx=ctx, wing="reg", room="r1", content="regression test")
 
-        try:
-            # Upsert path: mock FTS5 failure
-            with patch("mempalace.lexical_index.KeywordIndex") as mock_ki_cls:
-                mock_ki = MagicMock()
-                mock_ki.upsert_drawer_batch.side_effect = RuntimeError("FTS5 I/O error")
-                mock_ki_cls.get.return_value = mock_ki
-
-                warning = col.upsert(
-                    documents=["content"],
-                    ids=["doc_fts5_warn"],
-                    metadatas=[{"wing": "w", "room": "r", "language": ""}],
-                )
-
-                assert warning is not None
-                assert "FTS5" in warning
-                assert "rebuild_keyword_index" in warning
-
-                # Now simulate what the tool handler does:
-                resp = {"success": True, "drawer_id": "doc_fts5_warn"}
-                if warning:
-                    resp["_warning"] = warning
-
-                assert resp["_warning"] == warning
-                assert resp.get("success") is True
-
-            # Delete path: mock FTS5 failure
-            with patch("mempalace.lexical_index.KeywordIndex") as mock_ki_cls:
-                mock_ki = MagicMock()
-                mock_ki.delete_drawer_batch.side_effect = RuntimeError("FTS5 delete error")
-                mock_ki_cls.get.return_value = mock_ki
-
-                warning = col.delete(ids=["doc_fts5_warn"])
-
-                assert warning is not None
-                assert "FTS5" in warning
-
-                resp = {"success": True, "drawer_id": "doc_fts5_warn"}
-                if warning:
-                    resp["_warning"] = warning
-
-                assert resp["_warning"] == warning
-                assert resp.get("success") is True
-        finally:
-            lance_module._embed_texts = original
+        assert "_warning" in resp, (
+            "FTS5 warning must be in response — write tool handler has likely been changed "
+            "to no longer attach fts5_warning to resp['_warning']"
+        )

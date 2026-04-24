@@ -640,6 +640,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                 keeper = duplicates_with_ts[0]
                 to_remove = duplicates_with_ts[1:]
                 consolidate_failed = False
+                fts5_warning = None
                 if to_remove:
                     try:
                         wal_log(
@@ -647,7 +648,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                             {"deleted_ids": [d["id"] for d in to_remove], "topic": topic, "keeper_id": keeper["id"]},
                             wal_file=get_wal_path(settings.wal_dir),
                         )
-                        col.delete(ids=[d["id"] for d in to_remove])
+                        fts5_warning = col.delete(ids=[d["id"] for d in to_remove])
                         merged_count = len(to_remove)
                     except Exception:
                         consolidate_failed = True
@@ -660,6 +661,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             resp = {"topic": topic, "duplicates": duplicates, "merged": merged_count if merge else None, "total_found": len(duplicates)}
             if claim_warning:
                 resp["claim_warning"] = claim_warning
+            if merge and fts5_warning:
+                resp["_warning"] = fts5_warning
             return resp
         except Exception as e:
             _rollback_intent(consolidate_intent_id, session_id)
