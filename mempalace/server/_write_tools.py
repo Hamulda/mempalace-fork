@@ -580,6 +580,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             return _no_palace()
         consolidate_intent_id = None
         claim_warning = None
+        fts5_warning = None
         try:
             results = col.query(
                 query_texts=[topic],
@@ -640,7 +641,6 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                 keeper = duplicates_with_ts[0]
                 to_remove = duplicates_with_ts[1:]
                 consolidate_failed = False
-                fts5_warning = None
                 if to_remove:
                     try:
                         wal_log(

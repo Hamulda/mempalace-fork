@@ -502,6 +502,66 @@ class TestWriteToolFTS5WarningPropagation:
         assert "rebuild_keyword_index" in resp["_warning"]
         fake_col.delete.assert_called_once()
 
+    def test_consolidate_merge_one_duplicate_no_unbound_error(self, write_tool_server):
+        """merge=True with exactly 1 result → to_remove=[] → no UnboundLocalError, no _warning."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_consolidate"]
+        ctx = MagicMock()
+
+        # Only 1 result → after sort: keeper=[dup1], to_remove=[] (empty)
+        fake_col.query.return_value = {
+            "ids": [["dup_keeper_id"]],
+            "documents": [["only one document content"]],
+            "metadatas": [[{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"}]],
+            "distances": [[0.0]],
+        }
+        fake_col.get.return_value = {
+            "ids": [["dup_keeper_id"]],
+            "documents": [["only one document content"]],
+            "metadatas": [[{"wing": "w", "room": "r", "timestamp": "2026-01-01T00:00:00Z"}]],
+        }
+
+        resp = fn(ctx=ctx, topic="single result topic", merge=True, threshold=0.85)
+
+        assert "error" not in resp, f"must not raise UnboundLocalError: {resp}"
+        # No delete happened → fts5_warning is None → no _warning attached
+        assert "_warning" not in resp, "_warning must be absent when no deletion occurs"
+        # merged is 0-equivalent (nothing removed)
+        assert resp.get("merged", 0) == 0
+        # total_found is 1 (one drawer above threshold)
+        assert resp.get("total_found") == 1
+        fake_col.delete.assert_not_called()
+
+    def test_consolidate_merge_below_threshold_no_unbound_error(self, write_tool_server):
+        """merge=True with results but all below similarity threshold → duplicates=[] → no _warning."""
+        captured, fake_col = write_tool_server
+        fn = captured["mempalace_consolidate"]
+        ctx = MagicMock()
+
+        # All distances are large → similarity below threshold → duplicates stays []
+        fake_col.query.return_value = {
+            "ids": [["id1", "id2"]],
+            "documents": [["doc content A"], ["doc content B"]],
+            "metadatas": [[{"wing": "w", "room": "r"}], {"wing": "w", "room": "r"}],
+            # distances 0.30 and 0.35 → similarity 0.70 and 0.65, both below 0.85 threshold
+            "distances": [[0.30, 0.35]],
+        }
+        fake_col.get.return_value = {
+            "ids": [["id1", "id2"]],
+            "documents": [["doc content A", "doc content B"]],
+            "metadatas": [[
+                {"wing": "w", "room": "r"},
+                {"wing": "w", "room": "r"},
+            ]],
+        }
+
+        resp = fn(ctx=ctx, topic="off-topic query", merge=True, threshold=0.85)
+
+        assert "error" not in resp, f"must not raise UnboundLocalError: {resp}"
+        assert "_warning" not in resp, "_warning must be absent when no duplicates above threshold"
+        # No merge happened because duplicates=[] (len <= 1 so merge block skipped)
+        assert resp.get("total_found") == 0
+
     def test_warning_detached_if_write_tools_stops_attaching_it(self, write_tool_server):
         """Regression: fails if _write_tools.py ever removes the fts5_warning attachment.
 
