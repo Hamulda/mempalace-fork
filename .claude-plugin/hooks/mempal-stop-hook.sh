@@ -2,30 +2,34 @@
 #===============================================================================
 # mempal-stop-hook.sh — MemPalace Stop hook with lifecycle control
 #
-# CRITICAL ORDERING:
+# CRITICAL ORDERING (no set -e — save failure never blocks unregister):
 #   1. Derive SESSION_ID from hook JSON
-#   2. Run mempalace hook save (while server is still alive) — via HTTP preferred
-#   3. Unregister session via server-control stop (may shutdown server)
+#   2. Run mempalace hook save best-effort (server still alive)
+#   3. ALWAYS call server-control stop "$SESSION_ID" — even if save fails
 #
 # The save must happen BEFORE any server shutdown so memory state is preserved.
 #===============================================================================
 
-set -euo pipefail
+set -uo pipefail  # no -e: save failure must not prevent unregister
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_CONTROL="$SCRIPT_DIR/mempal-server-control.sh"
 
 #-------------------------------------------------------------------------------
-# Derive SESSION_ID from stdin JSON (same logic as session-start-hook)
+# Derive SESSION_ID — reads stdin once, uses raw content for fallback hash
 #-------------------------------------------------------------------------------
 derive_session_id() {
     python3 -c "
 import sys, json, hashlib
 
+raw = sys.stdin.read()
 try:
-    data = json.loads(sys.stdin.read())
+    data = json.loads(raw)
 except (json.JSONDecodeError, EOFError):
-    print('unknown', end='')
+    pass
+    # Use raw for hash even on parse failure
+    h = hashlib.sha256(raw.encode()).hexdigest()[:12]
+    print(f'unknown-{h}', end='')
     sys.exit(0)
 
 for key in ('session_id', 'sessionId', 'session.id',
@@ -52,7 +56,7 @@ if cwd or ts:
     print(f'fallback-{h}', end='')
     sys.exit(0)
 
-h = hashlib.sha256(sys.stdin.read().encode()).hexdigest()[:12]
+h = hashlib.sha256(raw.encode()).hexdigest()[:12]
 print(f'unknown-{h}', end='')
 "
 }
@@ -65,25 +69,31 @@ if [[ -z "$SESSION_ID" ]]; then
 fi
 
 MCP_HOST="http://127.0.0.1:8765"
+SAVE_STATUS="not_attempted"
 
 #---------------------------------------------------------------------------
-# STEP 1: Run the save hook while server is still alive (if health is ok)
+# STEP 1: Run the save hook best-effort while server is still alive
 #---------------------------------------------------------------------------
 if curl -sf --max-time 1 "$MCP_HOST/health" > /dev/null 2>&1; then
-    printf '%s' "$INPUT" | python3 -m mempalace hook run \
-        --hook stop --harness claude-code --transport http
+    SAVE_OUTPUT=$(printf '%s' "$INPUT" | python3 -m mempalace hook run \
+        --hook stop --harness claude-code --transport http 2>&1) && SAVE_STATUS="ok" || SAVE_STATUS="failed"
 else
-    # Server unreachable — still call CLI fallback so save logic runs
-    echo "WARNING: MCP server not reachable, running stop hook via CLI" >&2
-    printf '%s' "$INPUT" | python3 -m mempalace hook run \
-        --hook stop --harness claude-code
+    SAVE_OUTPUT=$(printf '%s' "$INPUT" | python3 -m mempalace hook run \
+        --hook stop --harness claude-code 2>&1) && SAVE_STATUS="ok" || SAVE_STATUS="failed"
+fi
+
+if [[ "$SAVE_STATUS" == "failed" ]]; then
+    echo "WARNING: mempalace hook save failed (server may already be stopping), proceeding to unregister" >&2
 fi
 
 #---------------------------------------------------------------------------
-# STEP 2: Unregister session and possibly shutdown server
+# STEP 2: ALWAYS unregister session — even if save failed (no set -e)
 #---------------------------------------------------------------------------
 if [[ -x "$SERVER_CONTROL" ]]; then
-    bash "$SERVER_CONTROL" stop "$SESSION_ID" 2>&2 || true
+    STOP_OUTPUT=$("$SERVER_CONTROL" stop "$SESSION_ID" 2>&1) && STOP_STATUS="ok" || STOP_STATUS="failed"
+    if [[ "$STOP_STATUS" == "failed" ]]; then
+        echo "WARNING: server-control stop failed: $STOP_OUTPUT" >&2
+    fi
 else
     echo "WARNING: $SERVER_CONTROL not found or not executable, session not unregistered" >&2
 fi

@@ -13,20 +13,24 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_CONTROL="$SCRIPT_DIR/mempal-server-control.sh"
 
 #-------------------------------------------------------------------------------
-# Derive SESSION_ID from stdin JSON using Python (robust, order: session_id,
-# sessionId, session.id, transcript_path, cwd+timestamp, hash of full input)
+# Derive SESSION_ID — reads stdin once, uses raw content for fallback hash.
+# Order: session_id, sessionId, session.id, transcript_path,
+#        cwd+timestamp, hash of raw input (not empty on parse failure)
 #-------------------------------------------------------------------------------
 derive_session_id() {
     python3 -c "
-import sys, json, hashlib, os
+import sys, json, hashlib
 
+raw = sys.stdin.read()
 try:
-    data = json.loads(sys.stdin.read())
+    data = json.loads(raw)
 except (json.JSONDecodeError, EOFError):
-    print('unknown', end='')
+    pass
+    # Use raw for hash even on parse failure
+    h = hashlib.sha256(raw.encode()).hexdigest()[:12]
+    print(f'unknown-{h}', end='')
     sys.exit(0)
 
-# Try field names in priority order
 for key in ('session_id', 'sessionId', 'session.id',
             'transcript_path', 'cwd', 'timestamp'):
     parts = key.split('.')
@@ -53,13 +57,13 @@ if cwd or ts:
     print(f'fallback-{h}', end='')
     sys.exit(0)
 
-# Last resort: hash entire input
-h = hashlib.sha256(sys.stdin.read().encode()).hexdigest()[:12]
+# Last resort: hash entire raw input
+h = hashlib.sha256(raw.encode()).hexdigest()[:12]
 print(f'unknown-{h}', end='')
 "
 }
 
-# Read INPUT once
+# Read INPUT once and reuse
 INPUT=$(cat)
 
 # Derive session ID
@@ -81,12 +85,14 @@ fi
 MCP_HOST="http://127.0.0.1:8765"
 
 if curl -sf --max-time 1 "$MCP_HOST/health" > /dev/null 2>&1; then
-    printf '%s' "$INPUT" | python3 -m mempalace hook run \
-        --hook session-start --harness claude-code --transport http
+    python3 -m mempalace hook run \
+        --hook session-start --harness claude-code --transport http <<< "$INPUT" \
+        && EXIT_CODE=0 || EXIT_CODE=$?
 else
     echo "WARNING: MCP server not reachable, falling back to CLI transport" >&2
-    printf '%s' "$INPUT" | python3 -m mempalace hook run \
-        --hook session-start --harness claude-code
+    python3 -m mempalace hook run \
+        --hook session-start --harness claude-code <<< "$INPUT" \
+        && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 
 exit 0

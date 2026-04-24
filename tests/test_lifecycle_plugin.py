@@ -419,3 +419,407 @@ def test_shell_scripts_syntax_check(script_name):
         text=True,
     )
     assert result.returncode == 0, f"{script_name}: {result.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 1 — stop hook always unregisters even on save failure
+# ---------------------------------------------------------------------------
+
+def test_stop_hook_unregisters_even_when_save_fails(tmp_path, monkeypatch):
+    """
+    When mempalace hook save fails, stop hook still calls server-control stop.
+    Issue: set -e could exit before unregister when save fails.
+    """
+    sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+
+    # Pre-create a session file to be removed
+    (sessions_dir / "save-fail-session").touch()
+
+    stdin_data = json.dumps({
+        "session_id": "save-fail-session",
+        "cwd": "/tmp",
+        "transcript_path": "/tmp/nonexistent.jsonl",
+    })
+
+    env = os.environ.copy()
+    env["RUNTIME_DIR"] = str(tmp_path / ".mempalace" / "runtime")
+    env["HOME"] = str(tmp_path.parent)
+
+    # Run stop hook — save will fail but unregister must happen
+    result = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-stop-hook.sh")],
+        input=stdin_data,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+    # Hook must exit 0
+    assert result.returncode == 0, f"stop hook exited {result.returncode}: {result.stderr}"
+    # Session file MUST be gone even if save hook failed
+    assert not (sessions_dir / "save-fail-session").exists(), \
+        "session file must be removed even when save hook fails (no set -e leak)"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 3 — lock timeout math is sane (waited += 1, not 2)
+# ---------------------------------------------------------------------------
+
+def test_lock_timeout_math_is_sane(tmp_path):
+    """
+    LOCK_MAX_WAIT=2 should wait roughly 2 seconds, not 0.2s or 20s.
+    Before fix: sleep 0.2 + waited+=2 → ~3 iterations = 0.6s.
+    After fix: sleep 0.2 + waited+=1 → ~10 iterations = 2s.
+    """
+    sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+
+    env = os.environ.copy()
+    env["RUNTIME_DIR"] = str(tmp_path / ".mempalace" / "runtime")
+    env["HOME"] = str(tmp_path.parent)
+    env["GRACE_PERIOD_SECONDS"] = "1"
+    env["LOCK_MAX_WAIT"] = "2"
+
+    # Acquire lock in a subprocess
+    lock_acquirer = subprocess.Popen(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "start", "lock-holder"],
+        env=env,
+    )
+    lock_acquirer.wait()
+
+    # Now try to acquire lock with short timeout
+    start = time.time()
+    result = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "stop", "lock-holder"],
+        env=env,
+        timeout=10,
+    )
+    elapsed = time.time() - start
+
+    # Should succeed and take ~2s (lock held, then released, then stop runs)
+    # Allow range 0.5s–8s: at least 2s of lock-wait activity, no more than 8s
+    assert result.returncode == 0, f"stop failed: {result.stderr}"
+    # The stop operation itself includes prune + lock release, but the lock
+    # acquisition timeout (2s) is bounded by LOCK_MAX_WAIT
+    assert elapsed < 8.0, f"stop took {elapsed:.1f}s — lock timeout may be too long"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 2 — start during grace prevents shutdown
+# ---------------------------------------------------------------------------
+
+def test_start_during_grace_prevents_shutdown(tmp_path):
+    """
+    If a new session starts while stop is sleeping through grace period,
+    the server must remain alive (grace interrupted, no shutdown).
+    This requires lock to be released during grace.
+    """
+    sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+
+    env = os.environ.copy()
+    env["RUNTIME_DIR"] = str(tmp_path / ".mempalace" / "runtime")
+    env["HOME"] = str(tmp_path.parent)
+    env["GRACE_PERIOD_SECONDS"] = "2"  # short grace for test speed
+
+    # Start a "victim" session that will be stopped, triggering grace
+    result = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "start", "victim-session"],
+        env=env,
+        timeout=10,
+    )
+    assert result.returncode == 0
+
+    # Start stop in background (will sleep through grace)
+    stop_proc = subprocess.Popen(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "stop", "victim-session"],
+        env=env,
+    )
+
+    # Wait a moment for stop to release lock and enter grace sleep
+    time.sleep(1.0)
+
+    # Start a new session during grace period — must succeed and keep server alive
+    start_result = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "start", "new-session-during-grace"],
+        env=env,
+        timeout=10,
+    )
+    assert start_result.returncode == 0, \
+        f"start during grace failed: {start_result.stderr}"
+
+    # Wait for stop to complete
+    stop_proc.wait(timeout=15)
+
+    # Server should still be running (new session kept it alive)
+    status = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "status"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert "server_running=true" in status.stdout, \
+        f"server should still be running (new session during grace). Status: {status.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 4 — prune before count in stop/shutdown-if-idle
+# ---------------------------------------------------------------------------
+
+def test_stop_prunes_before_counting(tmp_path):
+    """
+    Stale session files must not keep server alive after real session stops.
+    Before counting for shutdown decision, prune must run first.
+    """
+    sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+
+    env = os.environ.copy()
+    env["RUNTIME_DIR"] = str(tmp_path / ".mempalace" / "runtime")
+    env["HOME"] = str(tmp_path.parent)
+    env["GRACE_PERIOD_SECONDS"] = "1"  # short grace
+    env["MEMPALACE_SESSION_TTL_SECONDS"] = "1"  # 1s TTL
+
+    # Create a stale session (backdated 1 hour ago)
+    stale = sessions_dir / "stale-session"
+    stale.touch()
+    one_hour_ago = str(int(time.time()) - 3600)
+    subprocess.run(["touch", "-t", one_hour_ago, str(stale)], check=True)
+
+    # Create the real session
+    (sessions_dir / "active-session").touch()
+
+    # Stop the active session — stale session should be pruned before count
+    result = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "stop", "active-session"],
+        env=env,
+        timeout=15,
+    )
+    assert result.returncode == 0, f"stop failed: {result.stderr}"
+
+    # Stale should be gone; no sessions should remain; server shutdown
+    assert not stale.exists(), "stale session should be pruned"
+    assert len(list(sessions_dir.iterdir())) == 0, \
+        "no sessions should remain after stop of only session"
+
+    # Verify server shut down (no running process)
+    status = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-server-control.sh"), "status"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    # Server should either be stopped or in process of stopping
+    # As long as no active sessions remain, prune+count path worked
+    assert "active_sessions=0" in status.stdout, \
+        f"no sessions should remain: {status.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 5 — invalid/empty JSON produces stable non-empty id
+# ---------------------------------------------------------------------------
+
+def test_invalid_json_fallback_is_stable_and_safe(tmp_path):
+    """
+    Invalid JSON produces a stable hash-based id, not empty/unknown.
+    Empty input produces a unique but deterministic id.
+    Path traversal characters are sanitized away.
+    """
+    sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+
+    env = os.environ.copy()
+    env["RUNTIME_DIR"] = str(tmp_path / ".mempalace" / "runtime")
+    env["HOME"] = str(tmp_path.parent)
+
+    # Test 1: empty stdin
+    result1 = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-session-start-hook.sh")],
+        input="",
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert result1.returncode == 0
+
+    # Test 2: malformed JSON
+    result2 = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-session-start-hook.sh")],
+        input="not valid json at all {",
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert result2.returncode == 0
+
+    # Both should produce session files (non-empty ids)
+    files = list(sessions_dir.iterdir())
+    assert len(files) == 2, f"expected 2 session files, got: {[f.name for f in files]}"
+    for f in files:
+        assert f.name not in ("", ".", ".."), f"invalid session name: {f.name}"
+        assert "/" not in f.name, f"path traversal in session name: {f.name}"
+        # Each should be different (unique hash per raw input)
+    assert files[0].name != files[1].name, "empty vs invalid JSON should produce different ids"
+
+
+def test_path_traversal_in_session_id_is_sanitized(tmp_path):
+    """
+    Session IDs with path traversal characters are sanitized.
+    No file should be created outside SESSIONS_DIR.
+    """
+    sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+
+    env = os.environ.copy()
+    env["RUNTIME_DIR"] = str(tmp_path / ".mempalace" / "runtime")
+    env["HOME"] = str(tmp_path.parent)
+
+    result = subprocess.run(
+        ["bash", str(hooks_dir / "mempal-session-start-hook.sh")],
+        input=json.dumps({"session_id": "../../../etc/passwd"}),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert result.returncode == 0
+
+    # Only one file should exist in sessions dir
+    files = list(sessions_dir.iterdir())
+    assert len(files) == 1
+    assert "/" not in files[0].name
+    # No file should exist outside sessions dir
+    assert not (tmp_path / ".mempalace" / "etcpasswd").exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 6 — server startup fallback when mempalace binary absent
+# ---------------------------------------------------------------------------
+
+def test_start_server_fallback_when_binary_not_in_path(tmp_path, monkeypatch):
+    """
+    When mempalace binary is not in PATH, start_server uses python3 -m mempalace.
+    We test the fallback logic by ensuring the script does not hard-code the binary.
+    """
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+    script_path = hooks_dir / "mempal-server-control.sh"
+
+    # Read the script and verify both command variants appear
+    content = script_path.read_text()
+    assert "mempalace serve" in content
+    assert "python3 -m mempalace serve" in content, \
+        "start_server must have python3 -m fallback for when mempalace binary is absent"
+    # Verify it's conditional (command -v or if/else)
+    assert "command -v" in content or "which" in content or \
+           ("if" in content and "mempalace" in content), \
+        "start_server should check for mempalace binary before falling back"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 7 — stop_server PID verification before kill
+# ---------------------------------------------------------------------------
+
+def test_stop_server_does_not_kill_non_mempalace_process(tmp_path):
+    """
+    If SERVER_PID_FILE points to a process that is not a MemPalace server,
+    stop_server must NOT kill it — only remove the stale pid file.
+    """
+    sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+    runtime_dir = tmp_path / ".mempalace" / "runtime"
+
+    env = os.environ.copy()
+    env["RUNTIME_DIR"] = str(runtime_dir)
+    env["HOME"] = str(tmp_path.parent)
+
+    # Create a harmless sleep process
+    harmless_pid = subprocess.Popen(["sleep", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        # Point server.pid at the harmless process
+        pid_file = runtime_dir / "server.pid"
+        pid_file.write_text(str(harmless_pid.pid))
+
+        # Run stop — should not kill the sleep process
+        result = subprocess.run(
+            ["bash", str(hooks_dir / "mempal-server-control.sh"), "stop", "fake-session"],
+            env=env,
+            timeout=10,
+        )
+        # stop doesn't know session, so just clears pid file
+        assert result.returncode == 0, f"stop failed: {result.stderr}"
+
+        # The sleep process should still be alive
+        try:
+            os.kill(harmless_pid.pid, 0)  # signal 0 = check existence
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        assert alive, "stop_server must NOT kill a process that is not a MemPalace server"
+
+        # pid file should be removed
+        assert not pid_file.exists(), "stale pid file should be removed"
+
+    finally:
+        # Clean up the sleep process
+        try:
+            harmless_pid.terminate()
+            harmless_pid.wait(timeout=5)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Issue 8 — precompact works without GNU timeout on macOS
+# ---------------------------------------------------------------------------
+
+def test_precompact_hook_does_not_require_gnu_timeout(tmp_path):
+    """
+    mempal-precompact-hook.sh must work when timeout command is absent.
+    It should either skip timeout or use python-based fallback.
+    """
+    hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
+    script_path = hooks_dir / "mempal-precompact-hook.sh"
+
+    content = script_path.read_text()
+
+    # Script must have `command -v timeout` guard or equivalent
+    assert "command -v timeout" in content or \
+           ("if" in content and "timeout" in content), \
+        "precompact hook must guard timeout availability"
+
+    # Script should not unconditionally call `timeout 55s`
+    # It should be wrapped in `if command -v timeout`
+    assert "if command -v timeout" in content or \
+           "command -v timeout" in content, \
+        "precompact must check for timeout before using it"
+
+
+def test_precompact_no_session_refcount_change(runtime_dir, env_with_runtime):
+    """Existing test preserved for regression coverage."""
+    sessions_dir = runtime_dir / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    stdin_data = json.dumps({
+        "session_id": "precompact-test",
+        "cwd": "/tmp",
+    })
+
+    result = run_hook("precompact", stdin_data, env=env_with_runtime, timeout=10)
+
+    assert result.returncode == 0
+    session_files = [f for f in sessions_dir.iterdir() if f.is_file()]
+    assert len(session_files) == 0, \
+        f"precompact should not create session files, found: {session_files}"

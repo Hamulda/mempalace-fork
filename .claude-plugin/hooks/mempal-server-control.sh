@@ -69,10 +69,14 @@ acquire_lock() {
         holder_pid=$(cat "$LOCK_FILE/lock.pid" 2>/dev/null || echo "")
         if [[ -n "$holder_pid" ]]; then
             if ! kill -0 "$holder_pid" 2>/dev/null; then
-                # Stale lock — remove and retry
+                # Stale lock — holder is dead, clean up and retry
                 rm -f "$LOCK_FILE/lock.token" "$LOCK_FILE/lock.pid"
                 continue
             fi
+        else
+            # No PID recorded but lock.token exists — stale orphan, clean up
+            rm -f "$LOCK_FILE/lock.token" "$LOCK_FILE/lock.pid"
+            continue
         fi
 
         if [[ "$waited" -ge "$max_wait" ]]; then
@@ -81,7 +85,7 @@ acquire_lock() {
         fi
 
         sleep 0.2
-        waited=$((waited + 2))
+        waited=$((waited + 1))
     done
 }
 
@@ -180,7 +184,7 @@ unregister_session() {
 }
 
 #-------------------------------------------------------------------------------
-# start_server
+# start_server — PATH-robust: prefers mempalace binary, falls back to python -m
 #-------------------------------------------------------------------------------
 start_server() {
     log_msg "starting mempalace server..."
@@ -193,7 +197,16 @@ start_server() {
     # Disable GPU for MacBook Air M1 (UMA — GPU=CPU, slow)
     export PYTORCH_MPS_GPU_BACKEND="${PYTORCH_MPS_GPU_BACKEND:-}"
 
-    nohup mempalace serve --host 127.0.0.1 --port 8765 \
+    # Prefer mempalace binary if available; otherwise use python -m
+    if command -v mempalace >/dev/null 2>&1; then
+        SERVE_CMD="mempalace serve --host 127.0.0.1 --port 8765"
+        log_msg "start_server: using mempalace binary"
+    else
+        SERVE_CMD="python3 -m mempalace serve --host 127.0.0.1 --port 8765"
+        log_msg "start_server: using python3 -m mempalace (mempalace binary not in PATH)"
+    fi
+
+    nohup sh -c "$SERVE_CMD" \
         >> "$SERVER_LOG" \
         2>> "$SERVER_ERR_LOG" &
 
@@ -221,7 +234,7 @@ start_server() {
 }
 
 #-------------------------------------------------------------------------------
-# stop_server
+# stop_server — only kills MemPalace server process (PID-safe verification)
 #-------------------------------------------------------------------------------
 stop_server() {
     local pid
@@ -233,7 +246,42 @@ stop_server() {
         return 0
     fi
 
-    log_msg "stopping server pid $pid..."
+    # Verify pid is actually a MemPalace server before killing
+    # ps -p "$pid" -o command= returns full command line of pid (no header)
+    # Wrap with timeout(1) to prevent hanging on zombie/waitpid-stuck processes
+    local cmd_line
+    if command -v timeout >/dev/null 2>&1; then
+        cmd_line=$(timeout 1 ps -p "$pid" -o command= 2>/dev/null || echo "")
+    elif command -v gtimeout >/dev/null 2>&1; then
+        cmd_line=$(gtimeout 1 ps -p "$pid" -o command= 2>/dev/null || echo "")
+    else
+        # macOS without GNU timeout — use perl alarm wrapper inline
+        cmd_line=$(perl -e '
+use strict;
+alarm 1;
+exec("ps", "-p", $ARGV[0], "-o", "command=");
+print "";  # fallback if alarm fires
+' -- "$pid" 2>/dev/null || echo "")
+    fi
+    if [[ -z "$cmd_line" ]]; then
+        log_msg "stop_server: pid $pid vanished, cleaning up"
+        rm -f "$SERVER_PID_FILE"
+        return 0
+    fi
+
+    # Allow only mempalace serve or python...mempalace...serve patterns
+    local is_mempalace=0
+    if echo "$cmd_line" | grep -qE 'mempalace.?serve|python.*mempalace.*serve'; then
+        is_mempalace=1
+    fi
+
+    if [[ "$is_mempalace" -eq 0 ]]; then
+        log_msg "stop_server: pid $pid command='$cmd_line' does not look like MemPalace server, removing stale pid file"
+        rm -f "$SERVER_PID_FILE"
+        return 0
+    fi
+
+    log_msg "stopping server pid $pid (command: $cmd_line)..."
 
     if kill -TERM "$pid" 2>/dev/null; then
         local waited=0
@@ -259,9 +307,10 @@ stop_server() {
 }
 
 #-------------------------------------------------------------------------------
-# shutdown_if_idle — called inside lock
+# shutdown_if_idle — caller holds lock; releases during grace, reacquires after
 #-------------------------------------------------------------------------------
 shutdown_if_idle() {
+    do_prune
     local count
     count=$(active_session_count)
 
@@ -270,17 +319,46 @@ shutdown_if_idle() {
         return 0
     fi
 
-    log_msg "shutdown_if_idle: zero sessions, waiting ${GRACE_PERIOD_SECONDS}s grace period..."
-    sleep "$GRACE_PERIOD_SECONDS"
+    # Release lock during grace period so new sessions can register
+    log_msg "shutdown_if_idle: zero sessions, releasing lock for ${GRACE_PERIOD_SECONDS}s grace period..."
+    release_lock_from_shutdown
 
+    # Incremental sleep with session-check on each second (for fast test response)
+    local grace_remaining="$GRACE_PERIOD_SECONDS"
+    while [[ "$grace_remaining" -gt 0 ]]; do
+        sleep 1
+        grace_remaining=$((grace_remaining - 1))
+        # Check if a new session has registered (without acquiring lock — just file check)
+        if [[ -d "$SESSIONS_DIR" ]] && ls -1 "$SESSIONS_DIR"/ 2>/dev/null | grep -q .; then
+            log_msg "shutdown_if_idle: session registered during grace period, keeping server"
+            return 0
+        fi
+    done
+
+    # Reacquire lock to proceed with shutdown
+    local lock_token
+    lock_token=$(acquire_lock) || {
+        log_msg "shutdown_if_idle: could not reacquire lock, aborting shutdown"
+        return 1
+    }
+    echo "$$" > "$LOCK_FILE/lock.pid"
+
+    do_prune
     count=$(active_session_count)
     if [[ "$count" -gt 0 ]]; then
         log_msg "shutdown_if_idle: sessions appeared during grace period, keeping server"
+        release_lock "$lock_token"
         return 0
     fi
 
-    log_msg "shutdown_if_idle: still zero sessions, initiating graceful shutdown"
+    log_msg "shutdown_if_idle: still zero sessions after grace, initiating graceful shutdown"
     stop_server
+    release_lock "$lock_token"
+}
+
+release_lock_from_shutdown() {
+    # Called from shutdown_if_idle to release lock before sleep
+    rm -f "$LOCK_FILE/lock.token" "$LOCK_FILE/lock.pid" 2>/dev/null || true
 }
 
 #-------------------------------------------------------------------------------
@@ -333,17 +411,49 @@ cmd_stop() {
 
     unregister_session "$session_id"
 
+    # Prune stale sessions before counting — stale files must not keep server alive
+    do_prune
+
     local count
     count=$(active_session_count)
-    log_msg "stop: session unregistered, $count sessions remain"
+    log_msg "stop: session unregistered, $count sessions remain after prune"
 
     if [[ "$count" -eq 0 ]]; then
-        shutdown_if_idle
+        # Release lock during grace so new sessions can register and prevent shutdown
+        release_lock "$lock_token"
+
+        local grace_remaining="$GRACE_PERIOD_SECONDS"
+        while [[ "$grace_remaining" -gt 0 ]]; do
+            sleep 1
+            grace_remaining=$((grace_remaining - 1))
+            # Check if a new session has registered (no lock needed for file check)
+            if [[ -d "$SESSIONS_DIR" ]] && ls -1 "$SESSIONS_DIR"/ 2>/dev/null | grep -q .; then
+                log_msg "stop: new session registered during grace, keeping server"
+                return 0
+            fi
+        done
+
+        # Reacquire to verify still zero
+        lock_token=$(acquire_lock) || {
+            log_msg "stop: grace period interrupted by lock acquisition, server continuing"
+            return 0
+        }
+        echo "$$" > "$LOCK_FILE/lock.pid"
+        do_prune
+        count=$(active_session_count)
+        if [[ "$count" -gt 0 ]]; then
+            log_msg "stop: sessions appeared during grace, keeping server"
+            release_lock "$lock_token"
+            return 0
+        fi
+        log_msg "stop: still zero sessions after grace, shutting down server"
+        stop_server
+        release_lock "$lock_token"
     else
         log_msg "stop: $count sessions active, server continues running"
+        release_lock "$lock_token"
     fi
 
-    release_lock "$lock_token"
     exit 0
 }
 
