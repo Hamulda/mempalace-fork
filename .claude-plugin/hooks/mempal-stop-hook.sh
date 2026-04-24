@@ -16,6 +16,30 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_CONTROL="$SCRIPT_DIR/mempal-server-control.sh"
 
 #-------------------------------------------------------------------------------
+# run_with_timeout — bash 3.2/macOS-compatible timeout wrapper
+#-------------------------------------------------------------------------------
+run_with_timeout() {
+    local cmd="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 30s "$cmd" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout 30s "$cmd" "$@"
+    else
+        # macOS fallback: use perl alarm (works on all Unix)
+        perl -e '
+use strict;
+$SIG{ALRM} = sub {
+    print STDERR "[stop-hook] timeout after 30s\n";
+    exit(124);
+};
+alarm 30;
+exec(@ARGV) or die "exec failed: $!";
+' -- "$cmd" "$@"
+    fi
+}
+
+#-------------------------------------------------------------------------------
 # Derive SESSION_ID — reads stdin once, uses raw content for fallback hash
 #-------------------------------------------------------------------------------
 derive_session_id() {
@@ -72,13 +96,13 @@ MCP_HOST="http://127.0.0.1:8765"
 SAVE_STATUS="not_attempted"
 
 #---------------------------------------------------------------------------
-# STEP 1: Run the save hook best-effort while server is still alive
+# STEP 1: Run the save hook best-effort while server is still alive (bounded)
 #---------------------------------------------------------------------------
 if curl -sf --max-time 1 "$MCP_HOST/health" > /dev/null 2>&1; then
-    SAVE_OUTPUT=$(printf '%s' "$INPUT" | python3 -m mempalace hook run \
+    SAVE_OUTPUT=$(printf '%s' "$INPUT" | run_with_timeout python3 -m mempalace hook run \
         --hook stop --harness claude-code --transport http 2>&1) && SAVE_STATUS="ok" || SAVE_STATUS="failed"
 else
-    SAVE_OUTPUT=$(printf '%s' "$INPUT" | python3 -m mempalace hook run \
+    SAVE_OUTPUT=$(printf '%s' "$INPUT" | run_with_timeout python3 -m mempalace hook run \
         --hook stop --harness claude-code 2>&1) && SAVE_STATUS="ok" || SAVE_STATUS="failed"
 fi
 

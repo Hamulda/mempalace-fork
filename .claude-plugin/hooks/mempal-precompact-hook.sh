@@ -42,10 +42,10 @@ if curl -sf --max-time 1 "$MCP_HOST/health" > /dev/null 2>&1; then
         --hook precompact --harness claude-code --transport http <<< "$INPUT"
     EXIT_CODE=$?
     if [ $EXIT_CODE -ne 0 ]; then
-        $PYTHON_CMD -m mempalace hook run \
+        run_with_timeout "$PYTHON_CMD" -m mempalace hook run \
             --hook precompact --harness claude-code <<< "$INPUT"
     fi
 else
-    $PYTHON_CMD -m mempalace hook run \
+    run_with_timeout "$PYTHON_CMD" -m mempalace hook run \
         --hook precompact --harness claude-code <<< "$INPUT"
 fi

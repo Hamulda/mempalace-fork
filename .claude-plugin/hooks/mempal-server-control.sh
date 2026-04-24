@@ -27,9 +27,9 @@ LOCK_FILE="$RUNTIME_DIR/control.lock"
 # Tunables
 export MEMPALACE_SESSION_TTL_SECONDS="${MEMPALACE_SESSION_TTL_SECONDS:-21600}"  # 6 hours
 HEALTH_URL="http://127.0.0.1:8765/health"
-STARTUP_WAIT_SECONDS=10
+STARTUP_WAIT_SECONDS="${STARTUP_WAIT_SECONDS:-10}"
 GRACE_PERIOD_SECONDS="${GRACE_PERIOD_SECONDS:-20}"
-LOCK_MAX_WAIT=30
+LOCK_MAX_WAIT="${LOCK_MAX_WAIT:-30}"
 
 #-------------------------------------------------------------------------------
 # Helpers
@@ -41,6 +41,24 @@ log_msg() {
 runtime_dir() {
     mkdir -p "$RUNTIME_DIR"
     mkdir -p "$SESSIONS_DIR"
+}
+
+# safe_session_id — sanitize raw session id to safe filename characters.
+# If result is empty, returns a deterministic sha256 hash of the raw input.
+# Bash 3.2 compatible (no associative arrays, no regex).
+safe_session_id() {
+    local raw="$1"
+    local safe
+    safe=$(echo "$raw" | tr -cd 'a-zA-Z0-9_-')
+    if [[ -z "$safe" ]]; then
+        # Deterministic fallback: sha256 hash of raw input via stdin (no injection risk)
+        safe=$(python3 -c "
+import hashlib, sys
+raw = sys.stdin.read()
+print('id-' + hashlib.sha256(raw.encode()).hexdigest()[:12])
+" <<< "$raw")
+    fi
+    echo "$safe"
 }
 
 # acquire_lock — bash 3.x compatible. Blocks up to LOCK_MAX_WAIT real seconds.
@@ -172,8 +190,7 @@ active_session_count() {
 register_session() {
     local session_id="$1"
     local safe_id
-    safe_id=$(echo "$session_id" | tr -cd 'a-zA-Z0-9_-')
-    [[ -z "$safe_id" ]] && safe_id="unknown-$(date +%s)"
+    safe_id=$(safe_session_id "$session_id")
 
     touch "$SESSIONS_DIR/$safe_id"
     log_msg "registered session: $session_id → $SESSIONS_DIR/$safe_id"
@@ -185,8 +202,7 @@ register_session() {
 unregister_session() {
     local session_id="$1"
     local safe_id
-    safe_id=$(echo "$session_id" | tr -cd 'a-zA-Z0-9_-')
-    [[ -z "$safe_id" ]] && safe_id="unknown-$(md5 -q /dev/urandom 2>/dev/null || echo "$session_id" | md5 | cut -c1-8)"
+    safe_id=$(safe_session_id "$session_id")
 
     local path="$SESSIONS_DIR/$safe_id"
     if [[ -f "$path" ]]; then

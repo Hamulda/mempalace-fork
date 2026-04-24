@@ -9,6 +9,7 @@ Tests cover:
 
 import json
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -740,17 +741,25 @@ def test_stop_server_does_not_kill_non_mempalace_process(tmp_path):
     stop_server must NOT kill it — only remove the stale pid file.
 
     Uses GRACE_PERIOD_SECONDS=0 to make the test fast and deterministic.
-    A fake 'ps' in PATH returns a non-mempalace string so stop_server
-    removes the stale pid file without attempting to kill anything.
+    Starts a real `sleep 30` process, writes its PID to server.pid,
+    puts a fake `ps` in PATH returning `sleep 30`, then runs stop.
+    The sleep process must remain alive after stop completes.
     """
     sessions_dir = tmp_path / ".mempalace" / "runtime" / "sessions"
     sessions_dir.mkdir(parents=True)
     hooks_dir = Path(__file__).parent.parent / ".claude-plugin" / "hooks"
     runtime_dir = tmp_path / ".mempalace" / "runtime"
 
-    # Write a fake PID to server.pid (no real process needed)
     pid_file = runtime_dir / "server.pid"
-    pid_file.write_text("99999")
+
+    # Start a real sleep process and capture its PID
+    sleep_proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    sleep_pid = sleep_proc.pid
+    pid_file.write_text(str(sleep_pid))
 
     # Create a fake ps that returns a non-mempalace command string
     fake_bin = tmp_path / "bin"
@@ -766,16 +775,35 @@ def test_stop_server_does_not_kill_non_mempalace_process(tmp_path):
     env["MEMPALACE_SESSION_TTL_SECONDS"] = "36000"
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
 
-    # Run stop — should remove stale pid file without killing anything
-    result = subprocess.run(
-        ["bash", str(hooks_dir / "mempal-server-control.sh"), "stop", "fake-session"],
-        env=env,
-        timeout=20,
-    )
-    assert result.returncode == 0, f"stop failed: {result.stderr}"
+    try:
+        # Run stop — should remove stale pid file without killing the sleep process
+        result = subprocess.run(
+            ["bash", str(hooks_dir / "mempal-server-control.sh"), "stop", "fake-session"],
+            env=env,
+            timeout=20,
+        )
+        assert result.returncode == 0, f"stop failed: {result.stderr}"
 
-    # pid file must be removed (stale, non-MemPalace pid)
-    assert not pid_file.exists(), "stale pid file should be removed"
+        # pid file must be removed (stale, non-MemPalace pid)
+        assert not pid_file.exists(), "stale pid file should be removed"
+
+        # sleep process must still be alive (not killed by stop_server)
+        # os.kill(pid, 0) raises OSError if process is dead; returns None if alive
+        try:
+            os.kill(sleep_pid, 0)
+        except OSError as e:
+            assert False, \
+                f"sleep process {sleep_pid} should still be alive — stop_server must not kill non-mempalace processes: {e}"
+    finally:
+        # Clean up: kill the sleep process so it doesn't linger
+        try:
+            os.kill(sleep_pid, signal.SIGTERM)
+            sleep_proc.wait(timeout=5)
+        except Exception:
+            try:
+                os.kill(sleep_pid, signal.SIGKILL)
+            except OSError:
+                pass  # already dead
 
 
 # ---------------------------------------------------------------------------
