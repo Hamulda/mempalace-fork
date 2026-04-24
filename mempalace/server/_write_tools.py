@@ -232,7 +232,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         bg_executor.submit(_extract_general_facts, content, drawer_id)
 
         try:
-            col.upsert(
+            fts5_warning = col.upsert(
                 ids=[drawer_id],
                 documents=[content],
                 metadatas=[{
@@ -249,6 +249,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             resp = {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
             if claim_warning:
                 resp["claim_warning"] = claim_warning
+            if fts5_warning:
+                resp["_warning"] = fts5_warning
             return resp
         except Exception as e:
             _rollback_intent(intent_id, session_id)
@@ -292,13 +294,15 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         intent_id = _log_intent(session_id, "delete_drawer", "drawer", drawer_id)
 
         try:
-            col.delete(ids=[drawer_id])
+            fts5_warning = col.delete(ids=[drawer_id])
             _commit_intent(intent_id, session_id)
             invalidate_query_cache()
             _invalidate_status_cache()
             resp = {"success": True, "drawer_id": drawer_id}
             if claim_warning:
                 resp["claim_warning"] = claim_warning
+            if fts5_warning:
+                resp["_warning"] = fts5_warning
             return resp
         except Exception as e:
             _rollback_intent(intent_id, session_id)
@@ -349,7 +353,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
         intent_id = _log_intent(session_id, "diary_write", "diary_entry", entry_id, {"agent_name": agent_name, "topic": topic})
 
         try:
-            col.upsert(
+            fts5_warning = col.upsert(
                 ids=[entry_id],
                 documents=[entry],
                 metadatas=[{
@@ -366,6 +370,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             resp = {"success": True, "entry_id": entry_id, "agent": agent_name, "topic": topic, "timestamp": now.isoformat()}
             if claim_warning:
                 resp["claim_warning"] = claim_warning
+            if fts5_warning:
+                resp["_warning"] = fts5_warning
             return resp
         except Exception as e:
             _rollback_intent(intent_id, session_id)
@@ -530,7 +536,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                 ext = Path(source_file).suffix.lower()
                 from ..miner import LANGUAGE_MAP
                 language = LANGUAGE_MAP.get(ext, "Text")
-            col.upsert(
+            fts5_warning = col.upsert(
                 ids=[drawer_id],
                 documents=[f"{description}\n\n```\n{code_stored}\n```"],
                 metadatas=[{
@@ -553,6 +559,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
             }
             if claim_warning:
                 resp["claim_warning"] = claim_warning
+            if fts5_warning:
+                resp["_warning"] = fts5_warning
             return resp
         except Exception as e:
             _rollback_intent(intent_id, session_id)
