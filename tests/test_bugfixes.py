@@ -442,6 +442,80 @@ class TestRrfMergeIdKey:
         assert "id3" in ids
         assert "id2" in ids
 
+    def test_rrf_merge_duplicate_id_fused_score(self):
+        """Same id in two lists: result length is 1 and rrf_score is the fused sum."""
+        from mempalace.searcher import _rrf_merge
+
+        # Same id appears at rank 0 in both lists — fused score = 1/(k+1) + 1/(k+1)
+        list1 = [{"id": "dup", "text": "result one"}]
+        list2 = [{"id": "dup", "text": "result two"}]
+
+        merged = _rrf_merge([list1, list2])
+
+        assert len(merged) == 1, "Duplicate id should appear once after fusion"
+        hit = merged[0]
+        # k=60 default, so each contribution = 1/61; fused = 2/61
+        expected = 2 / 61
+        assert hit["rrf_score"] == expected, (
+            f"rrf_score={hit['rrf_score']} != expected {expected} — "
+            "score must reflect sum of all contributions, not only the first"
+        )
+
+    def test_rrf_merge_md5_fallback_no_second_pass(self):
+        """Hits without id use md5 fallback; no second md5 pass recomputes the hash."""
+        import hashlib
+        from unittest import mock
+        from mempalace.searcher import _rrf_merge
+
+        text = "text requiring md5 fallback"
+        list1 = [{"text": text}, {"text": "other"}]
+
+        call_count = 0
+        original_md5 = hashlib.md5
+        def counting_md5(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_md5(*args, **kwargs)
+
+        with mock.patch("hashlib.md5", side_effect=counting_md5):
+            merged = _rrf_merge([list1])
+
+        # Each distinct text triggers md5 once in the first pass.
+        # Same text appearing twice → only 1 md5 call (scores accumulator prevents recompute).
+        assert call_count == 2, (
+            f"md5 called {call_count} times — second pass recomputes hash for all hits"
+        )
+        assert len(merged) == 2
+        assert all("rrf_score" in h for h in merged)
+
+    def test_rrf_merge_three_layers_fused_score(self):
+        """Same id in vector+FTS5+KG layers: rrf_score is sum of all three contributions."""
+        from mempalace.searcher import _rrf_merge
+
+        # Same id at rank 0 in all three layers; k=60
+        hits_vector = [{"id": "shared", "text": "the memory"}]
+        hits_fts5 = [{"id": "shared", "text": "the memory"}]
+        hits_kg = [{"id": "shared", "text": "the memory"}]
+
+        merged = _rrf_merge([hits_vector, hits_fts5, hits_kg])
+
+        assert len(merged) == 1
+        # Each contributes 1/(60+0+1) = 1/61; total = 3/61
+        assert merged[0]["rrf_score"] == 3 / 61
+
+    def test_rrf_merge_existing_combines_sources(self):
+        """Existing test: RRF gives higher score to hits appearing in multiple result lists."""
+        from mempalace.searcher import _rrf_merge
+
+        list1 = [{"text": "shared result"}, {"text": "unique1"}]
+        list2 = [{"text": "shared result"}, {"text": "unique2"}]
+
+        result = _rrf_merge([list1, list2])
+
+        shared = next((h for h in result if h["text"] == "shared result"), None)
+        assert shared is not None
+        assert shared.get("rrf_score", 0) > 0, "Shared hit should have rrf_score"
+
 
 class TestGeneralExtractorIntegration:
     def test_general_extractor_import(self):

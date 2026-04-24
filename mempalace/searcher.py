@@ -513,10 +513,14 @@ def _rrf_merge(result_lists: list, k: int = 60) -> list:
             scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
             if key not in seen:
                 seen[key] = hit
-                seen[key]["rrf_score"] = scores[key]
 
     sorted_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
-    return [seen[k] for k in sorted_keys]
+    merged = []
+    for key in sorted_keys:
+        hit = seen[key]
+        hit["rrf_score"] = scores[key]
+        merged.append(hit)
+    return merged
 
 
 def hybrid_search(
