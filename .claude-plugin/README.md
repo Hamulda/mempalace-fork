@@ -1,18 +1,18 @@
 # MemPalace Claude Code Plugin
 
-A Claude Code plugin that gives your AI a persistent memory system powered by MemPalace — the local, LanceDB-backed memory palace with session coordination for 6× parallel Claude Code sessions.
+A Claude Code plugin that gives your AI a persistent memory system powered by MemPalace — the local, LanceDB-backed memory palace with session coordination for up to 6× parallel Claude Code sessions.
 
 ## What This Plugin Does
 
 - **Skills**: `/mempalace:help`, `/mempalace:init`, `/mempalace:search`, `/mempalace:mine`, `/mempalace:status`
-- **Hooks**: Auto-save on Stop, PreCompact preservation, SessionStart health check
-- **No MCP servers started by plugin** — plugin provides UX, MCP tools connect to a shared server
+- **Hooks**: Auto-save on Stop, PreCompact preservation, SessionStart lifecycle control
+- **No MCP servers started by plugin** — plugin provides skills + hooks, MCP tools connect to a shared HTTP server managed by the plugin
 
 ## Prerequisites
 
 - Python 3.9+
 - MemPalace installed: `pip install git+https://github.com/Hamulda/mempalace-fork`
-- Shared MemPalace MCP server running on `http://127.0.0.1:8765/mcp`
+- Shared MemPalace MCP server managed by plugin hooks (auto-started on first session)
 
 ## Installation
 
@@ -25,22 +25,42 @@ claude plugin marketplace add hamulda/mempalace-fork
 claude plugin install --scope user mempalace
 ```
 
-## Starting the Shared MCP Server
+## Server Lifecycle (Automatic — Recommended)
 
-Run **one** shared server for all Claude Code sessions:
+The plugin manages a **single shared HTTP server** across all Claude Code sessions using session refcounting:
+
+```
+SessionStart (hook)
+  → registers session ID
+  → starts server if not already running
+  → calls mempalace hook run (session-start inject)
+
+Stop (hook)
+  → calls mempalace hook run (auto-save while server alive)
+  → unregisters session ID
+  → if zero sessions remain → graceful server shutdown after ~20s grace period
+```
+
+Runtime state is kept in `~/.mempalace/runtime/`:
+- `server.pid` — current server process ID
+- `sessions/<session_id>` — session refcount files (TTL: 6 hours)
+- `control.lock` — flock-based mutual exclusion for all mutations
+
+The server binds to `http://127.0.0.1:8765` and is shared by all Claude Code sessions on the machine. Opening a new session while another is open reuses the same server. Closing one session does not shut down the server. Closing the last session triggers graceful shutdown after a 20-second grace period to avoid restart churn.
+
+### Crash / Stale Session Recovery
+
+Session files have a 6-hour TTL (configurable via `MEMPALACE_SESSION_TTL_SECONDS`). If Claude Code crashes without running the Stop hook, the stale session file expires automatically and does not prevent server shutdown.
+
+## Manual Server Mode (Optional)
+
+If you need a persistent server for debugging or external MCP clients (non-Claude-Code):
 
 ```bash
 mempalace serve --host 127.0.0.1 --port 8765
 ```
 
-Or:
-
-```bash
-python -m mempalace serve --host 127.0.0.1 --port 8765
-```
-
-The server starts on `http://127.0.0.1:8765/mcp` with all session coordinators active
-(SessionRegistry, WriteCoordinator, ClaimsManager, HandoffManager, DecisionTracker).
+This bypasses the plugin's session-aware lifecycle. The plugin hooks still run normally, but the server is already running so SessionStart registers the session without spawning a new process.
 
 ## Verify
 
@@ -48,6 +68,8 @@ The server starts on `http://127.0.0.1:8765/mcp` with all session coordinators a
 curl http://127.0.0.1:8765/health
 # → {"status": "ok", "service": "mempalace"}
 ```
+
+Then in Claude Code: `/mempalace:status`
 
 ## Available Slash Commands
 
@@ -61,9 +83,9 @@ curl http://127.0.0.1:8765/health
 
 ## Hooks
 
-- **Stop** — Auto-saves conversation context every 15 messages
-- **PreCompact** — Preserves memories before context compaction
-- **SessionStart** — Verifies MCP server is reachable
+- **SessionStart** — Registers session, starts shared server if needed, injects relevant memories
+- **Stop** — Runs auto-save (while server is alive), unregisters session, may shut down server
+- **PreCompact** — Preserves memories before context compaction (does NOT affect session refcount)
 
 Set `MEMPAL_DIR` environment variable to auto-ingest a directory on each save.
 
@@ -71,18 +93,19 @@ Set `MEMPAL_DIR` environment variable to auto-ingest a directory on each save.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Claude Code (session 1..6)                         │
-│  /mempalace:search → MCP call → http://localhost:8765│
+│  Claude Code session 1..6 (localhost)              │
+│  Hooks → mempal-server-control.sh (session refcount)│
+│  MCP tools → http://127.0.0.1:8765/mcp             │
 └─────────────────────────────────────────────────────┘
                      │
                      ▼ (shared HTTP)
 ┌─────────────────────────────────────────────────────┐
 │  mempalace serve (1 process, port 8765)             │
-│  ├── SessionRegistry (shared across sessions)       │
-│  ├── WriteCoordinator (WAL coalescing)              │
-│  ├── ClaimsManager (file-level mutual exclusion)    │
-│  ├── HandoffManager (atomic handoff)               │
-│  └── DecisionTracker (architectural decisions)       │
+│  ├── SessionRegistry (shared across sessions)        │
+│  ├── WriteCoordinator (WAL coalescing)               │
+│  ├── ClaimsManager (file-level mutual exclusion)     │
+│  ├── HandoffManager (atomic handoff)                │
+│  └── DecisionTracker (architectural decisions)        │
 └─────────────────────────────────────────────────────┘
                      │
                      ▼
@@ -90,6 +113,14 @@ Set `MEMPAL_DIR` environment variable to auto-ingest a directory on each save.
 │  LanceDB (~/.mempalace/)                           │
 └─────────────────────────────────────────────────────┘
 ```
+
+## Key Design Constraints
+
+- **One shared server** — plugin never spawns multiple MCP servers; session refcount ensures single process
+- **No plugin.json mcpServers** — the plugin is skills + hooks only; no MCP server configuration in plugin.json
+- **Localhost only** — server binds 127.0.0.1 only, never exposed externally
+- **Graceful shutdown** — Stop hook auto-save runs before any server termination
+- **No LaunchAgent** — server lifecycle is entirely hook-driven
 
 ## Full Documentation
 
