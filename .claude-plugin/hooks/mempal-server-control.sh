@@ -43,23 +43,25 @@ runtime_dir() {
     mkdir -p "$SESSIONS_DIR"
 }
 
-# acquire_lock — bash 3.x compatible using flock(1) via a temp file.
-# Creates $LOCK_FILE as a directory containing lock.name and lock.pid files.
-# Blocks up to LOCK_MAX_WAIT seconds for the lock.
+# acquire_lock — bash 3.x compatible. Blocks up to LOCK_MAX_WAIT real seconds.
+# Creates $LOCK_FILE as a directory containing lock.token and lock.pid files.
+# lock.pid is written INSIDE this function (not by caller) to avoid token/pid race.
 acquire_lock() {
     local max_wait="${LOCK_MAX_WAIT:-30}"
-    local waited=0
+    local start now elapsed
 
     # Ensure lock dir exists
     mkdir -p "$LOCK_FILE" || return 1
 
+    start=$(date +%s)
+
     # Wait for lock
     while true; do
-        # Try to atomically claim the lock using a rename
-        # We use the PID+timestamp as the lock token
+        # Try to atomically claim the lock using noclobber redirect
         local token="$$-$(date +%s%N)"
         if (set -C; echo "$token" > "$LOCK_FILE/lock.token" 2>/dev/null); then
-            # We got the lock
+            # We got the lock — write our PID before releasing
+            echo "$$" > "$LOCK_FILE/lock.pid"
             echo "$token"
             return 0
         fi
@@ -74,18 +76,28 @@ acquire_lock() {
                 continue
             fi
         else
-            # No PID recorded but lock.token exists — stale orphan, clean up
-            rm -f "$LOCK_FILE/lock.token" "$LOCK_FILE/lock.pid"
-            continue
+            # No PID recorded but lock.token exists — check token age to avoid
+            # deleting a freshly-created token that hasn't had PID written yet.
+            # Use a short stale threshold (2s) so the race window is bounded.
+            local token_age
+            token_age=$(stat -f %m "$LOCK_FILE/lock.token" 2>/dev/null || stat -c %Y "$LOCK_FILE/lock.token" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            if [[ $((now - token_age)) -gt 2 ]]; then
+                # Token older than 2s with no PID — treat as stale orphan
+                rm -f "$LOCK_FILE/lock.token" "$LOCK_FILE/lock.pid"
+                continue
+            fi
+            # Token is fresh (≤2s) — it may be mid-creation; wait and retry
         fi
 
-        if [[ "$waited" -ge "$max_wait" ]]; then
-            echo "ERROR: could not acquire lock after ${max_wait}s" >&2
+        now=$(date +%s)
+        elapsed=$((now - start))
+        if [[ "$elapsed" -ge "$max_wait" ]]; then
+            echo "ERROR: could not acquire lock after ${max_wait}s real time" >&2
             return 1
         fi
 
         sleep 0.2
-        waited=$((waited + 1))
     done
 }
 
@@ -206,7 +218,7 @@ start_server() {
         log_msg "start_server: using python3 -m mempalace (mempalace binary not in PATH)"
     fi
 
-    nohup sh -c "$SERVE_CMD" \
+    nohup sh -c "exec $SERVE_CMD" \
         >> "$SERVER_LOG" \
         2>> "$SERVER_ERR_LOG" &
 
@@ -341,7 +353,6 @@ shutdown_if_idle() {
         log_msg "shutdown_if_idle: could not reacquire lock, aborting shutdown"
         return 1
     }
-    echo "$$" > "$LOCK_FILE/lock.pid"
 
     do_prune
     count=$(active_session_count)
@@ -372,8 +383,6 @@ cmd_start() {
 
     local lock_token
     lock_token=$(acquire_lock) || { echo "ERROR: could not acquire lock" >&2; exit 1; }
-    # Write our PID so stale-lock detection can find us
-    echo "$$" > "$LOCK_FILE/lock.pid"
 
     do_prune
     register_session "$session_id"
@@ -407,7 +416,6 @@ cmd_stop() {
 
     local lock_token
     lock_token=$(acquire_lock) || { echo "ERROR: could not acquire lock" >&2; exit 1; }
-    echo "$$" > "$LOCK_FILE/lock.pid"
 
     unregister_session "$session_id"
 
@@ -438,7 +446,6 @@ cmd_stop() {
             log_msg "stop: grace period interrupted by lock acquisition, server continuing"
             return 0
         }
-        echo "$$" > "$LOCK_FILE/lock.pid"
         do_prune
         count=$(active_session_count)
         if [[ "$count" -gt 0 ]]; then
@@ -492,7 +499,6 @@ cmd_status() {
 cmd_prune() {
     local lock_token
     lock_token=$(acquire_lock) || { echo "ERROR: could not acquire lock" >&2; exit 1; }
-    echo "$$" > "$LOCK_FILE/lock.pid"
     do_prune
     release_lock "$lock_token"
     exit 0
@@ -504,7 +510,6 @@ cmd_prune() {
 cmd_shutdown_if_idle() {
     local lock_token
     lock_token=$(acquire_lock) || { echo "ERROR: could not acquire lock" >&2; exit 1; }
-    echo "$$" > "$LOCK_FILE/lock.pid"
     shutdown_if_idle
     release_lock "$lock_token"
     exit 0
