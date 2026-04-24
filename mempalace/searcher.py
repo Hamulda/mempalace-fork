@@ -504,21 +504,19 @@ def invalidate_query_cache() -> None:
 def _rrf_merge(result_lists: list, k: int = 60) -> list:
     """Reciprocal Rank Fusion — combines results from multiple retrieval systems."""
     scores = {}
+    seen = {}
     for result_list in result_lists:
         for rank, hit in enumerate(result_list):
-            key = hit.get("id") or hashlib.md5(hit["text"].encode(), usedforsecurity=False).hexdigest()[:16]
+            key = hit.get("id")
+            if not key:
+                key = hashlib.md5(hit["text"].encode(), usedforsecurity=False).hexdigest()[:16]
             scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
-
-    seen = {}
-    for hit_list in result_lists:
-        for hit in hit_list:
-            key = hit.get("id") or hashlib.md5(hit["text"].encode(), usedforsecurity=False).hexdigest()[:16]
             if key not in seen:
                 seen[key] = hit
-                seen[key]["rrf_score"] = round(scores.get(key, 0), 6)
+                seen[key]["rrf_score"] = scores[key]
 
     sorted_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
-    return [seen[k] for k in sorted_keys if k in seen]
+    return [seen[k] for k in sorted_keys]
 
 
 def hybrid_search(
@@ -606,6 +604,11 @@ async def hybrid_search_async(
     from datetime import date
     from .config import MempalaceConfig
 
+    # Build config once — avoids repeated disk reads and env var parsing per call
+    cfg = MempalaceConfig()
+    backend = get_backend(cfg.backend)
+    collection_name = cfg.collection_name
+
     def _vector_layer():
         return search_memories(
             query=query, palace_path=palace_path, wing=wing, room=room,
@@ -614,9 +617,6 @@ async def hybrid_search_async(
 
     def _fts5_layer():
         try:
-            cfg = MempalaceConfig()
-            backend = get_backend(cfg.backend)
-            collection_name = cfg.collection_name
             col = backend.get_collection(palace_path, collection_name, create=False)
             return _fts5_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
         except Exception as e:

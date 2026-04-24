@@ -483,9 +483,8 @@ class LanceOptimizer:
 
                 t = threading.Thread(target=_run_loop, daemon=True, name="mp_optimize")
                 t.start()
-                # Give the loop a moment to start so we don't schedule on a closed loop
-                while not ev.is_running():
-                    time.sleep(0.01)
+                # yield to the new thread — ev.run_forever() starts instantly, no spin needed
+                time.sleep(0)
             return self._optimize_loop
 
     def _stop_optimize_loop(self) -> None:
@@ -516,11 +515,23 @@ class LanceOptimizer:
                 loop.call_soon_threadsafe(self._schedule_optimize)
 
     def _schedule_optimize(self) -> None:
-        """Schedule one optimize run on the persistent loop. Runs fire-and-forget."""
+        """Schedule one optimize run on the persistent loop."""
         if self._lock_file.exists():
             logger.debug("LanceDB optimize already running, skipping")
             return
-        asyncio.ensure_future(self._run_optimize())
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(self._run_optimize())
+
+        def _on_done(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is None:
+                pass  # success already logged inside _run_optimize
+            else:
+                logger.error("LanceDB optimize task failed: %s", exc)
+
+        task.add_done_callback(_on_done)
 
     async def _run_optimize(self) -> None:
         """Compacts delta files. Runs on the persistent optimize event loop."""
@@ -576,8 +587,14 @@ class LanceOptimizer:
                 delete_unverified=True,
             )
         except Exception as e:
-            # Fallback: use synchronous API if async fails
-            logger.debug("Async optimize not available, skipping: %s", e)
+            # Sync fallback — use blocking LanceDB API directly
+            try:
+                import lancedb
+                db = lancedb.connect(self._palace_path)
+                table = db.open_table(self._collection_name).to_lance()
+                table.optimize()
+            except Exception as e2:
+                logger.debug("Both async and sync optimize unavailable: %s", e2)
 
     def run_optimize_sync(self) -> None:
         """Synchronous optimize — for CLI use."""
@@ -1065,7 +1082,7 @@ class LanceCollection(BaseCollection):
             )
             if not guard.wait_for_nominal(timeout=30.0):
                 raise MemoryPressureError(
-                    f"Cannot write to palace: system memory at "
+                    f"Cannot write to palace at {self._palace_path}: system memory at "
                     f"{guard.used_ratio:.0%}. Close some apps and retry."
                 )
 
