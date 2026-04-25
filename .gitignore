@@ -6,7 +6,7 @@ __pycache__/
 .pytest_cache/
 mempal.yaml
 .a5c/
-*.bak
+*.bak*
 *.omc
 .venv/
 node_modules/
