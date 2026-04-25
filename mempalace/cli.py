@@ -484,7 +484,8 @@ def cmd_embed_daemon(args):
                 start_new_session=True,
             )
 
-            deadline = time.monotonic() + 30
+            timeout_s = float(os.environ.get("MEMPALACE_EMBED_DAEMON_STARTUP_TIMEOUT", "30"))
+            deadline = time.monotonic() + timeout_s
             ready = False
             while time.monotonic() < deadline:
                 # use select so the readline loop cannot hang indefinitely
@@ -503,7 +504,7 @@ def cmd_embed_daemon(args):
             if ready:
                 print(f"Embedding daemon started at {sock_path}")
             else:
-                print("Daemon did not emit READY within 30s — killing child process")
+                print(f"Daemon did not emit READY within {timeout_s:.0f}s — killing child process")
                 try:
                     proc.kill()
                 except Exception:

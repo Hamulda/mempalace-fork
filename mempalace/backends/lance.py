@@ -457,7 +457,7 @@ class LanceOptimizer:
         self._palace_path = palace_path
         self._collection_name = collection_name
         self._writes_since_optimize = 0
-        self._last_optimize_time = 0.0
+        self._last_optimize_time = time.monotonic()
         self._lock = threading.Lock()
         self._lock_file = Path(palace_path) / ".optimize_lock"
         self._optimize_loop: asyncio.AbstractEventLoop | None = None
@@ -1465,6 +1465,12 @@ class LanceCollection(BaseCollection):
                     )
                     if page.empty:
                         break
+                    # Cap page to remaining scan budget before advancing total_scanned.
+                    # If LanceDB returns more rows than we requested via limit(), we must
+                    # not count those extra rows against the scan budget.
+                    remaining = MAX_SCAN - total_scanned
+                    if len(page) > remaining:
+                        page = page.iloc[:remaining]
                     total_scanned += len(page)
                     filtered = _apply_where_filter(page, where)
                     if not filtered.empty:
@@ -1489,8 +1495,9 @@ class LanceCollection(BaseCollection):
                     raise RuntimeError(
                         f"get(where=...) scanned {total_scanned} raw rows but only "
                         f"found {seen_filtered} filtered rows ({target_offset} offset + "
-                        f"{effective_limit} limit requested). The filter may be too broad "
-                        f"or the table is too large. Use a more selective filter."
+                        f"{effective_limit} limit requested) before hitting "
+                        f"MAX_SCAN={MAX_SCAN}. The filter may be too broad or the table "
+                        f"is too large. Use a more selective filter."
                     )
 
                 results = pandas.DataFrame(window) if window else pandas.DataFrame()
@@ -1544,41 +1551,14 @@ class LanceCollection(BaseCollection):
 
             self._write_with_retry(do_delete)
         elif where:
-            # OPTIMIZATION: Prefer LanceDB native delete(where=...) when possible.
-            # LanceDB 0.4+ supports SQL predicate pushdown natively on string columns.
-            # Fall back to vector-search scan when native delete is unavailable or fails.
-            try:
-                native_sql = _where_to_sql(where)
-                if native_sql:
-                    # CORRECTNESS FIX: Query affected IDs BEFORE delete so FTS5 sync
-                    # gets the real tombstone list. Without this, native delete removes
-                    # LanceDB rows but FTS5 index stays stale (empty ids list).
-                    affected_ids: list[str] = []
-                    page_start = 0
-                    while True:
-                        page = (
-                            self._table.search()
-                            .where(native_sql, prefilter=True)
-                            .limit(500)
-                            .offset(page_start)
-                            .to_pandas()
-                        )
-                        if page.empty:
-                            break
-                        affected_ids.extend(page["id"].tolist())
-                        if len(page) < 500:
-                            break
-                        page_start += 500
-
-                    self._table.delete(native_sql)
-                    return self._sync_fts5delete(affected_ids)
-            except Exception:
-                pass  # Fall through to vector-search scan
-
-            # LanceDB's json_extract SQL cannot filter UTF-8 metadata_json strings.
-            # Collect ALL matching ids via ANN scan with SQL predicate prefilter,
-            # then delete by id. This is still better than pandas full-table scan
-            # because LanceDB's ANN index narrows the scan to relevant regions.
+            # IMPORTANT: LanceDB's json_extract SQL cannot filter UTF-8 metadata_json
+            # strings because _json_col() emits CAST(...AS VARBINARY) which current
+            # LanceDB/DataFusion rejects with "Unsupported SQL type VARBINARY".
+            # We must NEVER pass a metadata filter through LanceDB SQL prefilter.
+            # Strategy: collect ALL matching ids via bounded Python-filtered scan,
+            # THEN delete by id. LanceDB's ANN scan narrows the search region even
+            # without a SQL predicate, and _apply_where_filter() handles all metadata
+            # conditions correctly.
             try:
                 batch_size = 500
                 MAX_SCAN = self._DELETE_MAX_SCAN
@@ -1587,17 +1567,14 @@ class LanceCollection(BaseCollection):
                 consecutive_empty_pages = 0
                 EMPTY_PAGES_BEFORE_BREAK = 2
 
-                sql_where = _where_to_sql(where)
                 page_start = 0
                 while total_scanned < MAX_SCAN:
                     batch_limit = min(batch_size, MAX_SCAN - total_scanned)
-                    # Use search().where() for SQL predicate pushdown — narrows scan
-                    # to rows matching the filter before vectors are considered.
-                    # Without vector query (no query= arg), this is a filtered full-scan
-                    # that leverages LanceDB's page-level pruning.
+                    # Use search without SQL predicate — LanceDB ANN index narrows
+                    # the scan; all metadata filtering happens in Python via
+                    # _apply_where_filter which parses metadata_json once per page.
                     page = (
                         self._table.search()
-                        .where(sql_where, prefilter=True)
                         .limit(batch_limit)
                         .offset(page_start)
                         .to_pandas()
@@ -1610,10 +1587,11 @@ class LanceCollection(BaseCollection):
                         page_start += batch_size
                         continue
                     consecutive_empty_pages = 0
+                    # Cap page to remaining scan budget before advancing total_scanned.
+                    remaining = MAX_SCAN - total_scanned
+                    if len(page) > remaining:
+                        page = page.iloc[:remaining]
                     total_scanned += len(page)
-                    # For search().where() the filter is pushed to SQL, but after
-                    # scanning we still need to verify row-level conditions (python
-                    # dict filters). Apply the remaining filter to the scanned page.
                     filtered = _apply_where_filter(page, where)
                     if not filtered.empty:
                         matching_ids.extend(filtered["id"].tolist())
@@ -1624,8 +1602,8 @@ class LanceCollection(BaseCollection):
                 if total_scanned >= MAX_SCAN and len(matching_ids) < MAX_SCAN:
                     raise RuntimeError(
                         f"delete(where=...) scanned {total_scanned} raw rows "
-                        f"({len(matching_ids)} matches) but hit MAX_SCAN={MAX_SCAN} ceiling "
-                        f"before the table was fully scanned. Either a sparse table, a "
+                        f"({len(matching_ids)} matches) before hitting "
+                        f"MAX_SCAN={MAX_SCAN}. Either a sparse table, a "
                         f"LanceDB compaction in progress, or the filter is not selective "
                         f"enough. Delete by id instead, or use a more selective filter."
                     )
@@ -1732,7 +1710,12 @@ class LanceBackend:
         db = lancedb.connect(palace_path)
 
         try:
-            table_names = db.list_table_names()
+            tables_response = db.list_tables()
+            table_names = (
+                tables_response.tables
+                if hasattr(tables_response, "tables")
+                else list(tables_response)
+            )
         except Exception:
             table_names = []
 
