@@ -1028,6 +1028,10 @@ def mine(
     include_ignored: list = None,
 ):
     """Mine a project directory into the palace."""
+    # Mining is daemon-only by default to prevent OOM on M1 8GB.
+    # The in-process fallback model (~500MB) causes memory pressure.
+    # User can override with: MEMPALACE_EMBED_FALLBACK=1 mempalace mine ...
+    os.environ.setdefault("MEMPALACE_EMBED_FALLBACK", "0")
 
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)

@@ -200,6 +200,15 @@ _fallback_model = None
 _fallback_lock = threading.Lock()
 
 
+def _embed_fallback_enabled() -> bool:
+    """Check if in-process fallback is enabled via env var.
+
+    Default "1" = fallback enabled (backward compatible).
+    "0", "false", "no", "off" = fallback disabled (daemon-only mode for mining).
+    """
+    return os.environ.get("MEMPALACE_EMBED_FALLBACK", "1").lower() not in ("0", "false", "no", "off")
+
+
 def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
     """In-process fallback — loads fastembed into this process.
 
@@ -221,6 +230,13 @@ def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
                         f"Start the embed daemon instead: mempalace embed-daemon start"
                     )
                 if guard.pressure == MemoryPressure.WARN:
+                    if not _embed_fallback_enabled():
+                        raise MemoryPressureError(
+                            f"Cannot load in-process embedding model: "
+                            f"memory pressure is WARN ({guard.used_ratio:.0%}) "
+                            f"and in-process fallback is disabled for mining. "
+                            f"Restart daemon with: mempalace embed-daemon stop && mempalace embed-daemon start"
+                        )
                     logger.warning(
                         "Memory pressure is WARN (%.0f%%). "
                         "Loading in-process embedding model — consider starting the daemon instead.",
@@ -286,8 +302,19 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
             logger.warning("Socket embedding failed (%s), using fallback", e)
             global _DAEMON_STARTED
             _DAEMON_STARTED = False
+            if not _embed_fallback_enabled():
+                raise RuntimeError(
+                    f"Embedding daemon request failed and in-process fallback is disabled. "
+                    f"Error: {e}. "
+                    f"Restart daemon with: mempalace embed-daemon stop && mempalace embed-daemon start"
+                )
             computed = _embed_texts_fallback(uncached_texts)
     else:
+        if not _embed_fallback_enabled():
+            raise RuntimeError(
+                "Embedding daemon unavailable and in-process fallback is disabled. "
+                "Run: mempalace embed-daemon start"
+            )
         computed = _embed_texts_fallback(uncached_texts)
 
     # Store computed in cache and merge into result dict
