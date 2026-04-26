@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import select
@@ -51,11 +52,17 @@ from .base import BaseCollection
 
 logger = logging.getLogger(__name__)
 
+_EMBED_SANITIZE_REPAIRS = 0
+_EMBED_SANITIZE_REPAIRS_LOCK = threading.Lock()
+
 # ── Embedding daemon client (Unix socket) ─────────────────────────────────────
 
 _DAEMON_LOCK = threading.Lock()
 _DAEMON_STARTED = False
-_SOCK_TIMEOUT = 30.0  # seconds to wait for daemon startup
+_SOCK_TIMEOUT = float(os.environ.get(
+    "MEMPALACE_EMBED_DAEMON_STARTUP_TIMEOUT",
+    os.environ.get("MEMPALACE_EMBED_SOCKET_TIMEOUT", "120"),
+))
 
 
 def _get_socket_path() -> str:
@@ -66,10 +73,17 @@ def _get_socket_path() -> str:
 
 
 def _daemon_is_running() -> bool:
-    """Check if the embedding daemon socket is responsive."""
+    """Check if the embedding daemon socket is responsive.
+
+    A bounded health probe — never hangs.
+    - missing socket path → False
+    - connect failure → False
+    - malformed JSON / wrong length / timeout → False
+    """
     sock_path = _get_socket_path()
     if not os.path.exists(sock_path):
         return False
+    s = None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(1.0)
@@ -77,28 +91,83 @@ def _daemon_is_running() -> bool:
         payload = json.dumps({"texts": []}).encode("utf-8")
         s.sendall(len(payload).to_bytes(4, "big") + payload)
         raw_len = s.recv(4)
-        if raw_len:
-            msg_len = int.from_bytes(raw_len, "big")
-            s.recv(msg_len)
-        s.close()
+        if not raw_len or len(raw_len) < 4:
+            return False
+        msg_len = int.from_bytes(raw_len, "big")
+        if msg_len > 10_000_000:  # sanity cap
+            return False
+        data = b""
+        while len(data) < msg_len:
+            chunk = s.recv(min(65536, msg_len - len(data)))
+            if not chunk:
+                return False
+            data += chunk
+        response = json.loads(data.decode("utf-8"))
+        if not isinstance(response, dict):
+            return False
         return True
     except Exception:
         return False
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def _mark_daemon_dead(reason: str = "") -> None:
+    """Mark the daemon as dead and reset global state."""
+    global _DAEMON_STARTED
+    _DAEMON_STARTED = False
+    try:
+        from ..circuit_breaker import _embed_circuit
+        _embed_circuit.record_failure()
+    except Exception:
+        pass
+    logger.warning("Embedding daemon marked dead: %s", reason)
 
 
 def _start_daemon_if_needed() -> bool:
     """
     Start the embedding daemon if it is not running.
     Thread-safe. Uses double-check locking.
+
+    On entry: if _DAEMON_STARTED is True but the daemon is not responding,
+    we mark it dead and clean the stale socket before attempting restart.
     """
     global _DAEMON_STARTED
 
-    if _daemon_is_running():
+    # Fast path: already started and daemon is healthy
+    if _DAEMON_STARTED and _daemon_is_running():
         return True
 
+    # Stale flag: started flag is set but daemon is not responding
+    if _DAEMON_STARTED and not _daemon_is_running():
+        _mark_daemon_dead("socket health check failed")
+
     with _DAEMON_LOCK:
+        # Double-check inside the lock
         if _daemon_is_running():
+            _DAEMON_STARTED = True
             return True
+
+        # Still dead — clean stale socket before starting fresh
+        sock_path = _get_socket_path()
+        if os.path.exists(sock_path):
+            # Try to connect; if it fails, unlink the stale socket
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect(sock_path)
+                s.close()
+            except Exception:
+                # Socket is not responsive — remove it
+                try:
+                    os.unlink(sock_path)
+                    logger.info("Removed stale socket %s", sock_path)
+                except Exception:
+                    pass
 
         logger.info("Starting MemPalace embedding daemon...")
 
@@ -122,23 +191,42 @@ def _start_daemon_if_needed() -> bool:
                         ready = True
                         break
                 if proc.poll() is not None:
-                    err = proc.stderr.read().decode("utf-8", errors="ignore")
-                    logger.error("Embedding daemon failed to start: %s", err)
+                    # Process exited before emitting READY
+                    err_b = proc.stderr.read()
+                    err = err_b.decode("utf-8", errors="ignore") if err_b else ""
+                    logger.error("Embedding daemon exited before READY: %s", err)
+                    _mark_daemon_dead("process exited before READY")
                     return False
 
             if not ready:
-                logger.warning("Embedding daemon startup timeout after %ss", _SOCK_TIMEOUT)
+                logger.warning(
+                    "Embedding daemon startup timeout after %ss", _SOCK_TIMEOUT
+                )
                 try:
                     proc.kill()
                 except Exception:
                     pass
+                # Wait for process to actually terminate
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+                _mark_daemon_dead("startup timeout")
                 return False
 
+            # READY emitted — verify the daemon is actually responsive
             if _daemon_is_running():
                 _DAEMON_STARTED = True
                 logger.info("Embedding daemon started (PID %d)", proc.pid)
                 return True
 
+            # READY was emitted but socket is not responsive
+            logger.error("Daemon emitted READY but socket health check failed")
+            _mark_daemon_dead("READY emitted but socket not responsive")
+            try:
+                proc.kill()
+            except Exception:
+                pass
             return False
 
         except Exception as e:
@@ -298,6 +386,8 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
     if daemon_ok:
         try:
             computed = _embed_via_socket(uncached_texts)
+            # Sanitize daemon output — central guarantee before cache and write paths
+            computed = _sanitize_embedding_batch(computed, context="_embed_via_socket")
         except Exception as e:
             logger.warning("Socket embedding failed (%s), using fallback", e)
             global _DAEMON_STARTED
@@ -309,6 +399,7 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
                     f"Restart daemon with: mempalace embed-daemon stop && mempalace embed-daemon start"
                 )
             computed = _embed_texts_fallback(uncached_texts)
+            computed = _sanitize_embedding_batch(computed, context="_embed_texts_fallback")
     else:
         if not _embed_fallback_enabled():
             raise RuntimeError(
@@ -316,6 +407,7 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
                 "Run: mempalace embed-daemon start"
             )
         computed = _embed_texts_fallback(uncached_texts)
+        computed = _sanitize_embedding_batch(computed, context="_embed_texts_fallback")
 
     # Store computed in cache and merge into result dict
     for text, emb in zip(uncached_texts, computed):
@@ -324,6 +416,250 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
 
     # Return in original order
     return [emb_map[text] for text in texts]
+
+
+def _is_degenerate_vector(vec) -> tuple[bool, str]:
+    """
+    Check if a vector is degenerate (all-zero, near-zero, all-NaN, or all-Inf).
+
+    Returns (is_degenerate, reason).  reason is "" if valid, otherwise describes
+    the failure mode.
+    """
+    try:
+        float_vec = [float(v) for v in vec]
+    except (TypeError, ValueError):
+        return True, "not convertible to float"
+    if len(float_vec) != EMBEDDING_DIMS:
+        return True, f"dimension {len(float_vec)} != {EMBEDDING_DIMS}"
+    has_nan = any(math.isnan(v) for v in float_vec)
+    has_inf = any(math.isinf(v) for v in float_vec)
+    if has_nan or has_inf:
+        return True, f"contains NaN/Inf (nan={has_nan}, inf={has_inf})"
+    norm = math.sqrt(sum(v * v for v in float_vec))
+    if norm < 1e-9:
+        return True, f"zero-norm ({norm:.2e})"
+    return False, ""
+
+
+def _quarantine_record(
+    source_file: str,
+    chunk_index: int,
+    reason: str,
+    preview: str,
+    model: str,
+    wing: str,
+) -> None:
+    """Append a quarantine record to the shared JSONL log."""
+    import datetime
+
+    record = {
+        "source_file": source_file,
+        "chunk_index": chunk_index,
+        "reason": reason,
+        "preview": preview[:200],
+        "time": datetime.datetime.utcnow().isoformat() + "Z",
+        "model": model,
+        "wing": wing,
+    }
+    qpath = Path(os.path.expanduser("~/.mempalace/palace/mining_quarantine.jsonl"))
+    qpath.parent.mkdir(parents=True, exist_ok=True)
+    with qpath.open("a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+_EMBED_TEXT_RESILIENT_LOCK = threading.Lock()
+_EMBED_QUARANTINE_COUNT = 0
+
+
+def _embed_texts_resilient(
+    texts: list[str],
+    *,
+    context: str = "",
+) -> tuple[list[str], list[list[float]], list[dict], list[int]]:
+    """
+    Embed texts with per-chunk degenerate vector recovery.
+
+    Returns (valid_texts, valid_embeddings, failures, valid_orig_indices).
+    - valid_texts / valid_embeddings: only chunks whose vectors passed validation
+    - failures: list of per-chunk failure records (index, reason, preview, context)
+    - valid_orig_indices: original positions in `texts` that produced valid embeddings
+
+    One bad chunk does not abort the batch.  All failures are quarantined.
+    """
+    global _EMBED_QUARANTINE_COUNT
+
+    if not texts:
+        return [], [], [], []
+
+    fallback_disabled = os.environ.get("MEMPALACE_EMBED_FALLBACK", "1") != "1"
+
+    # First attempt: batch embed everything
+    try:
+        vectors = _embed_texts(texts)
+    except Exception as initial_error:  # broad: RuntimeError, MemoryPressureError, etc.
+        err_str = str(initial_error).lower()
+
+        # Detect which chunk failed from error message format: "...[_embed_via_socket[N]]..."
+        import re
+        chunk_idx_match = re.search(r'\[(\d+)\]', str(initial_error))
+        failed_chunk_idx = int(chunk_idx_match.group(1)) if chunk_idx_match else None
+
+        if fallback_disabled:
+            # Daemon returned bad vectors AND fallback is disabled — quarantine affected chunks.
+            # Don't propagate: mining must continue even with bad chunks.
+            failures = []
+            for i, text in enumerate(texts):
+                if i == failed_chunk_idx or failed_chunk_idx is None:
+                    failures.append({
+                        "index": i,
+                        "reason": f"daemon_degenerate:{initial_error}",
+                        "preview": text[:200],
+                        "context": context,
+                    })
+                    _quarantine_record(
+                        source_file=context,
+                        chunk_index=i,
+                        reason=f"daemon_degenerate:{initial_error}",
+                        preview=text,
+                        model="mlx",
+                        wing="",
+                    )
+            if failed_chunk_idx is None:
+                # Systemic error — quarantine all
+                for i, text in enumerate(texts):
+                    if not any(f["index"] == i for f in failures):
+                        failures.append({
+                            "index": i,
+                            "reason": f"systemic:{initial_error}",
+                            "preview": text[:200],
+                            "context": context,
+                        })
+            # Return what we have (possibly empty valid list) — mining continues
+            return [], [], failures, []
+
+        # Fallback enabled — let error propagate for callers that handle it
+        raise
+
+    valid_texts, valid_vectors, failures, valid_orig_indices = [], [], [], []
+
+    for i, (text, vec) in enumerate(zip(texts, vectors)):
+        is_deg, reason = _is_degenerate_vector(vec)
+        if is_deg:
+            failures.append({
+                "index": i,
+                "reason": reason,
+                "preview": text[:200],
+                "context": context,
+            })
+            _quarantine_record(
+                source_file=context,
+                chunk_index=i,
+                reason=f"degenerate_embedding:{reason}",
+                preview=text,
+                model="mlx" if _DAEMON_STARTED else "fastembed",
+                wing="",
+            )
+            with _EMBED_TEXT_RESILIENT_LOCK:
+                _EMBED_QUARANTINE_COUNT += 1
+        else:
+            valid_texts.append(text)
+            valid_vectors.append(vec)
+            valid_orig_indices.append(i)
+
+    return valid_texts, valid_vectors, failures, valid_orig_indices
+
+
+def _sanitize_embedding_vector(
+    vec,
+    *,
+    expected_dim: int | None = None,
+    context: str = "",
+) -> list[float]:
+    """
+    Ensure a vector is finite and correctly-dimensioned before LanceDB write.
+
+    Policy:
+      - Wrong dimension → RuntimeError
+      - Sparse NaN/Inf (some values valid) → replace with 0.0, renormalize
+      - All invalid or zero norm after repair → RuntimeError
+      - Return value is always a plain list[float] with exactly expected_dim elements
+
+    Never returns NaN or Inf.
+    """
+    if expected_dim is None:
+        expected_dim = EMBEDDING_DIMS
+
+    if vec is None:
+        raise RuntimeError(
+            f"Embedding is None during mining{': ' + context if context else ''}. "
+            "The MLX daemon may have crashed on this input."
+        )
+
+    try:
+        float_vec = [float(v) for v in vec]
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(
+            f"Embedding values are not convertible to float{': ' + context if context else ''}: {e}"
+        )
+
+    if len(float_vec) != expected_dim:
+        raise RuntimeError(
+            f"Embedding dimension {len(float_vec)} != expected {expected_dim}"
+            f"{': ' + context if context else ''}"
+        )
+
+    # Detect any NaN/Inf
+    has_bad = any(not math.isfinite(v) for v in float_vec)
+
+    if has_bad:
+        # Replace NaN/Inf with 0.0
+        cleaned = [0.0 if not math.isfinite(v) else v for v in float_vec]
+
+        # Renormalize
+        norm = math.sqrt(sum(v * v for v in cleaned))
+        if norm > 1e-9:
+            factor = 1.0 / norm
+            cleaned = [v * factor for v in cleaned]
+            logger.warning(
+                "Embedding contained NaN/Inf and was repaired by zero-fill+renormalize"
+                f"{': ' + context if context else ''}"
+            )
+            with _EMBED_SANITIZE_REPAIRS_LOCK:
+                global _EMBED_SANITIZE_REPAIRS
+                _EMBED_SANITIZE_REPAIRS += 1
+        else:
+            # All zero or degenerate — cannot repair
+            raise RuntimeError(
+                f"Embedding is degenerate (all zero or invalid){': ' + context if context else ''}. "
+                "The MLX model produced a broken embedding for this input."
+            )
+
+        return cleaned
+
+    # All finite — check for zero vector (degenerate but not NaN/Inf)
+    norm = math.sqrt(sum(v * v for v in float_vec))
+    if norm < 1e-9:
+        raise RuntimeError(
+            f"Embedding is zero-dimensional{': ' + context if context else ''}. "
+            "The MLX model produced a degenerate (all-zero) embedding for this input."
+        )
+
+    return float_vec
+
+
+def _sanitize_embedding_batch(
+    vectors,
+    *,
+    expected_dim: int | None = None,
+    context: str = "",
+) -> list[list[float]]:
+    """Sanitize a batch of vectors. Applies _sanitize_embedding_vector to each."""
+    if expected_dim is None:
+        expected_dim = EMBEDDING_DIMS
+    return [
+        _sanitize_embedding_vector(v, expected_dim=expected_dim, context=f"{context}[{i}]")
+        for i, v in enumerate(vectors)
+    ]
 
 
 # ── Semantic Deduplicator ──────────────────────────────────────────────────────
@@ -408,37 +744,55 @@ class SemanticDeduplicator:
         metadatas: list[dict],
         collection: "LanceCollection",
         n_candidates: int = 5,
-    ) -> tuple[list[tuple[str, Optional[str]]], list[list[float]]]:
+        quarantine_ctx: str = "",
+    ) -> tuple[list[tuple[str, Optional[str]]], list[Optional[list[float]]], list[dict]]:
         """
         Klasifikuje celý batch dokumentů najednou.
-        Vrací (classifications, embeddings) — embeddingy jsou vypočítány
+        Vrací (classifications, embeddings, failures) — embeddingy jsou vypočítány
         JEDNÍM voláním _embed_texts a caller je může reuseovat.
+
+        failures: list of per-chunk degenerate embedding records that were quarantined.
+                  Caller can log these for visibility.
 
         Caller si musí sám vyfiltrovat embeddingy podle toho,
         které dokumenty mají akci "unique"/"conflict" (ne "duplicate").
         """
         if collection.count() == 0:
-            return [("unique", None)] * len(documents), _embed_texts(documents)
+            valid_texts, valid_embs, failures, valid_orig_indices = _embed_texts_resilient(
+                documents, context=quarantine_ctx or "classify_batch(empty_collection)"
+            )
+            # Align results with original document indices so upsert zip is correct
+            results: list[tuple[str, Optional[str]]] = [("unique", None)] * len(documents)
+            for qi in {f["index"] for f in failures}:
+                results[qi] = ("quarantined", None)
+            all_embs_aligned: list[Optional[list[float]]] = [None] * len(documents)
+            for vi, orig_i in enumerate(valid_orig_indices):
+                all_embs_aligned[orig_i] = valid_embs[vi]
+            return results, all_embs_aligned, failures
 
-        # JEDEN batch embedding call pro všechny dokumenty
-        batch_vectors = _embed_texts(documents)
+        # JEDEN batch embedding call pro všechny dokumenty (resilient: skips bad chunks)
+        valid_texts, batch_vectors, failures, valid_orig_indices = _embed_texts_resilient(
+            documents, context=quarantine_ctx or "classify_batch"
+        )
 
-        # BATCH vector search — single query místo N separátních query
-        # LanceDB neumí batch vector search přímo, ale mužeme použít
-        # ThreadPoolExecutor pro paralelní query (I/O bound, ne CPU bound)
+        # Build mapping: original_index → (doc, meta, vec)
+        orig_vec_map: dict[int, tuple[str, dict, list[float]]] = {}
+        for vi, orig_i in enumerate(valid_orig_indices):
+            orig_vec_map[orig_i] = (documents[orig_i], metadatas[orig_i], batch_vectors[vi])
+
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        n_workers = min(len(documents), 8)  # max 8 paralelních query
+        n_workers = min(len(valid_orig_indices), 8)
 
         results: list[tuple[str, Optional[str]]] = [("unique", None)] * len(documents)
+        # Mark quarantined indices as "quarantined" so upsert skips them
+        failed_orig_indices = {f["index"] for f in failures}
+        for qi in failed_orig_indices:
+            results[qi] = ("quarantined", None)
 
-        def _classify_one(args: tuple[int, list[float]]) -> tuple[int, tuple[str, Optional[str]]]:
-            i, vec = args
-            doc, meta = documents[i], metadatas[i]
-            similar = collection.query_by_vector(
-                vector=vec,
-                n_results=n_candidates,
-            )
+        def _classify_one(args: tuple[int, str, dict, list[float]]) -> tuple[int, tuple[str, Optional[str]]]:
+            i, doc, meta, vec = args
+            similar = collection.query_by_vector(vector=vec, n_results=n_candidates)
             if not similar["ids"] or not similar["ids"][0]:
                 return i, ("unique", None)
             best_dist = similar["distances"][0][0]
@@ -455,12 +809,20 @@ class SemanticDeduplicator:
             return i, ("unique", None)
 
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(_classify_one, (i, vec)): i for i, vec in enumerate(batch_vectors)}
+            futures = {
+                executor.submit(_classify_one, (orig_i, doc, meta, vec)): orig_i
+                for orig_i, (doc, meta, vec) in orig_vec_map.items()
+            }
             for future in as_completed(futures):
-                i, classification = future.result()
-                results[i] = classification
+                orig_i, classification = future.result()
+                results[orig_i] = classification
 
-        return results, batch_vectors
+        # Build aligned embeddings list: None at quarantined indices so upsert zip stays aligned
+        all_embeddings_aligned: list[Optional[list[float]]] = [None] * len(documents)
+        for vi, orig_i in enumerate(valid_orig_indices):
+            all_embeddings_aligned[orig_i] = batch_vectors[vi]
+
+        return results, all_embeddings_aligned, failures
 
 
 # ── LanceDB Async Optimizer ───────────────────────────────────────────────────
@@ -1133,18 +1495,23 @@ class LanceCollection(BaseCollection):
 
         # BATCH Semantic deduplication – jeden embedding call pro celý batch
         deduplicator = SemanticDeduplicator()
-        classifications, all_embeddings = deduplicator.classify_batch(
+        classifications, all_embeddings, failures = deduplicator.classify_batch(
             documents=documents,
             metadatas=metadatas,
             collection=self,
+            quarantine_ctx="_do_add",
         )
 
         final_docs, final_ids, final_metas, final_embs = [], [], [], []
-        skipped, conflicts = 0, 0
+        skipped, conflicts, quarantined = 0, 0, 0
 
         for doc, doc_id, meta, (action, existing_id), emb in zip(
             documents, ids, metadatas, classifications, all_embeddings
         ):
+            if action == "quarantined":
+                quarantined += 1
+                logger.debug("Skipping quarantined chunk: %s", doc_id)
+                continue
             if action == "duplicate":
                 skipped += 1
                 logger.debug("Skipping duplicate memory: %s (similar to %s)", doc_id, existing_id)
@@ -1162,6 +1529,8 @@ class LanceCollection(BaseCollection):
             final_metas.append(meta)
             final_embs.append(emb)
 
+        if quarantined > 0:
+            logger.info("_do_add quarantined %d degenerate embedding(s)", quarantined)
         if skipped > 0 or conflicts > 0:
             logger.info(
                 "Semantic dedup: skipped %d duplicates, resolved %d conflicts",
@@ -1170,6 +1539,9 @@ class LanceCollection(BaseCollection):
 
         if not final_docs:
             return
+
+        # Sanitize embeddings — repair sparse NaN/Inf, reject degenerate vectors
+        final_embs = _sanitize_embedding_batch(final_embs, context="_do_add")
 
         # Embeddingy jsou už spočítané v classify_batch – reuse
         now = time.time()
@@ -1228,18 +1600,24 @@ class LanceCollection(BaseCollection):
 
         # Semantic deduplication – používá classify_batch pro embedding reuse
         deduplicator = SemanticDeduplicator()
-        classifications, all_embeddings = deduplicator.classify_batch(
+        classifications, all_embeddings, failures = deduplicator.classify_batch(
             documents=documents,
             metadatas=metadatas,
             collection=self,
+            quarantine_ctx="upsert",
         )
 
-        final_docs, final_ids, final_metas, final_embs = [], [], [], []
+        quarantined = 0
         skipped = 0
+        final_docs, final_ids, final_metas, final_embs = [], [], [], []
 
         for doc, doc_id, meta, (action, existing_id), emb in zip(
             documents, ids, metadatas, classifications, all_embeddings
         ):
+            if action == "quarantined":
+                quarantined += 1
+                logger.debug("Upsert skipping quarantined chunk: %s", doc_id)
+                continue
             if action == "duplicate":
                 skipped += 1
                 logger.debug("Upsert skipping duplicate: %s", doc_id)
@@ -1249,11 +1627,16 @@ class LanceCollection(BaseCollection):
             final_metas.append(meta)
             final_embs.append(emb)
 
+        if quarantined > 0:
+            logger.info("Upsert quarantined %d degenerate embedding(s)", quarantined)
         if skipped > 0:
             logger.info("Upsert semantic dedup: skipped %d duplicates", skipped)
 
         if not final_docs:
             return
+
+        # Sanitize embeddings — repair sparse NaN/Inf, reject degenerate vectors
+        final_embs = _sanitize_embedding_batch(final_embs, context="upsert")
 
         # Delete existing records (with retry)
         id_set = set(final_ids)

@@ -14,6 +14,8 @@ import os
 import sys
 import hashlib
 import fnmatch
+import time
+import json as _json
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -22,6 +24,223 @@ from .config import MempalaceConfig
 from .backends import get_backend
 from .palace import SKIP_DIRS
 from .symbol_index import SymbolIndex
+from .mining_manifest import MiningManifest, _quick_hash
+
+
+# =============================================================================
+# MINE PROFILING
+# =============================================================================
+
+class MineStats:
+    """
+    Low-overhead profiler for mempalace mine.
+
+    Enabled via MEMPALACE_MINE_PROFILE=1.
+    Writes JSON report to MEMPALACE_MINE_PROFILE_JSON if set.
+    """
+
+    PROGRESS_EVERY = 25  # print summary every N files
+
+    def __init__(self):
+        self.enabled = os.environ.get("MEMPALACE_MINE_PROFILE", "0") == "1"
+        self.total_files = 0
+        self.processed_files = 0
+        self.skipped_files = 0
+        self.error_files = 0
+        self.total_drawers_added = 0
+
+        # Phase totals (seconds)
+        self._phase_totals = {
+            "read_file_s": 0.0,
+            "detect_room_s": 0.0,
+            "chunk_s": 0.0,
+            "revision_existing_get_s": 0.0,
+            "prepare_metadata_s": 0.0,
+            "collection_upsert_s": 0.0,
+            "tombstone_upsert_s": 0.0,
+            "total_s": 0.0,
+        }
+
+        # Per-file records
+        self._file_records: list[dict] = []
+
+        # Error list
+        self._errors: list[dict] = []
+
+        # Top-N tracking
+        self._slowest_files: list[tuple[float, dict]] = []  # (total_s, record)
+        self._largest_chunk_files: list[tuple[int, dict]] = []  # (chunk_count, record)
+
+        self._last_progress_time = time.monotonic()
+        self._start_wall = self._last_progress_time
+
+    def record_file(self, record: dict) -> None:
+        """Called after each process_file completes (or errors)."""
+        if not self.enabled:
+            return
+
+        self.total_files += 1
+
+        if record["status"] == "error":
+            self.error_files += 1
+            if len(self._errors) < 50:
+                self._errors.append({
+                    "source_file": record.get("source_file", "unknown"),
+                    "phase": record.get("phase", ""),
+                    "error": str(record.get("error", ""))[:200],
+                })
+            self._update_topN(record, also_errors=False)
+            return
+
+        if record["status"] == "skipped":
+            self.skipped_files += 1
+            return
+
+        # success
+        self.processed_files += 1
+        self.total_drawers_added += record.get("chunk_count", 0)
+
+        # Accumulate phase totals
+        for phase in self._phase_totals:
+            if phase in record:
+                self._phase_totals[phase] += record[phase]
+
+        self._update_topN(record, also_errors=True)
+
+        # Periodic progress every PROGRESS_EVERY files
+        if self.total_files % self.PROGRESS_EVERY == 0:
+            self._print_progress()
+
+    def _update_topN(self, record: dict, also_errors: bool) -> None:
+        """Maintain top 20 slowest and top 20 largest-chunk files."""
+        self._slowest_files.append((record.get("total_s", 0.0), record))
+        self._slowest_files.sort(key=lambda x: x[0], reverse=True)
+        self._slowest_files = self._slowest_files[:20]
+
+        if record.get("chunk_count", 0) > 0:
+            cc = record["chunk_count"]
+            self._largest_chunk_files.append((cc, record))
+            self._largest_chunk_files.sort(key=lambda x: x[0], reverse=True)
+            self._largest_chunk_files = self._largest_chunk_files[:20]
+
+    def _print_progress(self) -> None:
+        """Print periodic summary without flooding stdout."""
+        elapsed = time.monotonic() - self._start_wall
+        rate = self.total_files / elapsed if elapsed > 0 else 0
+        print(
+            f"  [PROFILE {self.total_files} files, {elapsed:.1f}s, {rate:.2f} files/sec]  "
+            f"processed={self.processed_files}  errors={self.error_files}  "
+            f"upsert_avg={self._avg_upsert_s():.3f}s",
+            flush=True,
+        )
+
+    def _avg_upsert_s(self) -> float:
+        total = self._phase_totals.get("collection_upsert_s", 0.0)
+        n = self.processed_files
+        return total / n if n > 0 else 0.0
+
+    def final_report(self) -> dict:
+        """Return the final report dict (and write JSON if configured)."""
+        phase_totals = dict(self._phase_totals)
+        phase_totals["wallclock_elapsed_s"] = time.monotonic() - self._start_wall
+        phase_totals["files_per_sec"] = self.total_files / phase_totals["wallclock_elapsed_s"] if phase_totals["wallclock_elapsed_s"] > 0 else 0
+
+        profile_json = os.environ.get("MEMPALACE_MINE_PROFILE_JSON", "")
+
+        slowest_files = [
+            {
+                "source_file": r[1].get("source_file", ""),
+                "room": r[1].get("room", ""),
+                "chunk_count": r[1].get("chunk_count", 0),
+                "total_s": round(r[0], 3),
+                "read_file_s": round(r[1].get("read_file_s", 0), 3),
+                "collection_upsert_s": round(r[1].get("collection_upsert_s", 0), 3),
+            }
+            for r in self._slowest_files
+        ]
+
+        largest_chunk_files = [
+            {
+                "source_file": r[1].get("source_file", ""),
+                "room": r[1].get("room", ""),
+                "chunk_count": r[1].get("chunk_count", 0),
+                "total_s": round(r[0], 3),
+            }
+            for r in self._largest_chunk_files
+        ]
+
+        report = {
+            "total_runtime_s": round(phase_totals["wallclock_elapsed_s"], 2),
+            "total_files": self.total_files,
+            "processed_files": self.processed_files,
+            "skipped_files": self.skipped_files,
+            "error_files": self.error_files,
+            "total_drawers_added": self.total_drawers_added,
+            "files_per_sec": round(phase_totals["files_per_sec"], 3),
+            "phase_totals": {k: round(v, 4) for k, v in phase_totals.items()},
+            "slowest_files": slowest_files,
+            "largest_chunk_files": largest_chunk_files,
+            "errors": self._errors,
+        }
+
+        if profile_json:
+            try:
+                with open(profile_json, "w") as f:
+                    _json.dump(report, f, indent=2)
+                print(f"  [PROFILE] JSON report written to {profile_json}", flush=True)
+            except Exception as e:
+                print(f"  [PROFILE] Failed to write JSON report: {e}", flush=True)
+
+        return report
+
+    def print_summary(self) -> None:
+        """Print human-readable end-of-run summary table."""
+        if not self.enabled:
+            return
+
+        r = self.final_report()
+        print(f"\n{'=' * 55}", flush=True)
+        print("  Mine Profile Summary", flush=True)
+        print(f"{'─' * 55}", flush=True)
+        print(f"  Files:     {r['total_files']} total  "
+              f"{r['processed_files']} processed  {r['skipped_files']} skipped  {r['error_files']} errors", flush=True)
+        print(f"  Runtime:   {r['total_runtime_s']:.2f}s  ({r['files_per_sec']:.2f} files/sec)", flush=True)
+        print(f"  Drawers:   {r['total_drawers_added']}", flush=True)
+        print(f"{'─' * 55}", flush=True)
+        print("  Phase totals (seconds):", flush=True)
+        phases = ["read_file_s", "detect_room_s", "chunk_s", "revision_existing_get_s",
+                  "prepare_metadata_s", "collection_upsert_s", "tombstone_upsert_s", "total_s"]
+        for phase in phases:
+            val = r["phase_totals"].get(phase, 0.0)
+            if val > 0:
+                print(f"    {phase:30s} {val:8.3f}s", flush=True)
+
+        if r["slowest_files"]:
+            print(f"{'─' * 55}", flush=True)
+            print("  Top 10 slowest files:", flush=True)
+            print(f"    {'source_file':45s} {'room':15s} {'chunks':6s} {'total_s':8s}", flush=True)
+            for f in r["slowest_files"][:10]:
+                name = f["source_file"][-45:] if len(f["source_file"]) > 45 else f["source_file"]
+                print(f"    {name:45s} {f['room'] or '?':15s} {f['chunk_count']:6d} {f['total_s']:8.3f}s", flush=True)
+
+        if r["largest_chunk_files"]:
+            print(f"{'─' * 55}", flush=True)
+            print("  Top 10 largest (by chunk count):", flush=True)
+            print(f"    {'source_file':45s} {'room':15s} {'chunks':6s}", flush=True)
+            for f in r["largest_chunk_files"][:10]:
+                name = f["source_file"][-45:] if len(f["source_file"]) > 45 else f["source_file"]
+                print(f"    {name:45s} {f['room'] or '?':15s} {f['chunk_count']:6d}", flush=True)
+
+        if r["errors"]:
+            print(f"{'─' * 55}", flush=True)
+            print(f"  Errors ({len(r['errors'])}):", flush=True)
+            for e in r["errors"][:10]:
+                print(f"    {e['source_file']}: [{e['phase']}] {e['error'][:80]}", flush=True)
+
+        print(f"{'=' * 55}\n", flush=True)
+
+
+# =============================================================================
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -59,6 +278,10 @@ CHUNK_SIZE = 800  # chars per drawer
 CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — skip files larger than this
+
+# Batching for safe mining — reduces per-file collection.get() overhead
+_MEMPALACE_MINE_BATCH_FILES = int(os.environ.get("MEMPALACE_MINE_BATCH_FILES", "8"))
+_MEMPALACE_MINE_BATCH_DRAWERS = int(os.environ.get("MEMPALACE_MINE_BATCH_DRAWERS", "256"))
 
 # Language detection from file extension
 LANGUAGE_MAP = {
@@ -784,6 +1007,99 @@ def _compute_content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
 
 
+def _prepare_file_drawers(
+    filepath: Path,
+    project_path: Path,
+    wing: str,
+    rooms: list,
+    agent: str,
+    stats: "MineStats | None" = None,
+) -> dict | None:
+    """Prepare drawer data for one file without any collection operations.
+
+    Returns a dict with prepared data ready for _commit_batch, or None if the
+    file should be skipped/error.
+    """
+    t0 = time.monotonic()
+    source_file = str(filepath)
+
+    try:
+        t_read = time.monotonic()
+        content = filepath.read_text(encoding="utf-8", errors="replace")
+        read_file_s = time.monotonic() - t_read
+    except OSError:
+        if stats:
+            stats.record_file({"status": "error", "source_file": source_file, "phase": "read_file", "error": "OSError", "total_s": time.monotonic() - t0})
+        return None
+
+    content = content.strip()
+    if len(content) < MIN_CHUNK_SIZE:
+        if stats:
+            stats.record_file({"status": "skipped", "source_file": source_file, "chunk_count": 0, "room": None, "total_s": time.monotonic() - t0})
+        return None
+
+    t_detect = time.monotonic()
+    room = detect_room(filepath, content, rooms, project_path)
+    detect_room_s = time.monotonic() - t_detect
+
+    t_chunk = time.monotonic()
+    chunks = chunk_with_metadata(content, source_file)
+    chunk_s = time.monotonic() - t_chunk
+    if not chunks:
+        if stats:
+            stats.record_file({"status": "skipped", "source_file": source_file, "chunk_count": 0, "room": room, "total_s": time.monotonic() - t0})
+        return None
+
+    revision_id = _compute_file_revision(source_file, content)
+    timestamp = datetime.utcnow().isoformat() + "Z"
+
+    try:
+        source_mtime = os.path.getmtime(source_file)
+    except OSError:
+        source_mtime = None
+
+    t_meta = time.monotonic()
+    documents, ids, metadatas = [], [], []
+    for idx, chunk in enumerate(chunks):
+        content_hash = _compute_content_hash(chunk["content"])
+        drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(idx)).encode()).hexdigest()[:24]}"
+        metadata = {
+            "wing": wing, "room": room, "source_file": source_file,
+            "chunk_index": idx, "added_by": agent, "agent_id": agent,
+            "timestamp": timestamp, "origin_type": "observation", "is_latest": True,
+            "supersedes_id": "", "language": detect_language(source_file),
+            "line_start": chunk.get("line_start", 0), "line_end": chunk.get("line_end", 0),
+            "symbol_name": chunk.get("symbol_name", ""), "symbol_scope": chunk.get("symbol_scope", ""),
+            "chunk_kind": chunk.get("chunk_kind", "mixed"),
+            "revision_id": revision_id, "content_hash": content_hash,
+        }
+        if source_mtime is not None:
+            metadata["source_mtime"] = source_mtime
+        documents.append(chunk["content"])
+        ids.append(drawer_id)
+        metadatas.append(metadata)
+    prepare_metadata_s = time.monotonic() - t_meta
+
+    total_s = time.monotonic() - t0
+    if stats:
+        stats.record_file({
+            "status": "prepared", "source_file": source_file, "room": room,
+            "chunk_count": len(documents), "total_s": total_s,
+            "read_file_s": read_file_s, "detect_room_s": detect_room_s,
+            "chunk_s": chunk_s,
+            "prepare_metadata_s": prepare_metadata_s,
+        })
+
+    return {
+        "source_file": source_file,
+        "documents": documents,
+        "ids": ids,
+        "metadatas": metadatas,
+        "room": room,
+        "prepare_metadata_s": prepare_metadata_s,
+    }
+
+
 def process_file(
     filepath: Path,
     project_path: Path,
@@ -793,6 +1109,7 @@ def process_file(
     agent: str,
     dry_run: bool,
     palace_path: str = None,
+    stats: "MineStats | None" = None,
 ) -> tuple:
     """Read, chunk, route, and file one file. Returns (drawer_count, room_name).
 
@@ -801,50 +1118,44 @@ def process_file(
     - New chunks that supersede old ones set is_latest=False on old, supersedes_id on new
     - Content-hash matching prevents unnecessary tombstones when content is unchanged
     """
-
+    t0 = time.monotonic()
     source_file = str(filepath)
 
-    try:
-        content = filepath.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    # Prepare drawer data (read, chunk, route — no collection ops)
+    prepared = _prepare_file_drawers(
+        filepath=filepath,
+        project_path=project_path,
+        wing=wing,
+        rooms=rooms,
+        agent=agent,
+        stats=stats,
+    )
+    if prepared is None:
         return 0, None
 
-    content = content.strip()
-    if len(content) < MIN_CHUNK_SIZE:
-        return 0, None
-
-    room = detect_room(filepath, content, rooms, project_path)
-
-    # Use code-aware chunking
-    chunks = chunk_with_metadata(content, source_file)
-    if not chunks:
-        return 0, None
+    documents = prepared["documents"]
+    ids = prepared["ids"]
+    metadatas = prepared["metadatas"]
+    room = prepared["room"]
+    prepare_metadata_s = prepared["prepare_metadata_s"]
 
     if dry_run:
-        print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
-        return len(chunks), room
+        print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(documents)} drawers)")
+        if stats:
+            stats.record_file({"status": "skipped", "source_file": source_file, "chunk_count": len(documents), "room": room, "total_s": time.monotonic() - t0})
+        return len(documents), room
 
-    # Compute revision_id for this file
-    revision_id = _compute_file_revision(source_file, content)
-    timestamp = datetime.utcnow().isoformat() + "Z"
-
-    try:
-        source_mtime = os.path.getmtime(source_file)
-    except OSError:
-        source_mtime = None
-
-    # Revision-based ingest: tombstone old chunks for this source_file
+    # ── Existing chunk lookup ──────────────────────────────────────────────
+    t_get = time.monotonic()
     try:
         existing = collection.get(
             where={"source_file": source_file, "is_latest": True},
-            include=["metadatas", "ids"]
+            include=["metadatas", "ids"],
         )
     except Exception:
         existing = {"ids": [], "metadatas": []}
+    revision_existing_get_s = time.monotonic() - t_get
 
-    # Build mapping from content_hash -> list of (old_id, old_meta)
-    # Using a list instead of dict to handle duplicate hashes at different positions.
-    # When multiple old chunks share the same content_hash, all must be superseded.
     old_chunks_by_hash: dict[str, list[tuple]] = defaultdict(list)
     if existing and existing.get("ids"):
         for old_id, old_meta in zip(existing["ids"], existing["metadatas"]):
@@ -853,64 +1164,23 @@ def process_file(
                 if old_hash:
                     old_chunks_by_hash[old_hash].append((old_id, old_meta))
 
-    # Prepare new chunks with code-aware metadata
-    documents, ids, metadatas = [], [], []
-    for idx, chunk in enumerate(chunks):
-        content_hash = _compute_content_hash(chunk["content"])
-        drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(idx)).encode()).hexdigest()[:24]}"
-
-        metadata = {
-            "wing": wing,
-            "room": room,
-            "source_file": source_file,
-            "chunk_index": idx,
-            "added_by": agent,
-            "agent_id": agent,
-            "timestamp": timestamp,
-            "origin_type": "observation",
-            "is_latest": True,
-            "supersedes_id": "",
-            # Code-aware fields
-            "language": detect_language(source_file),
-            "line_start": chunk.get("line_start", 0),
-            "line_end": chunk.get("line_end", 0),
-            "symbol_name": chunk.get("symbol_name", ""),
-            "symbol_scope": chunk.get("symbol_scope", ""),
-            "chunk_kind": chunk.get("chunk_kind", "mixed"),
-            "revision_id": revision_id,
-            "content_hash": content_hash,
-        }
-        if source_mtime is not None:
-            metadata["source_mtime"] = source_mtime
-
-        # Tombstone: find old chunk(s) with same content_hash.
-        # ALL matching old chunks are superseded by this new chunk.
-        # We store all superseded IDs as pipe-separated string (single-string contract).
-        superseded_ids_for_chunk = []
+    # Update supersedes_id on matching content hashes
+    for meta in metadatas:
+        content_hash = meta.get("content_hash", "")
         if content_hash in old_chunks_by_hash:
-            for old_id, old_meta in old_chunks_by_hash[content_hash]:
-                superseded_ids_for_chunk.append(old_id)
-            # Store all IDs as pipe-separated string; parse during tombstoning.
-            metadata["supersedes_id"] = "|".join(superseded_ids_for_chunk)
-            metadata["is_latest"] = True
+            superseded_ids_for_chunk = [old_id for old_id, _ in old_chunks_by_hash[content_hash]]
+            meta["supersedes_id"] = "|".join(superseded_ids_for_chunk)
 
-        documents.append(chunk["content"])
-        ids.append(drawer_id)
-        metadatas.append(metadata)
-
-    # Upsert new chunks
+    # ── Upsert new chunks ──────────────────────────────────────────────────
+    t_upsert = time.monotonic()
     collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
+    collection_upsert_s = time.monotonic() - t_upsert
 
-    # Tombstone old chunks that have no matching new content_hash.
-    # An old chunk is tombstoned when it was not matched by any new chunk.
-    # This is now a set operation: all old IDs minus superseded IDs = survivors to tombstone.
+    # ── Tombstone stale chunks ─────────────────────────────────────────────
     all_old_ids = set()
     for old_list in old_chunks_by_hash.values():
         for old_id, _ in old_list:
             all_old_ids.add(old_id)
-
-    # Superseded IDs are those referenced by new chunks via supersedes_id.
-    # supersedes_id is pipe-separated when multiple old chunks share the same hash.
     superseded_ids = set()
     for meta in metadatas:
         raw = meta.get("supersedes_id", "")
@@ -919,28 +1189,181 @@ def process_file(
                 if sid:
                     superseded_ids.add(sid)
 
-    # Tombstone every old chunk that was NOT superseded — single batch upsert
+    tombstone_upsert_s = 0.0
     tombstone_ids, tombstone_docs, tombstone_metas = [], [], []
     for old_hash, old_list in old_chunks_by_hash.items():
         for old_id, old_meta in old_list:
             if old_id not in superseded_ids:
                 tombstone_ids.append(old_id)
-                tombstone_docs.append(
-                    old_meta.get("source_content", old_meta.get("document", ""))
-                )
+                tombstone_docs.append(old_meta.get("source_content", old_meta.get("document", "")))
                 tombstone_metas.append({"is_latest": False})
 
     if tombstone_ids:
+        t_tomb = time.monotonic()
         try:
-            collection.upsert(
-                documents=tombstone_docs,
-                ids=tombstone_ids,
-                metadatas=tombstone_metas,
-            )
+            collection.upsert(documents=tombstone_docs, ids=tombstone_ids, metadatas=tombstone_metas)
         except Exception:
-            pass  # Best-effort tombstone
+            pass
+        tombstone_upsert_s = time.monotonic() - t_tomb
+
+    total_s = time.monotonic() - t0
+    if stats:
+        stats.record_file({
+            "status": "added", "source_file": source_file, "room": room,
+            "chunk_count": len(documents), "total_s": total_s,
+            "read_file_s": prepared.get("read_file_s", 0), "detect_room_s": prepared.get("detect_room_s", 0),
+            "chunk_s": prepared.get("chunk_s", 0), "revision_existing_get_s": revision_existing_get_s,
+            "prepare_metadata_s": prepare_metadata_s, "collection_upsert_s": collection_upsert_s,
+            "tombstone_upsert_s": tombstone_upsert_s,
+        })
 
     return len(documents), room
+
+
+# =============================================================================
+# BATCHED COMMIT
+# =============================================================================
+
+
+def _commit_batch(
+    pending: list[dict],
+    collection,
+    wing: str,
+    rooms: list,
+    agent: str,
+    palace_path: str,
+    stats: "MineStats | None",
+    manifest: "MiningManifest | None",
+    project_path: str,
+) -> tuple[int, int, dict]:
+    """Commit a batch of prepared file results sequentially.
+
+    Batches the existing-chunk lookup across all pending files using a single
+    $or query, then processes each file's tombstones and upserts one at a time.
+    Maintains per-file atomicity: one bad file does not poison others.
+
+    Returns (total_drawers, files_committed, phase_totals).
+    """
+    if not pending:
+        return 0, 0, {}
+
+    # ── Phase 1: batch existing-chunk lookup ──────────────────────────────
+    # Build a single $or query for all source_files to get existing chunks.
+    # Uses LanceDB's SQL id IN (...) path — safe for hex ids.
+    t_batch_get = time.monotonic()
+    source_files = [p["source_file"] for p in pending]
+    if len(source_files) == 1:
+        where_clause = {"source_file": source_files[0]}
+    else:
+        where_clause = {
+            "$or": [{"source_file": {"$eq": sf}} for sf in source_files]
+        }
+
+    existing = {"ids": [], "metadatas": []}
+    try:
+        existing = collection.get(
+            where={**where_clause, "is_latest": True},
+            include=["metadatas", "ids"],
+        )
+    except Exception:
+        pass  # Fail-open: treat as no existing chunks
+    batch_get_s = time.monotonic() - t_batch_get
+
+    # Index existing chunks by source_file for O(1) per-file lookup
+    by_source: dict[str, list[tuple]] = defaultdict(list)
+    if existing and existing.get("ids"):
+        for old_id, old_meta in zip(existing["ids"], existing["metadatas"]):
+            if old_meta:
+                by_source[old_meta.get("source_file", "")].append((old_id, old_meta))
+
+    # ── Phase 2: per-file tombstones + upserts (sequential, single writer) ─
+    total_drawers = 0
+    files_committed = 0
+    phase_totals = defaultdict(float)
+
+    for p in pending:
+        sf = p["source_file"]
+        documents = p["documents"]
+        ids = p["ids"]
+        metadatas = p["metadatas"]
+        room = p["room"]
+
+        old_chunks_by_hash: dict[str, list[tuple]] = defaultdict(list)
+        for old_id, old_meta in by_source.get(sf, []):
+            old_hash = old_meta.get("content_hash", "")
+            if old_hash:
+                old_chunks_by_hash[old_hash].append((old_id, old_meta))
+
+        # Tombstones
+        all_old_ids = set()
+        for old_list in old_chunks_by_hash.values():
+            for old_id, _ in old_list:
+                all_old_ids.add(old_id)
+        superseded_ids = set()
+        for meta in metadatas:
+            raw = meta.get("supersedes_id", "")
+            if raw:
+                for sid in raw.split("|"):
+                    if sid:
+                        superseded_ids.add(sid)
+
+        tombstone_ids, tombstone_docs, tombstone_metas = [], [], []
+        for old_hash, old_list in old_chunks_by_hash.items():
+            for old_id, old_meta in old_list:
+                if old_id not in superseded_ids:
+                    tombstone_ids.append(old_id)
+                    tombstone_docs.append(old_meta.get("source_content", old_meta.get("document", "")))
+                    tombstone_metas.append({"is_latest": False})
+
+        t_upsert = time.monotonic()
+        collection_upsert_s = 0.0
+        if documents:
+            try:
+                collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
+            except Exception:
+                # Per-file failure isolation: continue to next file
+                continue
+        collection_upsert_s = time.monotonic() - t_upsert
+
+        t_tomb = time.monotonic()
+        if tombstone_ids:
+            try:
+                collection.upsert(documents=tombstone_docs, ids=tombstone_ids, metadatas=tombstone_metas)
+            except Exception:
+                pass
+        tombstone_upsert_s = time.monotonic() - t_tomb
+
+        total_s = batch_get_s + collection_upsert_s + tombstone_upsert_s
+        if stats:
+            stats.record_file({
+                "status": "added", "source_file": sf, "room": room,
+                "chunk_count": len(documents), "total_s": total_s,
+                "batch_get_s": batch_get_s,
+                "prepare_metadata_s": p.get("prepare_metadata_s", 0),
+                "collection_upsert_s": collection_upsert_s,
+                "tombstone_upsert_s": tombstone_upsert_s,
+            })
+
+        phase_totals["collection_upsert_s"] += collection_upsert_s
+        phase_totals["tombstone_upsert_s"] += tombstone_upsert_s
+        total_drawers += len(documents)
+        files_committed += 1
+
+        # Update manifest for successfully committed file
+        if manifest is not None:
+            mf = p.get("_manifest")
+            if mf:
+                try:
+                    manifest.update_success(
+                        wing, project_path, sf,
+                        mf["size_bytes"], mf["mtime_ns"],
+                        mf["qh"], len(documents),
+                    )
+                except Exception:
+                    pass  # Fail-open
+
+    phase_totals["batch_get_s"] = batch_get_s
+    return total_drawers, files_committed, phase_totals
 
 
 # =============================================================================
@@ -1073,34 +1496,139 @@ def mine(
     files_skipped = 0
     room_counts = defaultdict(int)
 
-    for i, filepath in enumerate(files, 1):
-        drawers, room = process_file(
-            filepath=filepath,
-            project_path=project_path,
+    stats = MineStats()
+
+    # Open manifest (fail-open: any error leaves manifest as None)
+    manifest = None
+    use_force = os.environ.get("MEMPALACE_MINE_FORCE", "0") == "1"
+    if palace_path and not use_force:
+        try:
+            manifest = MiningManifest(palace_path)
+        except Exception:
+            pass
+
+    # Batching accumulator — reduces per-file collection.get() calls
+    pending: list[dict] = []
+
+    def _flush_pending():
+        nonlocal total_drawers, files_skipped
+        if not pending:
+            return
+        drawers, committed, _ = _commit_batch(
+            pending=pending,
             collection=collection,
             wing=wing,
             rooms=rooms,
             agent=agent,
-            dry_run=dry_run,
             palace_path=palace_path,
+            stats=stats,
+            manifest=manifest,
+            project_path=str(project_path),
         )
-        if drawers == 0 and not dry_run:
-            files_skipped += 1
+        total_drawers += drawers
+        files_skipped += len(pending) - committed
+        for p in pending:
+            room_counts[p["room"]] += 1
+            print(f"  ✓ {p['source_file'][:50]:50} +{len(p['documents'])}")
+        pending.clear()
+
+    for i, filepath in enumerate(files, 1):
+        # --- Manifest skip: compute fingerprint before expensive work ---
+        if manifest is not None and not dry_run:
+            try:
+                file_stat = filepath.stat()
+                size_bytes = file_stat.st_size
+                mtime_ns = file_stat.st_mtime_ns
+                qh = _quick_hash(filepath, size_bytes)
+                if qh is not None and manifest.is_unchanged(
+                    wing, str(project_path), str(filepath), size_bytes, mtime_ns, qh
+                ):
+                    files_skipped += 1
+                    if os.environ.get("MEMPALACE_MINE_PROFILE") == "1":
+                        print(f"    [skip manifest] {filepath.name}")
+                    continue
+            except Exception:
+                pass  # Fail-open: proceed
+
+        if dry_run:
+            # Dry run: use original process_file (handles its own output)
+            try:
+                drawers, room = process_file(
+                    filepath=filepath,
+                    project_path=project_path,
+                    collection=collection,
+                    wing=wing,
+                    rooms=rooms,
+                    agent=agent,
+                    dry_run=dry_run,
+                    palace_path=palace_path,
+                    stats=stats,
+                )
+            except Exception:
+                drawers = 0
+                room = None
+            if drawers == 0:
+                files_skipped += 1
+            else:
+                total_drawers += drawers
+                room_counts[room] += 1
         else:
-            total_drawers += drawers
-            room_counts[room] += 1
-            if not dry_run:
-                print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+            # Real mining: prepare drawer data, accumulate, batch commit
+            try:
+                prepared = _prepare_file_drawers(
+                    filepath=filepath,
+                    project_path=project_path,
+                    wing=wing,
+                    rooms=rooms,
+                    agent=agent,
+                    stats=stats,
+                )
+            except Exception:
+                if manifest is not None:
+                    manifest.update_error(wing, str(project_path), str(filepath))
+                prepared = None
+
+            if prepared is None:
+                files_skipped += 1
+                continue
+
+            # Attach manifest data for _commit_batch to update manifest
+            if manifest is not None:
+                try:
+                    file_stat = filepath.stat()
+                    prepared["_manifest"] = {
+                        "size_bytes": file_stat.st_size,
+                        "mtime_ns": file_stat.st_mtime_ns,
+                        "qh": _quick_hash(filepath, file_stat.st_size),
+                    }
+                except Exception:
+                    pass  # Fail-open: no manifest data
+
+            pending.append(prepared)
+
+            # Flush on thresholds
+            drawer_count = sum(len(p["documents"]) for p in pending)
+            if len(pending) >= _MEMPALACE_MINE_BATCH_FILES or drawer_count >= _MEMPALACE_MINE_BATCH_DRAWERS:
+                _flush_pending()
+
+    # Final flush
+    if not dry_run and pending:
+        _flush_pending()
+
+    if manifest is not None:
+        manifest.close()
 
     # Build cross-reference symbol index for all files
     if not dry_run and files:
         try:
             si = SymbolIndex.get(palace_path)
             si.build_index(str(project_path), [str(f) for f in files])
-            stats = si.stats()
-            print(f"  Symbol index: {stats['total_symbols']} symbols, {stats['total_files']} files")
+            si_stats = si.stats()
+            print(f"  Symbol index: {si_stats['total_symbols']} symbols, {si_stats['total_files']} files")
         except Exception:
             pass
+
+    stats.print_summary()
 
     print(f"\n{'=' * 55}")
     print("  Done.")

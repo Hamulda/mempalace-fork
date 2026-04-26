@@ -13,4 +13,7 @@ node_modules/
 .DS_Store
 .env
 .mempalace/
+mining_manifest.sqlite3
+mining_manifest.sqlite3-shm
+mining_manifest.sqlite3-wal
 si_*/

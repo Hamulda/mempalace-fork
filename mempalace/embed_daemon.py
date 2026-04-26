@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import socket
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -189,6 +191,39 @@ def get_pid_path() -> str:
     return get_socket_path().replace(".sock", ".pid")
 
 
+def _daemon_sanitize_embeddings(
+    embeddings: list[list[float]], *, dims: int = 256
+) -> list[list[float]]:
+    """
+    Ensure all embeddings are finite before sending to client.
+
+    Replaces sparse NaN/Inf with 0.0 and renormalizes.
+    Raises RuntimeError if an embedding is all-invalid (cannot be repaired).
+    """
+    repaired = 0
+    for emb in embeddings:
+        has_bad = any(not math.isfinite(v) for v in emb)
+        if not has_bad:
+            continue
+        # Replace bad values with 0.0
+        cleaned = [0.0 if not math.isfinite(v) else v for v in emb]
+        norm = math.sqrt(sum(v * v for v in cleaned))
+        if norm > 1e-9:
+            factor = 1.0 / norm
+            for idx in range(len(cleaned)):
+                cleaned[idx] *= factor
+            repaired += 1
+            logger.debug("Daemon repaired NaN/Inf embedding [%d values]", sum(1 for v in emb if not math.isfinite(v)))
+        else:
+            raise RuntimeError(
+                f"Daemon produced degenerate embedding (all-zero or all-NaN). "
+                "The MLX model failed on this input."
+            )
+    if repaired:
+        logger.info("Daemon repaired %d NaN/Inf embedding(s)", repaired)
+    return embeddings
+
+
 def _handle_client(conn: socket.socket, model) -> None:
     """Handle a single client request in a dedicated thread."""
     from mempalace.memory_guard import MemoryGuard
@@ -234,6 +269,8 @@ def _handle_client(conn: socket.socket, model) -> None:
                 chunk = texts[i:i + batch_size]
                 chunk_embs = [emb.tolist() for emb in model.embed(chunk)]
                 all_embeddings.extend(chunk_embs)
+            # Daemon-side finite check: repair sparse NaN/Inf before JSON response
+            all_embeddings = _daemon_sanitize_embeddings(all_embeddings)
             response = {"embeddings": all_embeddings, "error": None}
 
         payload = json.dumps(response).encode("utf-8")
@@ -257,10 +294,36 @@ def run_daemon() -> None:
         stream=sys.stdout,
     )
 
-    # Load fastembed model with optimal provider for platform
-    logger.info("Loading fastembed model %s...", EMBED_MODEL)
-    model = _create_embedding_model()
-    logger.info("Model loaded and warmed up.")
+    import platform
+    is_apple_silicon = (
+        platform.system() == "Darwin" and platform.machine() == "arm64"
+    )
+
+    # Detect model type for logging
+    model_type = "unknown"
+    if is_apple_silicon:
+        try:
+            import mlx_embeddings
+            model_type = "MLX (Apple Silicon)"
+        except Exception:
+            model_type = "CoreML/CPU"
+    else:
+        model_type = "CPU/fastembed"
+
+    logger.info("Loading %s embedding model %s...", model_type, EMBED_MODEL)
+    t0 = time.monotonic()
+    try:
+        model = _create_embedding_model()
+    except Exception as e:
+        logger.error("Model load failed: %s — exiting", e)
+        sys.stderr.write(f"FATAL: model load failed: {e}\n")
+        sys.exit(1)
+    warmup_ms = (time.monotonic() - t0) * 1000
+    logger.info(
+        "Model loaded and warmed up (%.0fms, type=%s) at %s",
+        warmup_ms, model_type,
+        get_socket_path(),
+    )
 
     sock_path = get_socket_path()
     Path(sock_path).parent.mkdir(parents=True, exist_ok=True)

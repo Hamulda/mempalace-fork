@@ -484,7 +484,10 @@ def cmd_embed_daemon(args):
                 start_new_session=True,
             )
 
-            timeout_s = float(os.environ.get("MEMPALACE_EMBED_DAEMON_STARTUP_TIMEOUT", "30"))
+            timeout_s = float(os.environ.get(
+                "MEMPALACE_EMBED_DAEMON_STARTUP_TIMEOUT",
+                os.environ.get("MEMPALACE_EMBED_SOCKET_TIMEOUT", "120"),
+            ))
             deadline = time.monotonic() + timeout_s
             ready = False
             while time.monotonic() < deadline:
