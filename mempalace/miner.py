@@ -1524,113 +1524,118 @@ def mine(
             print(f"  ✓ {p['source_file'][:50]:50} +{len(p['documents'])}")
         pending.clear()
 
-    for i, filepath in enumerate(files, 1):
-        # --- Manifest skip: compute fingerprint before expensive work ---
-        if manifest is not None and not dry_run:
-            try:
-                file_stat = filepath.stat()
-                size_bytes = file_stat.st_size
-                mtime_ns = file_stat.st_mtime_ns
-                qh = _quick_hash(filepath, size_bytes)
-                if qh is not None and manifest.is_unchanged(
-                    wing, str(project_path), str(filepath), size_bytes, mtime_ns, qh
-                ):
-                    files_skipped += 1
-                    if os.environ.get("MEMPALACE_MINE_PROFILE") == "1":
-                        print(f"    [skip manifest] {filepath.name}")
-                    continue
-            except Exception:
-                pass  # Fail-open: proceed
-
-        if dry_run:
-            # Dry run: use original process_file (handles its own output)
-            try:
-                drawers, room = process_file(
-                    filepath=filepath,
-                    project_path=project_path,
-                    collection=collection,
-                    wing=wing,
-                    rooms=rooms,
-                    agent=agent,
-                    dry_run=dry_run,
-                    palace_path=palace_path,
-                    stats=stats,
-                )
-            except Exception:
-                drawers = 0
-                room = None
-            if drawers == 0:
-                files_skipped += 1
-            else:
-                total_drawers += drawers
-                room_counts[room] += 1
-        else:
-            # Real mining: prepare drawer data, accumulate, batch commit
-            try:
-                prepared = _prepare_file_drawers(
-                    filepath=filepath,
-                    project_path=project_path,
-                    wing=wing,
-                    rooms=rooms,
-                    agent=agent,
-                    stats=stats,
-                )
-            except Exception:
-                if manifest is not None:
-                    manifest.update_error(wing, str(project_path), str(filepath))
-                prepared = None
-
-            if prepared is None:
-                files_skipped += 1
-                continue
-
-            # Attach manifest data for _commit_batch to update manifest
-            if manifest is not None:
+    exc_raised = False
+    try:
+        for i, filepath in enumerate(files, 1):
+            # --- Manifest skip: compute fingerprint before expensive work ---
+            if manifest is not None and not dry_run:
                 try:
                     file_stat = filepath.stat()
-                    prepared["_manifest"] = {
-                        "size_bytes": file_stat.st_size,
-                        "mtime_ns": file_stat.st_mtime_ns,
-                        "qh": _quick_hash(filepath, file_stat.st_size),
-                    }
+                    size_bytes = file_stat.st_size
+                    mtime_ns = file_stat.st_mtime_ns
+                    qh = _quick_hash(filepath, size_bytes)
+                    if qh is not None and manifest.is_unchanged(
+                        wing, str(project_path), str(filepath), size_bytes, mtime_ns, qh
+                    ):
+                        files_skipped += 1
+                        if os.environ.get("MEMPALACE_MINE_PROFILE") == "1":
+                            print(f"    [skip manifest] {filepath.name}")
+                        continue
                 except Exception:
-                    pass  # Fail-open: no manifest data
+                    pass  # Fail-open: proceed
 
-            pending.append(prepared)
+            if dry_run:
+                # Dry run: use original process_file (handles its own output)
+                try:
+                    drawers, room = process_file(
+                        filepath=filepath,
+                        project_path=project_path,
+                        collection=collection,
+                        wing=wing,
+                        rooms=rooms,
+                        agent=agent,
+                        dry_run=dry_run,
+                        palace_path=palace_path,
+                        stats=stats,
+                    )
+                except Exception:
+                    drawers = 0
+                    room = None
+                if drawers == 0:
+                    files_skipped += 1
+                else:
+                    total_drawers += drawers
+                    room_counts[room] += 1
+            else:
+                # Real mining: prepare drawer data, accumulate, batch commit
+                try:
+                    prepared = _prepare_file_drawers(
+                        filepath=filepath,
+                        project_path=project_path,
+                        wing=wing,
+                        rooms=rooms,
+                        agent=agent,
+                        stats=stats,
+                    )
+                except Exception:
+                    if manifest is not None:
+                        manifest.update_error(wing, str(project_path), str(filepath))
+                    prepared = None
 
-            # Flush on thresholds
-            drawer_count = sum(len(p["documents"]) for p in pending)
-            if len(pending) >= _MEMPALACE_MINE_BATCH_FILES or drawer_count >= _MEMPALACE_MINE_BATCH_DRAWERS:
-                _flush_pending()
+                if prepared is None:
+                    files_skipped += 1
+                    continue
 
-    # Final flush
-    if not dry_run and pending:
-        _flush_pending()
+                # Attach manifest data for _commit_batch to update manifest
+                if manifest is not None:
+                    try:
+                        file_stat = filepath.stat()
+                        prepared["_manifest"] = {
+                            "size_bytes": file_stat.st_size,
+                            "mtime_ns": file_stat.st_mtime_ns,
+                            "qh": _quick_hash(filepath, file_stat.st_size),
+                        }
+                    except Exception:
+                        pass  # Fail-open: no manifest data
 
-    if manifest is not None:
-        manifest.close()
+                pending.append(prepared)
 
-    # Build cross-reference symbol index for all files
-    if not dry_run and files:
-        try:
-            si = SymbolIndex.get(palace_path)
-            si.build_index(str(project_path), [str(f) for f in files])
-            si_stats = si.stats()
-            print(f"  Symbol index: {si_stats['total_symbols']} symbols, {si_stats['total_files']} files")
-        except Exception:
-            pass
+                # Flush on thresholds
+                drawer_count = sum(len(p["documents"]) for p in pending)
+                if len(pending) >= _MEMPALACE_MINE_BATCH_FILES or drawer_count >= _MEMPALACE_MINE_BATCH_DRAWERS:
+                    _flush_pending()
 
-    stats.print_summary()
+        # Final flush
+        if not dry_run and pending:
+            _flush_pending()
 
-    # Write JSON profile if path is set (guaranteed even on exception)
-    profile_json = os.environ.get("MEMPALACE_MINE_PROFILE_JSON", "")
-    if profile_json:
-        try:
-            report = stats.final_report()
-            with open(profile_json, "w") as f:
-                _json.dump(report, f, indent=2)
-        except Exception:
-            pass
+        if manifest is not None:
+            manifest.close()
+
+        # Build cross-reference symbol index for all files
+        if not dry_run and files:
+            try:
+                si = SymbolIndex.get(palace_path)
+                si.build_index(str(project_path), [str(f) for f in files])
+                si_stats = si.stats()
+                print(f"  Symbol index: {si_stats['total_symbols']} symbols, {si_stats['total_files']} files")
+            except Exception:
+                pass
+    except Exception:
+        exc_raised = True
+        raise
+    finally:
+        # Always write profile JSON even on exception — re-raises below
+        stats.print_summary()
+
+        profile_json = os.environ.get("MEMPALACE_MINE_PROFILE_JSON", "")
+        if profile_json:
+            try:
+                report = stats.final_report()
+                with open(profile_json, "w") as f:
+                    _json.dump(report, f, indent=2)
+            except Exception:
+                pass
 
     print(f"\n{'=' * 55}")
     print("  Done.")

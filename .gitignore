@@ -1,3 +1,4 @@
+.rtk/
 *.egg-info/
 dist/
 build/

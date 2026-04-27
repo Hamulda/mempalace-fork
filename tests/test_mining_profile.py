@@ -7,13 +7,21 @@ Verifies:
 - JSON report writes valid JSON
 - Progress output uses flush (no crash)
 - Periodic progress every 25 files
+- mine() writes bounded profile JSON even on exception (finally block)
 """
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
+
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Use chroma backend for integration tests (avoids MLX dependency)
+os.environ["MEMPALACE_BACKEND"] = "chroma"
 
 
 class TestMineStats:
@@ -266,3 +274,109 @@ class TestMineStats:
 
         report = stats.final_report()
         assert report["total_files"] == 0
+
+
+class TestMineProfileJson:
+    """Integration tests for MEMPALACE_MINE_PROFILE_JSON in mine().
+
+    Uses the session-wide _mock_embed_for_all_tests from conftest which patches
+    _embed_texts to return fast deterministic fakes.  The real mining path runs
+    (scan → chunk → upsert) but without any MLX daemon subprocesses.
+    """
+
+    def _make_project(self, tmpdir: Path) -> Path:
+        """Create a minimal mempalace-registered project in tmpdir."""
+        proj = tmpdir / "project"
+        proj.mkdir()
+        (proj / "mempalace.yaml").write_text(
+            yaml.dump({"wing": "test-wing", "rooms": [{"name": "general", "description": "General"}]})
+        )
+        (proj / "main.py").write_text("def hello():\n    print('world')\n" * 10)
+        return proj
+
+    def test_profile_json_written_on_success(self, tmp_path):
+        """mine() writes valid JSON to MEMPALACE_MINE_PROFILE_JSON on success."""
+        from mempalace.miner import mine
+
+        proj = self._make_project(tmp_path)
+        palace = tmp_path / "palace"
+        profile = tmp_path / "profile.json"
+
+        os.environ["MEMPALACE_MINE_PROFILE"] = "1"
+        os.environ["MEMPALACE_MINE_PROFILE_JSON"] = str(profile)
+
+        mine(str(proj), str(palace))
+
+        assert profile.exists(), "profile JSON not written after mine()"
+        data = json.loads(profile.read_text())
+        assert "total_files" in data
+        assert "processed_files" in data
+        assert "skipped_files" in data
+        assert "error_files" in data
+        assert "total_drawers_added" in data
+        assert "phase_totals" in data
+        assert "slowest_files" in data
+        assert "largest_chunk_files" in data
+        assert "errors" in data
+        assert "total_runtime_s" in data
+        assert "files_per_sec" in data
+
+        os.environ.pop("MEMPALACE_MINE_PROFILE", None)
+        os.environ.pop("MEMPALACE_MINE_PROFILE_JSON", None)
+
+    def test_profile_json_written_and_required_keys_present(self, tmp_path):
+        """mine() writes valid JSON with all required keys when a real mining run occurs.
+
+        Uses the session-wide _mock_embed_for_all_tests fixture which patches
+        _embed_texts to return fast deterministic fakes (no MLX subprocess).
+        """
+        from mempalace.miner import mine
+
+        proj = self._make_project(tmp_path)
+        palace = tmp_path / "palace"
+        profile = tmp_path / "profile.json"
+
+        os.environ["MEMPALACE_MINE_PROFILE"] = "1"
+        os.environ["MEMPALACE_MINE_PROFILE_JSON"] = str(profile)
+
+        # The conftest session fixture patches _embed_texts, so mining runs
+        # in-process without spawning an embed daemon subprocess.
+        mine(str(proj), str(palace))
+
+        assert profile.exists(), "profile JSON not written after mine()"
+        data = json.loads(profile.read_text())
+
+        # Verify all required keys are present
+        required = {
+            "total_files", "processed_files", "skipped_files", "error_files",
+            "total_drawers_added", "phase_totals", "slowest_files",
+            "largest_chunk_files", "errors", "total_runtime_s", "files_per_sec",
+        }
+        assert required.issubset(data.keys()), f"Missing keys: {required - data.keys()}"
+
+        os.environ.pop("MEMPALACE_MINE_PROFILE", None)
+        os.environ.pop("MEMPALACE_MINE_PROFILE_JSON", None)
+
+    def test_profile_json_no_absolute_local_paths(self, tmp_path):
+        """Profile JSON slowest/largest entries contain no absolute /tmp or $HOME paths."""
+        from mempalace.miner import mine
+
+        proj = self._make_project(tmp_path)
+        palace = tmp_path / "palace"
+        profile = tmp_path / "profile.json"
+
+        os.environ["MEMPALACE_MINE_PROFILE"] = "1"
+        os.environ["MEMPALACE_MINE_PROFILE_JSON"] = str(profile)
+
+        mine(str(proj), str(palace))
+
+        data = json.loads(profile.read_text())
+        home = str(Path.home())
+        for key in ("slowest_files", "largest_chunk_files"):
+            for entry in data.get(key, []):
+                sf = entry.get("source_file", "")
+                assert not sf.startswith("/tmp"), f"{key} contains /tmp path: {sf}"
+                assert not sf.startswith(home), f"{key} contains home path: {sf}"
+
+        os.environ.pop("MEMPALACE_MINE_PROFILE", None)
+        os.environ.pop("MEMPALACE_MINE_PROFILE_JSON", None)
