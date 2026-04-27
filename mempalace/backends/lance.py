@@ -1314,6 +1314,8 @@ def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]])
                 df = df[df["_meta"].apply(lambda m: m.get(key) is not None and m.get(key) < val)]
             elif op == "$lte":
                 df = df[df["_meta"].apply(lambda m: m.get(key) is not None and m.get(key) <= val)]
+            elif op == "$starts_with":
+                df = df[df["_meta"].apply(lambda m: isinstance(m.get(key), str) and m.get(key).startswith(val))]
         else:
             # Scalar metadata equality: {"wing": "x"} → metadata.wing == 'x'
             df = df[df["_meta"].apply(lambda m: m.get(key) == cond)]
@@ -1461,17 +1463,12 @@ class LanceCollection(BaseCollection):
         else:
             distances = [0.0] * len(results)
 
-        metas_out = []
-        for meta_json in results["metadata_json"]:
-            try:
-                metas_out.append(json.loads(meta_json) if meta_json else {})
-            except json.JSONDecodeError:
-                metas_out.append({})
-
+        # Use _parse_metadata — parses all metadata in one vectorized pass (O(n) not O(n*json))
+        df = _parse_metadata(results)
         return {
             "ids": [[str(r) for r in results["id"]]],
             "documents": [[str(r) for r in results["document"]]],
-            "metadatas": [metas_out],
+            "metadatas": [df["_meta"].tolist()],
             "distances": [distances],
         }
 
@@ -1826,12 +1823,9 @@ class LanceCollection(BaseCollection):
 
         ids_out = [str(r) for r in results["id"]]
         docs_out = [str(r) for r in results["document"]]
-        metas_out = []
-        for meta_json in results["metadata_json"]:
-            try:
-                metas_out.append(json.loads(meta_json) if meta_json else {})
-            except json.JSONDecodeError:
-                metas_out.append({})
+        # Use _parse_metadata — parses all metadata in one vectorized pass
+        results = _parse_metadata(results)
+        metas_out = results["_meta"].tolist()
 
         # LanceDB returns _distance (lower = better); ChromaDB convention matches
         # If time-decay was applied, use _combined_score
@@ -1980,13 +1974,11 @@ class LanceCollection(BaseCollection):
         if limit:
             results = results.head(limit)
 
+        results = _parse_metadata(results)
         return {
             "ids": results["id"].tolist(),
             "documents": results["document"].tolist(),
-            "metadatas": [
-                json.loads(m) if m else {}
-                for m in results["metadata_json"]
-            ],
+            "metadatas": results["_meta"].tolist(),
         }
 
     def delete(

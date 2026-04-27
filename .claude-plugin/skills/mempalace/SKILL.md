@@ -45,7 +45,7 @@ Searchable memory palace for AI sessions. Mine projects, store decisions, recall
 |------|-------------|
 | `mempalace_search` | Semantic search across all memories |
 | `mempalace_hybrid_search` | Semantic + keyword + KG combined |
-| `mempalace_code_search` | Code-specialized search with language/symbol filters |
+| `mempalace_search_code` | Code-specialized search with language/symbol/file-path filters |
 | `mempalace_kg_query` | Query knowledge graph entities |
 | `mempalace_diary_read` | Read agent diary |
 | `mempalace_status` | Palace overview: counts, wings, size |

@@ -235,7 +235,11 @@ def _auto_detect(directory: str, known_people: list) -> list:
             if e["name"].lower() not in known_names and e["confidence"] >= 0.7
         ]
         return new_people
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger("mempalace.onboarding").warning(
+            "auto_detect failed for %s: %s", directory, e
+        )
         return []
 
 

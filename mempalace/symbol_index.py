@@ -27,8 +27,15 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+try:
+    from .code_index.ast_extractor import extract_code_structure as _extract_code_structure
+except ImportError:
+    from .symbol_index import extract_symbols as _extract_legacy
+    _extract_code_structure = None  # type: ignore[assignment]
 
 
 # =============================================================================
@@ -234,6 +241,12 @@ CREATE INDEX IF NOT EXISTS idx_symbol_file_line ON symbol_index(symbol_name, fil
 CREATE INDEX IF NOT EXISTS idx_direct_imports ON symbol_index(direct_imports);
 """
 
+_SYMBOL_INDEX_SCHEMA_V2 = """
+ALTER TABLE symbol_index ADD COLUMN parent_symbol TEXT;
+ALTER TABLE symbol_index ADD COLUMN symbol_fqn TEXT;
+ALTER TABLE symbol_index ADD COLUMN extraction_backend TEXT DEFAULT 'regex';
+"""
+
 
 class SymbolIndex:
     """
@@ -266,6 +279,17 @@ class SymbolIndex:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SYMBOL_INDEX_SCHEMA)
+
+        # Idempotent migration: add parent_symbol, symbol_fqn, extraction_backend
+        for stmt in _SYMBOL_INDEX_SCHEMA_V2.split(";"):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
         self._conn = conn
 
     @classmethod
@@ -302,7 +326,7 @@ class SymbolIndex:
         old (symbol_name, file_path) uniqueness model.
 
         Returns list of dicts with: file_path, line_start, line_end, symbol_type,
-        file_signature, imports, exports.
+        file_signature, imports, exports, parent_symbol, symbol_fqn, extraction_backend.
         """
         with self._lock:
             if not self._conn:
@@ -313,7 +337,8 @@ class SymbolIndex:
                 collation = "COLLATE BINARY" if exact else ""
                 cur = self._conn.execute(
                     f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end,
-                              file_signature, imports, exports
+                              file_signature, imports, exports, parent_symbol, symbol_fqn,
+                              extraction_backend
                        FROM symbol_index
                        WHERE symbol_name {collation} = ?
                        ORDER BY file_path""",
@@ -330,6 +355,9 @@ class SymbolIndex:
                         "file_signature": r[5] or "",
                         "imports": r[6] or "",
                         "exports": r[7] or "",
+                        "parent_symbol": r[8],
+                        "symbol_fqn": r[9],
+                        "extraction_backend": r[10] or "regex",
                     }
                     for r in rows
                 ]
@@ -427,21 +455,26 @@ class SymbolIndex:
         Get all symbols defined in a file.
 
         Returns dict with keys:
-        - symbols: list of {name, type, line_start, line_end} for each distinct
-          (name, line_start) pair. Multiple definitions with the same name at
-          different lines are all included.
+        - symbols: list of {name, type, line_start, line_end, parent, fqn} for each
+          distinct (name, line_start) pair. Multiple definitions with the same name
+          at different lines are all included. parent/fqn may be None for regex-only.
         - imports: list of module/package names imported by this file
         - exports: list of public names (uppercase-first assignments, heuristic)
         - file_signature: module-level docstring or shebang
+        - extraction_backend: "tree_sitter" or "regex" (first symbol's backend)
+        - parent_symbols: list of distinct parent class/function names (may be empty)
+        - fqns: list of distinct fully-qualified names (may be empty)
 
         Note: line_start is 1-based (matching editor convention).
         """
         with self._lock:
             if not self._conn:
-                return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+                return {"symbols": [], "imports": [], "exports": [], "file_signature": "", "extraction_backend": "regex", "parent_symbols": [], "fqns": []}
             try:
                 cur = self._conn.execute(
-                    """SELECT symbol_name, symbol_type, line_start, line_end, imports, exports, file_signature
+                    """SELECT symbol_name, symbol_type, line_start, line_end,
+                              imports, exports, file_signature,
+                              parent_symbol, symbol_fqn, extraction_backend
                        FROM symbol_index
                        WHERE file_path = ?
                        ORDER BY line_start""",
@@ -449,21 +482,34 @@ class SymbolIndex:
                 )
                 rows = cur.fetchall()
                 if not rows:
-                    return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
+                    return {"symbols": [], "imports": [], "exports": [], "file_signature": "", "extraction_backend": "regex", "parent_symbols": [], "fqns": []}
                 symbols = [
-                    {"name": r[0], "type": r[1], "line_start": r[2], "line_end": r[3]}
+                    {
+                        "name": r[0],
+                        "type": r[1],
+                        "line_start": r[2],
+                        "line_end": r[3],
+                        "parent": r[7],
+                        "fqn": r[8],
+                    }
                     for r in rows
                 ]
                 imports_raw = rows[0][4] or ""
                 exports_raw = rows[0][5] or ""
                 file_sig = rows[0][6] or ""
+                backend = rows[0][9] or "regex"
                 imports = imports_raw.split(",") if imports_raw else []
                 exports = exports_raw.split(",") if exports_raw else []
+                parent_symbols = list({r[7] for r in rows if r[7]})
+                fqns = list({r[8] for r in rows if r[8]})
                 return {
                     "symbols": symbols,
                     "imports": [i for i in imports if i],
                     "exports": [e for e in exports if e],
                     "file_signature": file_sig,
+                    "extraction_backend": backend,
+                    "parent_symbols": parent_symbols,
+                    "fqns": fqns,
                 }
             except Exception:
                 return {"symbols": [], "imports": [], "exports": [], "file_signature": ""}
@@ -569,6 +615,9 @@ class SymbolIndex:
         """
         Extract symbols from content and upsert into index.
 
+        Uses extract_code_structure (AST-aware) when available, falls back
+        to legacy extract_symbols (regex-based) otherwise.
+
         Handles files with no symbol definitions (import-only files) by
         storing a single placeholder row so imports are preserved for
         get_callers lookups.
@@ -577,8 +626,14 @@ class SymbolIndex:
             if not self._conn:
                 return
             try:
-                extracted = extract_symbols(content, file_path)
-                from datetime import datetime, timezone
+                # Prefer AST-aware extraction when available
+                if _extract_code_structure is not None:
+                    extracted = _extract_code_structure(content, file_path)
+                    backend = extracted.get("extraction_backend", "tree_sitter")
+                else:
+                    extracted = extract_symbols(content, file_path)
+                    backend = "regex"
+
                 now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
                 self._conn.execute("DELETE FROM symbol_index WHERE file_path = ?", (file_path,))
@@ -591,16 +646,19 @@ class SymbolIndex:
 
                 if symbols:
                     for sym in symbols:
-                        line_start = sym.get("line", 0)
+                        line_start = sym.get("line_start", sym.get("line", 0))
                         line_end = sym.get("line_end", line_start + 1)
+                        parent_sym = sym.get("parent")
+                        symbol_fqn = sym.get("fqn")
                         self._conn.execute(
                             """INSERT OR REPLACE INTO symbol_index
                                (symbol_name, symbol_type, file_path, line_start, line_end,
-                                file_signature, imports, direct_imports, exports, indexed_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                file_signature, imports, direct_imports, exports, indexed_at,
+                                parent_symbol, symbol_fqn, extraction_backend)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 sym["name"],
-                                sym.get("type", "definition"),
+                                sym.get("type", sym.get("kind", "definition")),
                                 file_path,
                                 line_start,
                                 line_end,
@@ -609,6 +667,9 @@ class SymbolIndex:
                                 direct_imports_str,
                                 exports_str,
                                 now,
+                                parent_sym,
+                                symbol_fqn,
+                                backend,
                             ),
                         )
                 elif imports_str:
@@ -618,8 +679,9 @@ class SymbolIndex:
                     self._conn.execute(
                         """INSERT OR REPLACE INTO symbol_index
                            (symbol_name, symbol_type, file_path, line_start, line_end,
-                            file_signature, imports, direct_imports, exports, indexed_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            file_signature, imports, direct_imports, exports, indexed_at,
+                            parent_symbol, symbol_fqn, extraction_backend)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             "",  # empty symbol_name = import-only file marker
                             "imports",
@@ -631,6 +693,9 @@ class SymbolIndex:
                             direct_imports_str,
                             exports_str,
                             now,
+                            None,
+                            None,
+                            backend,
                         ),
                     )
                 self._conn.commit()

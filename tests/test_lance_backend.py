@@ -120,7 +120,7 @@ class TestLanceAddAndQuery:
             ids=["dup_id"],
             metadatas=[{"wing": "a"}],
         )
-        with pytest.raises(ValueError, match="already exists"):
+        with pytest.raises(ValueError, match="already exist"):
             lance_collection.add(
                 documents=["doc2"],
                 ids=["dup_id"],

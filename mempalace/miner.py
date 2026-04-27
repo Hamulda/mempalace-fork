@@ -887,7 +887,11 @@ def split_code_structurally(content: str, source_file: str, max_chunk_chars: int
             continue
 
         chunk_content = "\n".join(chunk_lines).strip()
-        if len(chunk_content) < MIN_CHUNK_SIZE:
+        # Tentative symbol lookup: structural chunks anchored at a def/class line carry a symbol.
+        # For prose chunks (no symbol), enforce MIN_CHUNK_SIZE.
+        # Small code chunks (e.g. 1-line functions) are still valid — keep them.
+        sym_name_tentative, _ = symbol_map.get(start_line, ("", ""))
+        if not sym_name_tentative and len(chunk_content) < MIN_CHUNK_SIZE:
             continue
 
         sym_name, sym_scope = symbol_map.get(start_line, ("", ""))
@@ -1067,6 +1071,19 @@ def _prepare_file_drawers(
         }
         if source_mtime is not None:
             metadata["source_mtime"] = source_mtime
+        # Phase 3 retrieval planner: store project context for push-down filtering
+        metadata["project_root"] = str(project_path)
+        try:
+            metadata["repo_rel_path"] = str(filepath.relative_to(project_path))
+        except ValueError:
+            metadata["repo_rel_path"] = str(filepath)
+        # Build symbol_fqn from name + scope for symbol-first retrieval
+        sym_name = chunk.get("symbol_name", "")
+        sym_scope = chunk.get("symbol_scope", "")
+        if sym_name and sym_scope:
+            metadata["symbol_fqn"] = f"{sym_scope}::{sym_name}"
+        elif sym_name:
+            metadata["symbol_fqn"] = sym_name
         documents.append(chunk["content"])
         ids.append(drawer_id)
         metadatas.append(metadata)

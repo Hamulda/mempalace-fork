@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import signal
@@ -38,6 +39,8 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import httpx
 
@@ -426,15 +429,17 @@ def start_server(palace_path: str | None = None) -> subprocess.Popen:
 async def wait_for_server(timeout: float = 20.0) -> bool:
     """Poll /health until server is ready."""
     t0 = time.perf_counter()
+    last_err: Exception | None = None
     while time.perf_counter() - t0 < timeout:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(HEALTH_ENDPOINT)
                 if resp.status_code == 200:
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            last_err = e
         await asyncio.sleep(0.5)
+    logger.warning("wait_for_server timed out after %.0fs (last error: %s)", timeout, last_err)
     return False
 
 

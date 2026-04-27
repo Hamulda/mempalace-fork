@@ -5,14 +5,14 @@ A Claude Code plugin that gives your AI a persistent memory system powered by Me
 ## What This Plugin Does
 
 - **Skills**: `/mempalace:help`, `/mempalace:init`, `/mempalace:search`, `/mempalace:mine`, `/mempalace:status`
-- **Hooks**: Auto-save on Stop, PreCompact preservation, SessionStart lifecycle control
+- **Hooks** (optional, requires manual registration in `settings.json`): Auto-save on Stop, PreCompact preservation, SessionStart lifecycle control
 - **No MCP servers started by plugin** — plugin provides skills + hooks, MCP tools connect to a shared HTTP server managed by the plugin
 
 ## Prerequisites
 
 - Python 3.9+
 - MemPalace installed: `pip install git+https://github.com/Hamulda/mempalace-fork`
-- Shared MemPalace MCP server managed by plugin hooks (auto-started on first session)
+- Shared MemPalace MCP server (start manually with `mempalace serve --host 127.0.0.1 --port 8765`, or enable auto-start by registering the hooks in `settings.json` — see Hooks section below)
 
 ## Installation
 
@@ -25,12 +25,12 @@ claude plugin marketplace add hamulda/mempalace-fork
 claude plugin install --scope user mempalace
 ```
 
-## Server Lifecycle (Automatic — Recommended)
+## Server Lifecycle (Automatic — Recommended, Requires Hook Registration)
 
-The plugin manages a **single shared HTTP server** across all Claude Code sessions using session refcounting:
+The plugin can manage a **single shared HTTP server** across all Claude Code sessions using session refcounting — but **only if hooks are registered in `settings.json`** (see below). Without registration, run `mempalace serve` manually.
 
 ```
-SessionStart (hook)
+SessionStart (hook — requires settings.json registration)
   → registers session ID
   → starts server if not already running
   → calls mempalace hook run (session-start inject)
@@ -80,12 +80,53 @@ Then in Claude Code: `/mempalace:status`
 | `/mempalace:search` | Search memories across the palace |
 | `/mempalace:mine` | Mine projects and conversations |
 | `/mempalace:status` | Palace overview — wings, rooms, counts |
+| `/mempalace:doctor` | Diagnose server health — health endpoint, process, sessions |
 
 ## Hooks
 
 - **SessionStart** — Registers session, starts shared server if needed, injects relevant memories
 - **Stop** — Runs auto-save (while server is alive), unregisters session, may shut down server
 - **PreCompact** — Preserves memories before context compaction (does NOT affect session refcount)
+
+**To enable:** Add the following to your `~/.claude/settings.json` under the `hooks` key. Replace `{PLUGIN_ROOT}` with the path to this plugin (or use the absolute path shown below):
+
+```json
+{
+  "SessionStart": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash /Users/vojtechhamada/.claude/plugins/marketplaces/mempalace/.claude-plugin/hooks/mempal-session-start-hook.sh"
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash /Users/vojtechhamada/.claude/plugins/marketplaces/mempalace/.claude-plugin/hooks/mempal-stop-hook.sh"
+        }
+      ]
+    }
+  ],
+  "PreCompact": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash /Users/vojtechhamada/.claude/plugins/marketplaces/mempalace/.claude-plugin/hooks/mempal-precompact-hook.sh"
+        }
+      ]
+    }
+  ]
+}
+```
 
 Set `MEMPAL_DIR` environment variable to auto-ingest a directory on each save.
 

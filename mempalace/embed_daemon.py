@@ -93,68 +93,61 @@ def _create_embedding_model():
 
 def _create_mlx_model():
     """
-    ModernBERT-embed-base 4-bit MLX.
-    MTEB ~61.17 (256-dim Matryoshka truncation vs full 768-dim = 62.62),
-    8192 token context, ~85MB RAM, nativní Apple Silicon.
+    Nomic-embed-text v1.5 MLX (360M params, 256-dim).
+    ~85MB RAM, native Apple Silicon Metal, 512 token context.
     """
-    from mlx_embeddings import load, generate
+    from mlx_embeddings.utils import load as mlx_load
     import numpy as np
+    import mlx.core as mx
 
-    MODEL_ID = "mlx-community/nomicai-modernbert-embed-base-4bit"
+    MODEL_ID = "mlx-community/nomic-embed-text-v1-ablated-flash-smollm2-360M"
 
-    logger.info("Loading modernbert-embed-base 4-bit MLX...")
-    model, tokenizer = load(MODEL_ID)
+    logger.info("Loading MLX embedding model %s...", MODEL_ID)
+    model, tokenizer = mlx_load(MODEL_ID)
 
-    class ModernBERTWrapper:
-        """
-        Wrapper kompatibilní s fastembed .embed() API.
-        Podporuje Matryoshka dims – používáme 256 místo 768
-        pro 3x menší LanceDB storage bez výrazné ztráty kvality.
-        """
-        DIMS = 256  # Matryoshka: 256 dims = MTEB 61.17 vs 768 dims = 62.62
+    class MLXEmbeddingWrapper:
+        DIMS = 256  # Matryoshka truncation
 
         def __init__(self, m, tok):
             self._model = m
             self._tokenizer = tok
-            # Warm-up
+            self._warmup()
+
+        def _warmup(self):
             self._embed_batch(["warmup"])
-            logger.info(
-                "✅ ModernBERT-embed 4-bit MLX ready "
-                "(dims=%d, context=8192, RAM~85MB)",
-                self.DIMS,
-            )
+            try:
+                mx.metal.clear_cache()
+            except Exception:
+                pass
+            logger.info("MLX embedding model ready (dims=%d)", self.DIMS)
 
         def _embed_batch(self, texts: list[str]) -> np.ndarray:
-            output = generate(self._model, self._tokenizer, texts=texts)
-            # Force MLX to synchronize GPU→CPU transfer before clearing cache
-            try:
-                import mlx.core as mx
-                mx.eval(output.text_embeds)
-            except Exception:
-                pass  # mx.eval not available on all MLX builds
-            embeddings = np.array(output.text_embeds)
-            # Matryoshka truncation: prvních DIMS dimenzí + L2 normalizace
+            inputs = self._tokenizer.batch_encode_plus(
+                texts,
+                return_tensors="mlx",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            )
+            outputs = self._model(
+                inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            )
+            embeddings = np.array(outputs.text_embeds)
             embeddings = embeddings[:, : self.DIMS]
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
             return embeddings / (norms + 1e-9)
 
-        def embed(self, texts: list[str]):
-            """Kompatibilní s fastembed API."""
+        def embed(self, texts):
             result = self._embed_batch(list(texts))
-            # Return iterator of numpy arrays (each with .tolist() method)
+            # After each batch, clear Metal cache to prevent memory buildup
+            try:
+                mx.metal.clear_cache()
+            except Exception:
+                pass
             return iter(result)
 
-    wrapper = ModernBERTWrapper(model, tokenizer)
-
-    # Post-load cache hygiene: evict KV cache after warmup to free ~0.75GB
-    try:
-        import mlx.core as mx
-        mx.eval(wrapper._embed_batch(["post_load"]))
-        mx.metal.clear_cache()
-    except Exception:
-        pass  # Only available on MLX with Metal backend
-
-    return wrapper
+    return MLXEmbeddingWrapper(model, tokenizer)
 
 
 def _create_coreml_model():
@@ -280,8 +273,8 @@ def _handle_client(conn: socket.socket, model) -> None:
         try:
             err = json.dumps({"embeddings": [], "error": str(e)}).encode("utf-8")
             conn.sendall(len(err).to_bytes(4, "big") + err)
-        except Exception:
-            pass
+        except Exception as send_err:
+            logger.warning("handle_client: failed to send error response: %s", send_err)
     finally:
         conn.close()
 

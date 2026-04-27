@@ -98,6 +98,7 @@ def register_code_tools(server, backend, config, settings):
         symbol_name: str | None = None,
         file_path: str | None = None,
         limit: int = 10,
+        project_path: str | None = None,
     ) -> dict:
         """
         Search code using vector similarity within the palace.
@@ -112,6 +113,7 @@ def register_code_tools(server, backend, config, settings):
             symbol_name: Optional symbol name to scope results to.
             file_path: Optional file path to restrict results to that file.
             limit: Maximum number of results to return (default 10).
+            project_path: Optional project root to scope results (push-down filter).
 
         Returns:
             dict with query, language, chunks list, and count.
@@ -121,6 +123,7 @@ def register_code_tools(server, backend, config, settings):
         return await code_search_async(
             query=query, palace_path=settings.db_path, n_results=limit,
             language=language, symbol_name=symbol_name, file_path=file_path,
+            project_path=project_path,
         )
 
     @server.tool(timeout=settings.timeout_read)
@@ -191,7 +194,7 @@ def register_code_tools(server, backend, config, settings):
         }
 
     @server.tool(timeout=settings.timeout_read)
-    def mempalace_project_context(
+    async def mempalace_project_context(
         ctx: Context,
         project_path: str,
         query: str | None = None,
@@ -230,42 +233,74 @@ def register_code_tools(server, backend, config, settings):
 
         try:
             if query:
-                # Mode 1: Vector similarity search with project filtering.
-                # We skip DB-level filtering entirely and apply all filters (wing,
-                # is_latest, language, project_path) in Python to support both
-                # wing="repo" (canonical) and wing="project" (legacy seeded data).
-                n_fetch = min(limit * 3, 150)
-                q_result = col.query(
-                    query_texts=[query],
-                    n_results=n_fetch,
-                    include=["documents", "metadatas"],
-                )
-                docs = q_result.get("documents", [[]])[0] or []
-                metas = q_result.get("metadatas", [[]])[0] or []
+                # Phase 3 retrieval planner: route by query intent, project_path as hard filter.
+                # Path/symbol → specialized paths in code_search; others → code_search_async.
+                from mempalace.retrieval_planner import classify_query
+                from mempalace.searcher import code_search_async
 
-                # Python-side post-filters: wing, is_latest, language, project_path
-                matched = []
-                for i, doc in enumerate(docs):
-                    meta = metas[i] if i < len(metas) else {}
-                    if meta.get("is_latest") is False:
+                intent = classify_query(query)
+
+                if intent == "path":
+                    from mempalace.searcher import _path_first_search
+                    hits = _path_first_search(
+                        query, settings.db_path, col,
+                        n_results=limit, language=language,
+                        project_path=project_path,
+                    )
+                    for h in hits:
+                        h["doc"] = h.pop("text", "")
+                        h["repo_rel_path"] = _compute_repo_rel_path(h.get("source_file", ""), project_path)
+                    return {
+                        "project_path": project_path, "language": language,
+                        "query": query, "chunks": hits[:limit], "count": len(hits),
+                        "intent": intent,
+                    }
+
+                if intent == "symbol":
+                    from mempalace.searcher import _symbol_first_search
+                    hits = _symbol_first_search(
+                        query, settings.db_path, col,
+                        n_results=limit, language=language,
+                    )
+                    if project_path:
+                        hits = [h for h in hits if _source_file_matches(h.get("source_file", ""), project_path)]
+                    for h in hits:
+                        h["doc"] = h.pop("text", "")
+                        h["repo_rel_path"] = _compute_repo_rel_path(h.get("source_file", ""), project_path)
+                    return {
+                        "project_path": project_path, "language": language,
+                        "query": query, "chunks": hits[:limit], "count": len(hits),
+                        "intent": intent,
+                    }
+
+                # code_exact / code_semantic / memory / mixed: full code_search_async with planner
+                result = await code_search_async(
+                    query=query, palace_path=settings.db_path, n_results=limit,
+                    language=language, project_path=project_path,
+                )
+                chunks_raw = result.get("results", [])
+
+                # Belt-and-suspenders project filter + schema normalize
+                chunks = []
+                for chunk in chunks_raw:
+                    sf = chunk.get("source_file", "")
+                    if project_path and sf and not _source_file_matches(sf, project_path):
                         continue
-                    wing = meta.get("wing", "")
-                    if wing not in ("repo", "project"):
-                        continue
-                    if language and meta.get("language") != language:
-                        continue
-                    sf = meta.get("source_file", "")
-                    if sf and _source_file_matches(sf, project_path):
-                        matched.append({
-                            "source_file": sf,
-                            "language": meta.get("language", ""),
-                            "line_start": meta.get("line_start", 0),
-                            "line_end": meta.get("line_end", 0),
-                            "symbol_name": meta.get("symbol_name", ""),
-                            "chunk_kind": meta.get("chunk_kind", ""),
-                            "doc": doc,
-                        })
-                matched = matched[:limit]
+                    chunks.append({
+                        "source_file": sf,
+                        "language": chunk.get("language", ""),
+                        "line_start": chunk.get("line_start", 0),
+                        "line_end": chunk.get("line_end", 0),
+                        "symbol_name": chunk.get("symbol_name", ""),
+                        "chunk_kind": chunk.get("chunk_kind", ""),
+                        "doc": chunk.get("text", chunk.get("document", "")),
+                        "repo_rel_path": _compute_repo_rel_path(sf, project_path),
+                    })
+                return {
+                    "project_path": project_path, "language": language,
+                    "query": query, "chunks": chunks[:limit], "count": len(chunks),
+                    "intent": result.get("filters", {}).get("intent", "mixed"),
+                }
 
             else:
                 # Mode 2: Deterministic metadata retrieval (no vector search).

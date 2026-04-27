@@ -265,7 +265,7 @@ class QueryCache:
                 while len(cache) > self._maxsize:
                     cache.popitem(last=False)
             except Exception:
-                pass
+                logger.warning("query_cache.set_value failed: shard=%d key=%s", shard_idx, key)
 
     def clear(self) -> None:
         """Remove all cached entries and all _last_write timestamps across all shards."""
@@ -275,7 +275,7 @@ class QueryCache:
                     self._shards[i]["cache"].clear()
                     self._shards[i]["last_write"].clear()
                 except Exception:
-                    pass
+                    logger.warning("query_cache.clear failed: shard=%d", i)
 
     def stats(self) -> dict:
         with self._global_lock:

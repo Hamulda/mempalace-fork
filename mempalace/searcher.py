@@ -21,6 +21,7 @@ from .query_sanitizer import sanitize_query
 logger = logging.getLogger("mempalace_mcp")
 
 _search_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp_search")
+_search_semaphore = asyncio.Semaphore(8)  # Backpressure: max 8 concurrent searches
 
 _reranker = None
 _reranker_lock = threading.Lock()
@@ -598,82 +599,84 @@ async def hybrid_search_async(
     n_results: int = 10, use_kg: bool = True, rerank: bool = False,
     agent_id: str = None, is_latest: bool | None = None,
 ) -> dict:
-    """Parallel 3-layer hybrid search: vector + FTS5 + KG run concurrently.
+    """Parallel 3-layer hybrid search with semaphore backpressure.
 
     Latency = max(layer times) instead of sum. Uses asyncio.to_thread for
     CPU-bound layers (vector search, FTS5) and direct call for KG.
+    Semaphore limits concurrent searches to 8 to prevent thread pool exhaustion.
     """
     import asyncio
 
     from datetime import date
     from .config import MempalaceConfig
 
-    # Build config once — avoids repeated disk reads and env var parsing per call
-    cfg = MempalaceConfig()
-    backend = get_backend(cfg.backend)
-    collection_name = cfg.collection_name
+    async with _search_semaphore:
+        # Build config once — avoids repeated disk reads and env var parsing per call
+        cfg = MempalaceConfig()
+        backend = get_backend(cfg.backend)
+        collection_name = cfg.collection_name
 
-    def _vector_layer():
-        return search_memories(
-            query=query, palace_path=palace_path, wing=wing, room=room,
-            n_results=n_results, is_latest=is_latest, agent_id=agent_id, rerank=rerank
+        def _vector_layer():
+            return search_memories(
+                query=query, palace_path=palace_path, wing=wing, room=room,
+                n_results=n_results, is_latest=is_latest, agent_id=agent_id, rerank=rerank
+            )
+
+        def _fts5_layer():
+            try:
+                col = backend.get_collection(palace_path, collection_name, create=False)
+                return _fts5_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
+            except Exception as e:
+                logger.warning("FTS5 layer failed: %s", e)
+                return []
+
+        def _kg_layer():
+            if not use_kg:
+                return []
+            try:
+                kg = _get_kg(palace_path)
+                if kg is None:
+                    return []
+                today = date.today().isoformat()
+                tokens = [t.lower() for t in query.split() if len(t) > 3]
+                seen = set()
+                kg_hits = []
+                for token in tokens[:5]:
+                    for triple in kg.query_entity(token, as_of=today)[:3]:
+                        key = f"{triple['subject']}_{triple['predicate']}_{triple['object']}"
+                        if key not in seen:
+                            seen.add(key)
+                            kg_hits.append({
+                                "text": f"{triple['subject']} {triple['predicate']} {triple['object']}",
+                                "wing": "knowledge_graph",
+                                "room": triple["predicate"],
+                                "source_file": "knowledge_graph.sqlite3",
+                                "similarity": triple.get("confidence", 0.8),
+                                "source": "kg",
+                            })
+                return kg_hits
+            except Exception as e:
+                logger.warning("KG layer failed in hybrid_search: %s", e)
+                return []
+
+        # Run all 3 layers concurrently — latency = max, not sum
+        vector_results, fts5_hits, kg_hits = await asyncio.gather(
+            asyncio.to_thread(_vector_layer),
+            asyncio.to_thread(_fts5_layer),
+            asyncio.to_thread(_kg_layer),
         )
 
-    def _fts5_layer():
-        try:
-            col = backend.get_collection(palace_path, collection_name, create=False)
-            return _fts5_search(query, col, palace_path, n_results=n_results, wing=wing, room=room)
-        except Exception as e:
-            logger.warning("FTS5 layer failed: %s", e)
-            return []
+        hits = vector_results.get("results", [])
 
-    def _kg_layer():
-        if not use_kg:
-            return []
-        try:
-            kg = _get_kg(palace_path)
-            if kg is None:
-                return []
-            today = date.today().isoformat()
-            tokens = [t.lower() for t in query.split() if len(t) > 3]
-            seen = set()
-            kg_hits = []
-            for token in tokens[:5]:
-                for triple in kg.query_entity(token, as_of=today)[:3]:
-                    key = f"{triple['subject']}_{triple['predicate']}_{triple['object']}"
-                    if key not in seen:
-                        seen.add(key)
-                        kg_hits.append({
-                            "text": f"{triple['subject']} {triple['predicate']} {triple['object']}",
-                            "wing": "knowledge_graph",
-                            "room": triple["predicate"],
-                            "source_file": "knowledge_graph.sqlite3",
-                            "similarity": triple.get("confidence", 0.8),
-                            "source": "kg",
-                        })
-            return kg_hits
-        except Exception as e:
-            logger.warning("KG layer failed in hybrid_search: %s", e)
-            return []
+        # RRF merge
+        merged = _rrf_merge([hits, fts5_hits, kg_hits])[:n_results]
 
-    # Run all 3 layers concurrently — latency = max, not sum
-    vector_results, fts5_hits, kg_hits = await asyncio.gather(
-        asyncio.to_thread(_vector_layer),
-        asyncio.to_thread(_fts5_layer),
-        asyncio.to_thread(_kg_layer),
-    )
-
-    hits = vector_results.get("results", [])
-
-    # RRF merge
-    merged = _rrf_merge([hits, fts5_hits, kg_hits])[:n_results]
-
-    return {
-        "query": query,
-        "filters": {"wing": wing, "room": room, "agent_id": agent_id},
-        "results": merged,
-        "sources": {"vector": len(hits), "fts5": len(fts5_hits), "kg": len(kg_hits)},
-    }
+        return {
+            "query": query,
+            "filters": {"wing": wing, "room": room, "agent_id": agent_id},
+            "results": merged,
+            "sources": {"vector": len(hits), "fts5": len(fts5_hits), "kg": len(kg_hits)},
+        }
 
 
 # =============================================================================
@@ -781,6 +784,73 @@ def is_path_query(query: str) -> bool:
     return bool(_PATH_LIKE_RE.search(query))
 
 
+def classify_query(query: str) -> str:
+    """
+    Classify a query into one of six retrieval intent categories.
+
+    The returned category determines which retrieval path is used:
+
+    - path       : User is looking for a specific file or path literal.
+                   Use FTS5 prefix/path lookup first, skip vector.
+    - symbol     : User is looking for a symbol (function, class, constant).
+                   Query SymbolIndex first, then expand to chunks in same file/line.
+    - code_exact : Exact code pattern (def, import, -> etc.).
+                   FTS5 first, small vector shortlist for disambiguation.
+    - code_semantic : Semantic code query (≥4 words with code signal).
+                   FTS5 + vector + symbol expansion, RRF merge.
+    - memory     : Prose/memory style (short or conversational).
+                   Vector-first, FTS5 fallback.
+    - mixed      : Cannot determine intent; use full hybrid search.
+
+    This is the Phase 3 retrieval planner entry point.
+    """
+    query = query.strip()
+    if not query:
+        return "memory"
+
+    # Path: FTS5-exact, no vector needed
+    if _PATH_LIKE_RE.search(query):
+        return "path"
+
+    # Symbol: identifier that could be a function/class/variable name
+    # Heuristic: single camelCase/PascalCase word, or snake_case identifier
+    if _is_symbol_name(query):
+        return "symbol"
+
+    # Code exact: strong code pattern signals
+    if _CODE_QUERY_RE.search(query):
+        # If it's just a short identifier pattern, treat as symbol
+        if len(query.split()) == 1 and _SYMBOL_NAME_RE.search(query):
+            return "symbol"
+        return "code_exact"
+
+    # Memory/prose: short queries or non-code language
+    if len(query.split()) <= 2:
+        return "memory"
+
+    # Semantic code: ≥3 words with code-like vocabulary
+    if _query_complexity(query) == "complex":
+        return "code_semantic"
+
+    return "mixed"
+
+
+# Additional regex for symbol name detection
+_SYMBOL_NAME_RE = _re.compile(
+    r"^\b[a-z_][a-z0-9_]*\b$|^\b[A-Z][a-zA-Z0-9]*\b$|^\b[a-z]+([A-Z][a-z]+)+\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_symbol_name(query: str) -> bool:
+    """Check if query looks like a symbol name (function/class/variable)."""
+    q = query.strip()
+    # Single identifier: snake_case, PascalCase, or SCREAMING_SNAKE
+    if len(q.split()) == 1:
+        return bool(_SYMBOL_NAME_RE.search(q))
+    return False
+
+
 def query_complexity(query: str) -> str:
     """Public API for query complexity classification."""
     return _query_complexity(query)
@@ -851,6 +921,230 @@ def _fts5_search(
         return []
 
 
+def _symbol_first_search(
+    query: str,
+    palace_path: str,
+    col,
+    n_results: int = 10,
+    language: str = None,
+    file_path: str = None,
+) -> list:
+    """
+    Path 2 — Symbol-first retrieval.
+
+    Query flow:
+    1. SymbolIndex.find_symbol(query) — exact symbol name match
+    2. Collect all (file_path, line_start, line_end) tuples
+    3. LanceDB get() to fetch chunks in those file/line ranges
+    4. Filter by language / file_path
+    5. Rank by line proximity to symbol definition
+    6. Optional: small vector shortlist rerank within the collected set
+
+    Returns list of hit dicts with rrf_score.
+    """
+    hits = []
+    try:
+        from .symbol_index import SymbolIndex
+    except Exception:
+        return []
+
+    try:
+        index = SymbolIndex(palace_path)
+    except Exception:
+        return []
+
+    # Step 1: SymbolIndex exact match
+    try:
+        symbols = index.find_symbol(query, limit=50)
+    except Exception:
+        symbols = []
+
+    if not symbols:
+        return []
+
+    # Step 2: Group symbols by file_path
+    from collections import defaultdict
+    file_to_lines = defaultdict(list)
+    for sym in symbols:
+        fp = sym.get("file_path", "")
+        if fp:
+            file_to_lines[fp].append(sym)
+
+    # Step 3: Fetch chunks from LanceDB for each file
+    backend = get_backend("lance")
+    collection_name = MempalaceConfig().collection_name
+    collection = backend.get_collection(palace_path, collection_name, create=False)
+
+    all_ids = []
+    id_to_meta = {}
+
+    for fp, syms in file_to_lines.items():
+        # Build line range: min line_start to max line_end across symbols in this file
+        lines = [(s.get("line_start", 0), s.get("line_end", 0)) for s in syms]
+        min_line = min(l[0] for l in lines)
+        max_line = max(l[1] for l in lines)
+
+        try:
+            # Fetch all chunks from this file (is_latest=True, wing=repo)
+            result = collection.get(
+                limit=500,
+                where={"source_file": fp, "is_latest": True, "wing": "repo"},
+                include=["documents", "metadatas", "ids"],
+            )
+        except Exception:
+            continue
+
+        for rid, doc, meta in zip(result.get("ids", []), result.get("documents", []), result.get("metadatas", [])):
+            ls = meta.get("line_start", 0)
+            le = meta.get("line_end", 0)
+            # Check overlap with symbol range
+            if ls <= max_line and le >= min_line:
+                all_ids.append(rid)
+                id_to_meta[rid] = meta
+
+    if not all_ids:
+        return []
+
+    # Step 4: Deduplicate and filter
+    seen = set()
+    for rid in all_ids:
+        if rid in seen:
+            continue
+        seen.add(rid)
+        meta = id_to_meta.get(rid, {})
+        sf = meta.get("source_file", "")
+
+        # Apply language filter
+        if language and meta.get("language") != language:
+            continue
+        # Apply file_path filter
+        if file_path and not _path_contains(sf, file_path):
+            continue
+
+        # Build hit
+        sym_count = len(file_to_lines.get(sf, []))
+        hits.append({
+            "id": rid,
+            "text": "",
+            "source_file": sf,
+            "wing": meta.get("wing", "repo"),
+            "room": meta.get("room", ""),
+            "symbol_rank": sym_count,  # files with more symbols rank higher
+            "similarity": 1.0,
+            "source": "symbol_index",
+            "symbol_fqn": meta.get("symbol_fqn", ""),
+            "language": meta.get("language", ""),
+        })
+
+    # Step 5: Sort by symbol count per file (descending) — most symbol-dense first
+    hits.sort(key=lambda h: h.get("symbol_rank", 0), reverse=True)
+
+    # Step 6: Assign rrf_score
+    k = 60
+    for rank, hit in enumerate(hits):
+        hit["rrf_score"] = 1 / (k + rank + 1)
+
+    return hits[:n_results]
+
+
+def _path_first_search(
+    query: str,
+    palace_path: str,
+    col,
+    n_results: int = 10,
+    language: str = None,
+    project_path: str = None,
+) -> list:
+    """
+    Path 1 — Path-first retrieval (no vector needed).
+
+    Query flow:
+    1. FTS5 search with wing filter (if project_path given, FTS5 wing=project)
+    2. Python filter: source_file prefix matches project_path
+    3. If FTS5 returns < n_results, supplement with DB-level get() scan
+       filtered by source_file prefix (batch of 100, walk until n_results or exhausted)
+    4. Language filter applied in Python
+
+    Returns list of hit dicts with rrf_score.
+    """
+    # Step 1: FTS5 search
+    try:
+        fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results * 2, language=language)
+    except Exception as e:
+        logger.warning("FTS5 search in _path_first_search failed: %s", e)
+        fts5_hits = []
+
+    # Step 2: Filter by project_path
+    matched = []
+    for hit in fts5_hits:
+        sf = hit.get("source_file", "")
+        if project_path and not _source_file_matches(sf, project_path):
+            continue
+        if language and hit.get("language") != language:
+            continue
+        matched.append(hit)
+
+    # Step 3: If FTS5 insufficient, scan via get()
+    if len(matched) < n_results and project_path:
+        try:
+            backend = get_backend("lance")
+            collection_name = MempalaceConfig().collection_name
+            collection = backend.get_collection(palace_path, collection_name, create=False)
+            offset = 0
+            batch_get = 100
+            gathered = 0
+            seen_ids = {h["id"] for h in matched}
+
+            while gathered < (n_results - len(matched)):
+                result = collection.get(
+                    limit=batch_get,
+                    offset=offset,
+                    where={"is_latest": True, "wing": {"$in": ["repo", "project"]}},
+                    include=["documents", "metadatas", "ids"],
+                )
+                batch_ids = result.get("ids", [])
+                if not batch_ids:
+                    break
+
+                for rid, doc, meta in zip(
+                    result.get("ids", []),
+                    result.get("documents", []),
+                    result.get("metadatas", []),
+                ):
+                    if rid in seen_ids:
+                        continue
+                    sf = meta.get("source_file", "")
+                    if not _source_file_matches(sf, project_path):
+                        continue
+                    if language and meta.get("language") != language:
+                        continue
+                    seen_ids.add(rid)
+                    matched.append({
+                        "id": rid,
+                        "text": doc,
+                        "source_file": sf,
+                        "wing": meta.get("wing", "repo"),
+                        "room": meta.get("room", ""),
+                        "similarity": 1.0,
+                        "source": "fts5_scan",
+                        "language": meta.get("language", ""),
+                    })
+                    gathered += 1
+                    if gathered >= n_results - len(matched):
+                        break
+
+                offset += batch_get
+        except Exception as e:
+            logger.warning("get() scan fallback in _path_first_search failed: %s", e)
+
+    # Assign rrf_score
+    k = 60
+    for rank, hit in enumerate(matched):
+        hit["rrf_score"] = 1 / (k + rank + 1)
+
+    return matched[:n_results]
+
+
 def code_search(
     query: str,
     palace_path: str,
@@ -859,6 +1153,7 @@ def code_search(
     symbol_name: str = None,
     file_path: str = None,
     include_prose: bool = False,
+    project_path: str = None,
 ) -> dict:
     """
     Specialized retrieval for code content.
@@ -892,44 +1187,110 @@ def code_search(
     except Exception:
         return {"query": query, "filters": {}, "results": [], "error": f"No palace at {palace_path}"}
 
-    # Build filters
-    base_where = {"wing": "repo", "is_latest": True}
+    # Phase 3 retrieval planner: route based on query intent
+    intent = classify_query(query)
+    kind = {"query": query, "intent": intent}
 
-    # FTS5 keyword search (exact identifier matching)
+    # ── Path-first: literal path query — skip vector ──────────────────────────────
+    if intent == "path":
+        hits = _path_first_search(query, palace_path, col, n_results=n_results,
+                                  language=language, project_path=project_path)
+        return {
+            "query": query, "filters": kind, "results": hits[:n_results],
+            "sources": {"fts5": len(hits)},
+        }
+
+    # ── Symbol-first: symbol name query — skip global vector ───────────────────
+    if intent == "symbol":
+        hits = _symbol_first_search(query, palace_path, col, n_results=n_results,
+                                    language=language, file_path=file_path)
+        if hits:
+            return {
+                "query": query, "filters": kind, "results": hits[:n_results],
+                "sources": {"symbol_index": len(hits)},
+            }
+        # Fall through to code_exact if SymbolIndex returned nothing
+
+    # ── Code-exact: strong code patterns — FTS5 primary, small vector shortlist ──
+    if intent == "code_exact":
+        fts5_hits = []
+        if include_prose or language != "Markdown":
+            fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results * 2,
+                                     language=language)
+        # Small vector supplement (top 5 only, no rerank for exact patterns)
+        vector_hits = []
+        try:
+            results = search_memories(
+                query=query, palace_path=palace_path,
+                wing="repo", room=None, is_latest=True, n_results=5,
+            )
+            vector_hits = results.get("results", [])
+            if language:
+                vector_hits = [h for h in vector_hits if h.get("language") == language]
+            if file_path:
+                vector_hits = [h for h in vector_hits if _path_contains(h.get("source_file", ""), file_path)]
+        except Exception as e:
+            logger.warning("Vector search in code_search (code_exact) failed: %s", e)
+
+        merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
+        source_files = [h.get("source_file", "") for h in merged]
+        merged = _add_repo_rel_path(merged, source_files)
+        return {
+            "query": query, "filters": kind, "results": merged,
+            "sources": {"vector": len(vector_hits), "fts5": len(fts5_hits)},
+        }
+
+    # ── Memory: prose-style query — vector primary ───────────────────────────────
+    if intent == "memory":
+        vector_hits = []
+        try:
+            results = search_memories(
+                query=query, palace_path=palace_path,
+                wing="repo", room=None, is_latest=True, n_results=n_results,
+            )
+            vector_hits = results.get("results", [])
+            if language:
+                vector_hits = [h for h in vector_hits if h.get("language") == language]
+            if file_path:
+                vector_hits = [h for h in vector_hits if _path_contains(h.get("source_file", ""), file_path)]
+        except Exception as e:
+            logger.warning("Vector search in code_search (memory) failed: %s", e)
+
+        source_files = [h.get("source_file", "") for h in vector_hits]
+        vector_hits = _add_repo_rel_path(vector_hits, source_files)
+        return {
+            "query": query, "filters": kind, "results": vector_hits[:n_results],
+            "sources": {"vector": len(vector_hits)},
+        }
+
+    # ── Code-semantic / mixed: full hybrid search ──────────────────────────────
     fts5_hits = []
     if include_prose or language != "Markdown":
         fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results, language=language)
 
-    # Vector search
     vector_hits = []
     try:
         results = search_memories(
             query=query, palace_path=palace_path,
-            wing="repo", room=None,
-            is_latest=True, n_results=n_results,
+            wing="repo", room=None, is_latest=True, n_results=n_results,
         )
         vector_hits = results.get("results", [])
-        # Apply language filter post-query
         if language:
             vector_hits = [h for h in vector_hits if h.get("language") == language]
-        # Apply symbol_name filter
         if symbol_name:
             vector_hits = [h for h in vector_hits if symbol_name.lower() in h.get("text", "").lower()]
-        # Apply file_path filter — path-aware, case-insensitive
         if file_path:
             vector_hits = [h for h in vector_hits if _path_contains(h.get("source_file", ""), file_path)]
     except Exception as e:
         logger.warning("Vector search in code_search failed: %s", e)
 
-    # Merge vector + FTS5 with RRF
     merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
-    # Add repo_rel_path
     source_files = [h.get("source_file", "") for h in merged]
     merged = _add_repo_rel_path(merged, source_files)
 
     return {
         "query": query,
-        "filters": {"language": language, "symbol_name": symbol_name, "file_path": file_path},
+        "filters": {"language": language, "symbol_name": symbol_name, "file_path": file_path, "intent": intent},
         "results": merged,
         "sources": {"vector": len(vector_hits), "fts5": len(fts5_hits)},
     }
@@ -943,14 +1304,18 @@ async def code_search_async(
     symbol_name: str = None,
     file_path: str = None,
     include_prose: bool = False,
+    project_path: str = None,
 ) -> dict:
+    """Code search with semaphore backpressure (max 8 concurrent)."""
     import functools
-    return await asyncio.get_event_loop().run_in_executor(
-        _search_executor,
-        functools.partial(code_search, query=query, palace_path=palace_path,
-            n_results=n_results, language=language, symbol_name=symbol_name,
-            file_path=file_path, include_prose=include_prose)
-    )
+
+    async with _search_semaphore:
+        return await asyncio.get_event_loop().run_in_executor(
+            _search_executor,
+            functools.partial(code_search, query=query, palace_path=palace_path,
+                n_results=n_results, language=language, symbol_name=symbol_name,
+                file_path=file_path, include_prose=include_prose, project_path=project_path)
+        )
 
 
 async def auto_search(

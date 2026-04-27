@@ -118,11 +118,15 @@ class ClaimsManager:
 
     def _start_lazy_cleanup(self) -> None:
         """Start background thread to clean up expired claims periodically."""
+        import logging
+
+        _logger = logging.getLogger("mempalace.claims")
+
         def _run():
             try:
                 self.cleanup_expired()
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning("lazy cleanup failed: %s", exc)
             # Re-schedule
             with self._write_lock:
                 if self._cleanup_timer is not None:
@@ -170,10 +174,10 @@ class ClaimsManager:
                     (session_id, target_type, target_id, action, _utc_now(), json.dumps(payload or {}))
                 )
                 self._conn_ctx.commit()
-        except Exception:
+        except Exception as exc:
             import logging
             logging.getLogger("mempalace.claims").warning(
-                "Failed to log event %s/%s/%s: %s", session_id, target_type, target_id, str(e)
+                "Failed to log event %s/%s/%s: %s", session_id, target_type, target_id, str(exc)
             )
 
     def claim(
