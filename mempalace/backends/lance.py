@@ -116,6 +116,8 @@ def _daemon_is_running() -> bool:
     - missing socket path → False
     - connect failure → False
     - malformed JSON / wrong length / timeout → False
+    - response must be dict with "embeddings" key whose value is a list
+    - empty request {"texts": []} must receive {"embeddings": []} back
     """
     sock_path = _get_socket_path()
     if not os.path.exists(sock_path):
@@ -142,6 +144,13 @@ def _daemon_is_running() -> bool:
         response = json.loads(data.decode("utf-8"))
         if not isinstance(response, dict):
             return False
+        if "embeddings" not in response:
+            return False
+        if not isinstance(response["embeddings"], list):
+            return False
+        # empty request must receive empty embeddings
+        if response["embeddings"] != []:
+            return False
         return True
     except Exception:
         return False
@@ -151,18 +160,6 @@ def _daemon_is_running() -> bool:
                 s.close()
             except Exception:
                 pass
-
-
-def _mark_daemon_dead(reason: str = "") -> None:
-    """Mark the daemon as dead and reset global state."""
-    global _DAEMON_STARTED
-    _DAEMON_STARTED = False
-    try:
-        from ..circuit_breaker import _embed_circuit
-        _embed_circuit.record_failure()
-    except Exception:
-        pass
-    logger.warning("Embedding daemon marked dead: %s", reason)
 
 
 def _start_daemon_if_needed() -> bool:
@@ -494,6 +491,41 @@ def _quarantine_record(
 _EMBED_TEXT_RESILIENT_LOCK = threading.Lock()
 _EMBED_QUARANTINE_COUNT = 0
 
+# ---------------------------------------------------------------------------
+# Per-vector error classification
+# ---------------------------------------------------------------------------
+
+
+def _is_per_vector_embedding_error(exc: Exception) -> bool:
+    """Return True if exc is a per-vector (degenerate) error, not a systemic one.
+
+    Per-vector errors: a specific chunk produced a bad embedding.
+    Systemic errors: daemon unavailable, socket broken, memory pressure, etc.
+    """
+    msg = str(exc).lower()
+    per_vector_tokens = (
+        "degenerate",
+        "zero-dimensional",
+        "all zero",
+        "nan",
+        "inf",
+        "dimension",
+        "_embed_via_socket[",
+    )
+    if not any(token in msg for token in per_vector_tokens):
+        return False
+    # Exclude systemic error tokens
+    systemic_tokens = (
+        "daemon unavailable",
+        "connection",
+        "timeout",
+        "fallback is disabled",
+        "memory pressure",
+        "malformed",
+        "json",
+    )
+    return not any(token in msg for token in systemic_tokens)
+
 
 def _embed_texts_resilient(
     texts: list[str],
@@ -520,20 +552,16 @@ def _embed_texts_resilient(
     # First attempt: batch embed everything
     try:
         vectors = _embed_texts(texts)
-    except Exception as initial_error:  # broad: RuntimeError, MemoryPressureError, etc.
-        err_str = str(initial_error).lower()
+    except Exception as initial_error:
+        if fallback_disabled and _is_per_vector_embedding_error(initial_error):
+            # Per-vector degenerate error from daemon with fallback disabled: quarantine affected chunks.
+            import re
 
-        # Detect which chunk failed from error message format: "...[_embed_via_socket[N]]..."
-        import re
-        chunk_idx_match = re.search(r'\[(\d+)\]', str(initial_error))
-        failed_chunk_idx = int(chunk_idx_match.group(1)) if chunk_idx_match else None
-
-        if fallback_disabled:
-            # Daemon returned bad vectors AND fallback is disabled — quarantine affected chunks.
-            # Don't propagate: mining must continue even with bad chunks.
+            chunk_idx_match = re.search(r'\[(\d+)\]', str(initial_error))
+            failed_chunk_idx = int(chunk_idx_match.group(1)) if chunk_idx_match else None
             failures = []
             for i, text in enumerate(texts):
-                if i == failed_chunk_idx or failed_chunk_idx is None:
+                if failed_chunk_idx is None or i == failed_chunk_idx:
                     failures.append({
                         "index": i,
                         "reason": f"daemon_degenerate:{initial_error}",
@@ -548,20 +576,9 @@ def _embed_texts_resilient(
                         model="mlx",
                         wing="",
                     )
-            if failed_chunk_idx is None:
-                # Systemic error — quarantine all
-                for i, text in enumerate(texts):
-                    if not any(f["index"] == i for f in failures):
-                        failures.append({
-                            "index": i,
-                            "reason": f"systemic:{initial_error}",
-                            "preview": text[:200],
-                            "context": context,
-                        })
-            # Return what we have (possibly empty valid list) — mining continues
             return [], [], failures, []
-
-        # Fallback enabled — let error propagate for callers that handle it
+        # Systemic error, MemoryPressureError, daemon dead, or fallback disabled but error
+        # is not per-vector → raise and stop mining.
         raise
 
     valid_texts, valid_vectors, failures, valid_orig_indices = [], [], [], []
