@@ -44,7 +44,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 
 class MemoryNamespace(Enum):
@@ -63,7 +62,7 @@ class MemoryNamespace(Enum):
     CHAT_ARCHIVE = "chat_archive"
 
 
-@dataclass
+@dataclass(slots=True)
 class NamespaceConfig:
     """
     Configuration for a single canonical namespace.
@@ -94,7 +93,7 @@ class NamespaceConfig:
     namespace: MemoryNamespace
     description: str
     suggested_origin_types: list[str]
-    ttl_days: Optional[int]
+    ttl_days: int | None
 
 
 # -------------------------------------------------------------------------------------------------
@@ -160,7 +159,7 @@ WING_TO_COLLECTION: dict[str, str] = {
 }
 
 
-def get_collection_name_for_wing(wing: Optional[str]) -> str:
+def get_collection_name_for_wing(wing: str | None) -> str:
     """
     Resolve wing to the corresponding LanceDB collection name.
 
@@ -188,7 +187,7 @@ _MAX_ROOM_LEN = 128
 _ROOM_SANITIZE_RE = re.compile(r"[^a-z0-9_]")
 
 
-def normalize_room_name(value: Optional[str]) -> str:
+def normalize_room_name(value: str | None) -> str:
     """
     Normalize ``value`` into a safe, consistent room name.
 
@@ -296,10 +295,10 @@ def is_valid_namespace(wing: str, room: str) -> bool:
 
 def resolve_namespace(
     origin_type: str,
-    source_file: Optional[str] = None,
-    session_id: Optional[str] = None,
-    category: Optional[str] = None,
-    timestamp: Optional[str] = None,
+    source_file: str | None = None,
+    session_id: str | None = None,
+    category: str | None = None,
+    timestamp: str | None = None,
 ) -> tuple[str, str]:
     """
     Resolve ``origin_type`` + context → canonical ``(wing, room)`` pair.

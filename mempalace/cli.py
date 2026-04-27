@@ -71,8 +71,8 @@ def cmd_init(args):
 
 
 def cmd_migrate(args):
-    """Migrate palace between ChromaDB and LanceDB backends."""
-    from .migrate import migrate_chroma_to_lance, migrate_lance_to_chroma
+    """Migrate palace to LanceDB — ChromaDB support has been removed."""
+    from .migrate import migrate_chroma_to_lance
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
@@ -84,12 +84,11 @@ def cmd_migrate(args):
             verbose=not args.quiet,
         )
     else:
-        migrate_lance_to_chroma(
-            palace_path=palace_path,
-            collection_name=args.collection,
-            batch_size=args.batch_size,
-            verbose=not args.quiet,
-        )
+        # lance-to-chroma is no longer supported
+        print("  ERROR: ChromaDB backend has been removed.")
+        print("  LanceDB is the only supported backend.")
+        print("  The lance-to-chroma migration direction is no longer available.")
+        sys.exit(1)
 
 
 def cmd_mine(args):
@@ -235,10 +234,7 @@ def cmd_split(args):
 def cmd_status(args):
     """Show full MemPalace status including memory pressure.
 
-    Respects canonical backend configuration:
-    - LanceDB is the canonical storage backend
-    - ChromaDB is legacy compatibility only
-    - Default backend is Lance (unless explicitly overridden to chroma in config)
+    Uses LanceDB as the canonical storage backend.
     """
     from .memory_guard import MemoryGuard, MemoryPressure
     from .config import MempalaceConfig
@@ -308,19 +304,27 @@ def cmd_status(args):
         print("Embedding daemon: ❌ not running")
 
     # ── Palace ──────────────────────────────────────────────────────────
-    # Canonical backend: Lance is primary storage; Chroma is legacy/migration-only.
+    # Canonical backend: Lance is primary storage.
     # Read from config unless --palace is explicitly passed.
     backend_type = config.backend  # from config.json / env
     if backend_type not in ("lance", "chroma"):
         backend_type = "lance"  # canonical default if config is weird
+
+    # ChromaDB palaces must migrate first — no longer supported
+    if backend_type == "chroma":
+        print(f"Backend: chroma (LEGACY — no longer supported)")
+        print(f"  ChromaDB backend has been removed. LanceDB is the only supported backend.")
+        print(f"  If you have existing ChromaDB data, migrate it first:")
+        print(f"    pip install chromadb")
+        print(f"    python -m mempalace.migrate chroma-to-lance --palace {palace_path}")
+        return
 
     if os.path.isdir(palace_path):
         try:
             backend = get_backend(backend_type)
             col = backend.get_collection(palace_path, config.collection_name, create=False)
             count = col.count()
-            backend_label = "lance" if backend_type == "lance" else "chroma"
-            print(f"Backend: {backend_label}")
+            print(f"Backend: lance")
             print(f"Memories: {count:,}")
             try:
                 from .symbol_index import SymbolIndex
@@ -343,7 +347,7 @@ def cmd_status(args):
 def cmd_repair(args):
     """Rebuild palace vector index from stored data.
 
-    Uses LanceDB (canonical backend). ChromaDB palaces must be migrated first.
+    Uses LanceDB as the canonical backend.
     """
     import shutil
     from .backends import get_backend
@@ -359,11 +363,11 @@ def cmd_repair(args):
     if backend_type not in ("lance", "chroma"):
         backend_type = "lance"
 
-    # ChromaDB palaces must migrate first — repair is Lance-only canonical
+    # ChromaDB is no longer supported
     if backend_type == "chroma":
-        print(f"\n  ⚠️  Palace at {palace_path} uses ChromaDB (legacy).")
-        print("  Run 'mempalace migrate chroma-to-lance' first, then retry.")
-        print("  ChromaDB repair is not supported — migration is the only path.")
+        print(f"\n  ERROR: ChromaDB backend has been removed.")
+        print("  LanceDB is the only supported backend.")
+        print(f"  Palace at {palace_path} uses ChromaDB and cannot be repaired.")
         return
 
     print(f"\n{'=' * 55}")
@@ -629,7 +633,11 @@ def cmd_cleanup(args):
     # Memory-safe cleanup — process in batches of 5000 to prevent RAM spike.
     # Only deletes old (timestamp < cutoff) AND is_latest=False drawers.
     try:
-        backend = get_backend(cfg.backend)
+        backend_type = cfg.backend
+        if backend_type == "chroma":
+            sys.stderr.write("Cleanup: ChromaDB backend is no longer supported.\n")
+            sys.exit(1)
+        backend = get_backend(backend_type)
         col = backend.get_collection(palace_path, cfg.collection_name, create=False)
         deleted = 0
         BATCH = 5000
@@ -852,7 +860,7 @@ def cmd_mcp(args):
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect.
 
-    Uses the configured backend (LanceDB canonical, ChromaDB legacy).
+    Uses LanceDB as the canonical backend.
     """
     from .dialect import Dialect
     from .backends import get_backend
@@ -873,10 +881,14 @@ def cmd_compress(args):
     else:
         dialect = Dialect()
 
-    # Connect via backend abstraction (Lance canonical, Chroma legacy)
+    # LanceDB is the only supported backend
     cfg = MempalaceConfig()
     backend_type = cfg.backend
-    if backend_type not in ("lance", "chroma"):
+    if backend_type == "chroma":
+        print(f"\n  ERROR: ChromaDB backend has been removed.")
+        print(f"  LanceDB is the only supported backend.")
+        sys.exit(1)
+    if backend_type not in ("lance",):
         backend_type = "lance"  # canonical default
 
     try:
@@ -888,8 +900,7 @@ def cmd_compress(args):
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         sys.exit(1)
 
-    backend_label = "lance" if backend_type == "lance" else "chroma"
-    print(f"  Using backend: {backend_label}")
+    print(f"  Using backend: lance")
 
     # Query drawers in batches to avoid SQLite variable limit (~999)
     where = {"wing": args.wing} if args.wing else None
@@ -1403,12 +1414,12 @@ def main():
     # migrate
     p_migrate = sub.add_parser(
         "migrate",
-        help="Migrate palace between ChromaDB and LanceDB backends",
+        help="Migrate ChromaDB palace to LanceDB (chroma-to-lance only)",
     )
     p_migrate.add_argument(
         "direction",
         choices=["chroma-to-lance", "lance-to-chroma"],
-        help="Migration direction",
+        help="Migration direction (lance-to-chroma is no longer supported)",
     )
     p_migrate.add_argument(
         "--collection",

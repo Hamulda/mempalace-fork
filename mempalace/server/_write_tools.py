@@ -226,8 +226,8 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     fact_text = str(fact.get("content", "")) if isinstance(fact, dict) else str(fact)
                     if fact_text:
                         pass
-            except (ImportError, Exception):
-                pass
+            except (ImportError, Exception) as e:
+                logger.warning("extract_memories failed for %s (fail-open): %s", drawer_id, e)
 
         bg_executor.submit(_extract_general_facts, content, drawer_id)
 
@@ -421,10 +421,11 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                                 "content": str(row["document"]),
                             })
                     entries = entries[:last_n]
-                except (ImportError, AttributeError):
+                except (ImportError, AttributeError) as e:
                     # FALLBACK: LanceDB version doesn't support sort() on .search()
                     # Use heapq.nlargest to keep only the newest last_n entries in memory
                     # instead of loading all entries then sorting everything.
+                    logger.warning("diary_read sort/limit fallback active (wing=%s): %s", wing, e)
                     import heapq
                     _BATCH = 500
                     offset = 0

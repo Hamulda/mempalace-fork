@@ -72,7 +72,7 @@ SHARED_FILES = [
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
 
-@dataclass
+@dataclass(slots=True)
 class ToolLatency:
     tool: str = ""
     calls: int = 0
@@ -110,14 +110,14 @@ class ToolLatency:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class ConflictStats:
     total_workspace_claims: int = 0
     conflicts_detected: int = 0
     conflict_rate: float = 0.0
 
 
-@dataclass
+@dataclass(slots=True)
 class WriteStats:
     attempted: int = 0
     failed: int = 0
@@ -125,7 +125,7 @@ class WriteStats:
     claim_conflicts: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class CacheChurn:
     invalidations: int = 0
     keys_changed: set[str] = field(default_factory=set)

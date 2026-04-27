@@ -10,6 +10,7 @@ Storage: Uses get_backend(config.backend) — LanceDB is canonical primary,
 ChromaDB is legacy compat via the same abstraction layer.
 """
 
+import logging
 import os
 import sys
 import hashlib
@@ -26,6 +27,7 @@ from .palace import SKIP_DIRS
 from .symbol_index import SymbolIndex
 from .mining_manifest import MiningManifest, _quick_hash
 
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # MINE PROFILING
@@ -1558,8 +1560,8 @@ def mine(
                         if os.environ.get("MEMPALACE_MINE_PROFILE") == "1":
                             print(f"    [skip manifest] {filepath.name}")
                         continue
-                except Exception:
-                    pass  # Fail-open: proceed
+                except Exception as e:
+                    logger.debug("manifest check failed for %s (fail-open): %s", filepath, e)
 
             if dry_run:
                 # Dry run: use original process_file (handles its own output)

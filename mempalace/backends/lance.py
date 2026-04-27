@@ -97,8 +97,8 @@ def _mark_daemon_dead(reason: str = "") -> None:
     try:
         from ..circuit_breaker import _embed_circuit
         _embed_circuit.record_failure()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("circuit_breaker.record_failure failed (non-critical): %s", e)
     logger.warning("Embedding daemon marked dead: %s", reason)
 
 
@@ -417,7 +417,7 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
                 raise EmbeddingDaemonError(
                     f"Socket embedding failed and in-process fallback is disabled: {e}",
                     cause=e,
-                ) from None
+                ) from e
             logger.warning("Socket embedding failed (%s), using fallback", e)
             computed = _embed_texts_fallback(uncached_texts)
             computed = _sanitize_embedding_batch(computed, context="_embed_texts_fallback")

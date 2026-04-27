@@ -40,6 +40,122 @@ def _ensure_tree_sitter() -> bool:
         return False
 
 
+# ── tree-sitter parser helper ──────────────────────────────────────────────────
+
+def _get_tree_sitter_parser(language: str) -> "object | None":
+    """
+    Get a tree-sitter Parser for the given language.
+
+    Tries:
+      1. tree_sitter_languages.get_parser(language)  (preferred, bundled parsers)
+      2. tree_sitter.Language + tree_sitter.Parser (manual loading)
+    Returns None if tree-sitter is unavailable or the language parser can't be loaded.
+    """
+    if not _ensure_tree_sitter():
+        return None
+
+    try:
+        from tree_sitter_languages import get_parser
+
+        try:
+            parser = get_parser(language)
+            if parser is not None:
+                return parser
+        except Exception:
+            pass
+
+        # Fallback: manual Language + Parser
+        from tree_sitter_languages import get_language
+        from tree_sitter import Parser
+
+        lang = get_language(language)
+        parser = Parser()
+        parser.set_language(lang)
+        return parser
+
+    except Exception:
+        return None
+
+
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+def tree_sitter_diagnostics() -> dict:
+    """
+    Return diagnostic info about tree-sitter availability and Python parser.
+
+    Returns:
+        {
+            "available": bool,
+            "parser_backend": str | None,
+            "python_parser_works": bool,
+            "error": str | None,
+        }
+    """
+    available = _ensure_tree_sitter()
+
+    if not available:
+        return {
+            "available": False,
+            "parser_backend": None,
+            "python_parser_works": False,
+            "error": "tree_sitter or tree_sitter_languages not installed",
+        }
+
+    # Try to get Python parser via get_parser
+    try:
+        from tree_sitter_languages import get_parser, get_language
+
+        parser = get_parser("python")
+        if parser is not None:
+            # Quick smoke test: parse a trivial Python snippet
+            try:
+                tree = parser.parse(b"def foo(): pass")
+                if tree.root_node is not None:
+                    return {
+                        "available": True,
+                        "parser_backend": "tree_sitter_languages.get_parser",
+                        "python_parser_works": True,
+                        "error": None,
+                    }
+            except Exception as e:
+                return {
+                    "available": True,
+                    "parser_backend": "tree_sitter_languages.get_parser",
+                    "python_parser_works": False,
+                    "error": f"parse failed: {e}",
+                }
+
+        # Fallback: Language + Parser
+        lang = get_language("python")
+        from tree_sitter import Parser
+
+        parser2 = Parser()
+        parser2.set_language(lang)
+        tree2 = parser2.parse(b"def foo(): pass")
+        if tree2.root_node is not None:
+            return {
+                "available": True,
+                "parser_backend": "Language+Parser (tree_sitter)",
+                "python_parser_works": True,
+                "error": None,
+            }
+
+        return {
+            "available": True,
+            "parser_backend": "unknown",
+            "python_parser_works": False,
+            "error": "parser returned None root_node",
+        }
+
+    except Exception as e:
+        return {
+            "available": True,
+            "parser_backend": None,
+            "python_parser_works": False,
+            "error": str(e),
+        }
+
+
 # ── Regex extraction helpers ──────────────────────────────────────────────────
 
 def _line_number(content: str, char_offset: int) -> int:
@@ -89,23 +205,23 @@ def _file_signature(content: str) -> str:
 
 def _extract_py_tree_sitter(content: str) -> dict:
     """Extract Python symbols with parent/fqn using tree-sitter."""
-    from tree_sitter_languages import get_language
+    parser = _get_tree_sitter_parser("python")
+    if parser is None:
+        return {
+            "symbols": [],
+            "imports": [],
+            "direct_imports": [],
+            "exports": [],
+            "file_signature": "",
+            "extraction_backend": "tree_sitter",
+        }
 
-    lang = get_language("python")
-
-    # Build parent map via DFS
-    def _build_parent_map(node) -> dict:
-        result = {}
-        stack = [(node, None)]
-        while stack:
-            n, parent = stack.pop()
-            result[id(n)] = parent
-            for child in n.children:
-                stack.append((child, n))
-        return result
+    # Build parent map and id→node map via single DFS pass
+    parent_map: dict[int, Optional[int]] = {}
+    id_to_node: dict[int, object] = {}
 
     try:
-        tree = lang.parse(bytes(content, "utf-8"))
+        tree = parser.parse(bytes(content, "utf-8"))
     except Exception:
         return {
             "symbols": [],
@@ -117,7 +233,24 @@ def _extract_py_tree_sitter(content: str) -> dict:
         }
 
     root = tree.root_node
-    parent_map = _build_parent_map(root)
+    if root is None:
+        return {
+            "symbols": [],
+            "imports": [],
+            "direct_imports": [],
+            "exports": [],
+            "file_signature": "",
+            "extraction_backend": "tree_sitter",
+        }
+
+    stack: list[tuple[object, Optional[int]]] = [(root, None)]
+    while stack:
+        n, parent = stack.pop()
+        nid = id(n)
+        parent_map[nid] = parent
+        id_to_node[nid] = n
+        for child in n.children:
+            stack.append((child, nid))
 
     def _child(node, *types):
         for c in node.children:
@@ -134,31 +267,30 @@ def _extract_py_tree_sitter(content: str) -> dict:
     def _end_line(node):
         return (node.end_point[0] + 1) if node else 0
 
-    def _fqn_prefix(node_id) -> list[str]:
+    def _fqns_from_ancestors(node_id: int) -> list[str]:
+        """Walk ancestors using parent_map (O(depth), no linear search)."""
         parts = []
-        parent_id = parent_map.get(node_id)
-        while parent_id is not None:
-            for n in (root.preorder()):
-                if id(n) == parent_id:
-                    if n.type in ("function_definition", "async_generator_function_definition", "class_definition"):
-                        name_node = _child(n, "identifier")
-                        if name_node:
-                            parts.insert(0, _node_text(name_node))
-                    parent_id = parent_map.get(parent_id)
-                    break
-            else:
+        cur_id = parent_map.get(node_id)
+        while cur_id is not None:
+            n = id_to_node.get(cur_id)
+            if n is None:
                 break
+            if n.type in ("function_definition", "async_generator_function_definition", "class_definition"):
+                name_node = _child(n, "identifier")
+                if name_node:
+                    parts.insert(0, _node_text(name_node))
+            cur_id = parent_map.get(cur_id)
         return parts
 
+    SYMBOL_TYPES = ("function_definition", "async_generator_function_definition", "class_definition")
+
     symbols = []
-    seen_ids = set()
 
     for node in root.preorder():
-        if id(node) in seen_ids:
-            continue
-        seen_ids.add(id(node))
-
-        if node.type not in ("function_definition", "async_generator_function_definition", "class_definition"):
+        nid = id(node)
+        if nid in id_to_node and nid != id(root):
+            pass
+        if node.type not in SYMBOL_TYPES:
             continue
 
         name_node = _child(node, "identifier")
@@ -166,24 +298,8 @@ def _extract_py_tree_sitter(content: str) -> dict:
             continue
 
         name = _node_text(name_node)
-
-        # Build fqn prefix from ancestors
-        prefix_parts = []
-        cur_id = parent_map.get(id(node))
-        while cur_id is not None:
-            for n in (root.preorder()):
-                if id(n) == cur_id:
-                    if n.type in ("function_definition", "async_generator_function_definition", "class_definition"):
-                        nn = _child(n, "identifier")
-                        if nn:
-                            prefix_parts.insert(0, _node_text(nn))
-                    cur_id = parent_map.get(cur_id)
-                    break
-            else:
-                break
-
+        prefix_parts = _fqns_from_ancestors(nid)
         fqn = ".".join(prefix_parts + [name]) if prefix_parts else name
-
         parent_name = prefix_parts[-1] if prefix_parts else None
 
         kind = "class" if node.type == "class_definition" else "function"
@@ -228,12 +344,14 @@ def _extract_py_tree_sitter(content: str) -> dict:
     for node in root.preorder():
         if node.type == "assignment":
             parent_node = parent_map.get(id(node))
-            if parent_node and parent_node.type == "module":
-                name_node = _child(node, "identifier")
-                if name_node:
-                    n = _node_text(name_node)
-                    if n[0].isupper() and n not in ("True", "False", "None"):
-                        exports.append(n)
+            if parent_node is not None:
+                parent_n = id_to_node.get(parent_node)
+                if parent_n is not None and parent_n.type == "module":
+                    name_node = _child(node, "identifier")
+                    if name_node:
+                        n = _node_text(name_node)
+                        if n[0].isupper() and n not in ("True", "False", "None"):
+                            exports.append(n)
 
     return {
         "symbols": symbols,
@@ -245,7 +363,7 @@ def _extract_py_tree_sitter(content: str) -> dict:
     }
 
 
-# ── Regex extractors (mirror symbol_index.py behavior) ───────────────────────
+# ── Regex extractors (mirror symbol_index.py behavior) ────────────────────────
 
 def _extract_py_regex(content: str) -> dict:
     symbols = []
@@ -511,3 +629,13 @@ def extract_symbols(content: str, source_file: str) -> dict:
         "file_signature": result.get("file_signature", ""),
         "extraction_backend": result.get("extraction_backend", "regex"),
     }
+
+
+# ── CLI doctor ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    diag = tree_sitter_diagnostics()
+    print(f"tree-sitter available: {diag['available']}")
+    print(f"parser backend:        {diag['parser_backend']}")
+    print(f"python parser works:   {diag['python_parser_works']}")
+    print(f"error:                {diag['error']}")

@@ -155,21 +155,33 @@ class MempalaceConfig:
     @property
     def backend(self) -> str:
         """
-        Storage backend: 'lance' (canonical primary) or 'chroma' (legacy/migration only).
+        Storage backend: 'lance' only (ChromaDB support has been removed).
 
-        Canonical default is 'lance'. Use 'chroma' only for migrating existing ChromaDB
-        palaces to LanceDB — not for new installations or ongoing use.
+        ChromaDB is no longer supported. LanceDB is the only available backend.
+        If config or env contains 'chroma', a warning is issued and 'lance' is returned.
 
-        Note: the Pydantic layer in settings.py uses the same 'lance'/'chroma' values
-        (not 'lancedb'/'chromadb'). The canonical values are consistent across all layers.
+        Note: the Pydantic layer in settings.py uses 'lance' only.
         """
+        import warnings
         env_val = os.environ.get("MEMPALACE_BACKEND")
-        if env_val:
-            return env_val
+        if env_val == "chroma":
+            warnings.warn(
+                "ChromaDB backend has been removed. "
+                "LanceDB is the only supported backend. "
+                "Ignoring MEMPALACE_BACKEND=chroma.",
+                UserWarning,
+                stacklevel=2,
+            )
         file_val = self._file_config.get("backend", "")
-        if file_val in ("lance", "chroma"):
-            return file_val
-        return "lance"  # canonical default — Lance is primary storage
+        if file_val == "chroma":
+            warnings.warn(
+                "ChromaDB backend has been removed from this installation. "
+                "LanceDB is the only supported backend. "
+                "Your config file contains backend='chroma' which will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return "lance"
 
     @property
     def people_map(self):

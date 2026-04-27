@@ -27,13 +27,7 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
-# ── Deterministic mock embeddings ───────────────────────────────────────
-# Fast, deterministic mock — bypasses MLX, fastembed, and MemoryGuard.
-# Tests that intentionally test real embedding behavior should be marked @pytest.mark.slow.
-
-
 # Now it is safe to import mempalace modules that trigger initialisation.
-import chromadb  # noqa: E402
 import pytest  # noqa: E402
 
 from mempalace.config import MempalaceConfig  # noqa: E402
@@ -113,7 +107,6 @@ def _cleanup_resources():
     - MemoryGuard daemon thread stopped and singleton reset
     - SymbolIndex instances closed and cleared
     - QueryCache cleared
-    - ChromaDB client reset
     """
     yield
     # Stop MemoryGuard daemon thread and reset singleton
@@ -147,12 +140,6 @@ def _cleanup_resources():
         cache.clear()
     except Exception:
         pass
-    # Reset ChromaDB client singleton
-    try:
-        import chromadb
-        chromadb.reset_client()
-    except Exception:
-        pass
 
 
 @pytest.fixture
@@ -184,28 +171,25 @@ def config(tmp_dir, palace_path):
 
 
 @pytest.fixture
-def collection_chroma(palace_path):
-    """A ChromaDB collection pre-seeded in the temp palace.
+def collection(palace_path):
+    """A LanceDB collection in the temp palace.
 
-    DEPRECATED: This fixture exists only for tests that still use ChromaDB.
-    All new tests should use LanceDB via the canonical write/read paths.
+    This is the canonical collection fixture for all tests.
+    Uses the LanceDB backend exclusively.
     """
-    client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_or_create_collection("mempalace_drawers")
+    from mempalace.backends import get_backend
+
+    backend = get_backend("lance")
+    col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
     yield col
+    # Cleanup handled by backend
+
+    # Reset query cache to avoid cross-test contamination
     try:
-        client.delete_collection("mempalace_drawers")
+        from mempalace.query_cache import get_query_cache
+        get_query_cache().clear()
     except Exception:
         pass
-    try:
-        client.close()
-    except Exception:
-        pass
-    del client
-
-
-# Alias for backward compatibility with existing tests
-collection = collection_chroma
 
 
 @pytest.fixture

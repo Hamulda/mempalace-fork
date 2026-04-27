@@ -39,7 +39,7 @@ bash ~/.claude/plugins/marketplaces/mempalace/.claude-plugin/hooks/mempal-server
 |---------|-------|-----|
 | MCP tools return connection error | Health check | Start server: `mempalace serve --host 127.0.0.1 --port 8765` |
 | `connection refused` | Server PID missing | Server not running — start it or check hooks registration |
-| Stale sessions | Session count high | Prune: `find ~/.mempalace/runtime/sessions/ -name "*.session" -mtime +6h -delete` |
+| Stale sessions | Session count high | Sessions auto-expire via TTL (6h) — no manual prune needed |
 | Slow searches | Memory pressure | Check `memory_guard` in `mempalace_status` output |
 
 ## If All Checks Pass but Slow

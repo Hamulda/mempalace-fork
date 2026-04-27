@@ -6,7 +6,7 @@ import threading
 import time
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .backends.lance import LanceCollection
@@ -14,13 +14,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class PendingWrite:
     documents: list[str]
     ids: list[str]
     metadatas: list[dict]
     result_event: threading.Event = field(default_factory=threading.Event)
-    error: Optional[Exception] = None
+    error: Exception | None = None
 
 
 class WriteCoalescer:
@@ -43,7 +43,7 @@ class WriteCoalescer:
         self._window_s = window_ms / 1000.0
         self._pending: list[PendingWrite] = []
         self._lock = threading.Lock()
-        self._flush_timer: Optional[threading.Timer] = None
+        self._flush_timer: threading.Timer | None = None
         self._timer_lock = threading.Lock()
 
     def enqueue(

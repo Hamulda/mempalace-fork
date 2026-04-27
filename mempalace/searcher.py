@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .backends import get_backend
 from .query_sanitizer import sanitize_query
+from .server._code_tools import _source_file_matches
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -424,8 +425,7 @@ async def search_memories_async(
     """Non-blocking wrapper — používej v async kontextu (fastmcp_server.py)."""
     import asyncio
 
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
+    return await asyncio.get_running_loop().run_in_executor(
         _search_executor,
         functools.partial(
             search_memories,
@@ -928,6 +928,7 @@ def _symbol_first_search(
     n_results: int = 10,
     language: str = None,
     file_path: str = None,
+    project_path: str = None,
 ) -> list:
     """
     Path 2 — Symbol-first retrieval.
@@ -1034,7 +1035,14 @@ def _symbol_first_search(
             "source": "symbol_index",
             "symbol_fqn": meta.get("symbol_fqn", ""),
             "language": meta.get("language", ""),
+            "line_start": meta.get("line_start", 0),
+            "line_end": meta.get("line_end", 0),
+            "symbol_name": meta.get("symbol_name", ""),
         })
+
+    # Belt-and-suspenders project_path filter
+    if project_path:
+        hits = [h for h in hits if _source_file_matches(h.get("source_file", ""), project_path)]
 
     # Step 5: Sort by symbol count per file (descending) — most symbol-dense first
     hits.sort(key=lambda h: h.get("symbol_rank", 0), reverse=True)
@@ -1203,7 +1211,8 @@ def code_search(
     # ── Symbol-first: symbol name query — skip global vector ───────────────────
     if intent == "symbol":
         hits = _symbol_first_search(query, palace_path, col, n_results=n_results,
-                                    language=language, file_path=file_path)
+                                    language=language, file_path=file_path,
+                                    project_path=project_path)
         if hits:
             return {
                 "query": query, "filters": kind, "results": hits[:n_results],
@@ -1235,6 +1244,9 @@ def code_search(
         merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
         source_files = [h.get("source_file", "") for h in merged]
         merged = _add_repo_rel_path(merged, source_files)
+        # Belt-and-suspenders project_path filter
+        if project_path:
+            merged = [h for h in merged if _source_file_matches(h.get("source_file", ""), project_path)]
         return {
             "query": query, "filters": kind, "results": merged,
             "sources": {"vector": len(vector_hits), "fts5": len(fts5_hits)},
@@ -1256,6 +1268,9 @@ def code_search(
         except Exception as e:
             logger.warning("Vector search in code_search (memory) failed: %s", e)
 
+        # Belt-and-suspenders project_path filter
+        if project_path:
+            vector_hits = [h for h in vector_hits if _source_file_matches(h.get("source_file", ""), project_path)]
         source_files = [h.get("source_file", "") for h in vector_hits]
         vector_hits = _add_repo_rel_path(vector_hits, source_files)
         return {
@@ -1287,6 +1302,9 @@ def code_search(
     merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
     source_files = [h.get("source_file", "") for h in merged]
     merged = _add_repo_rel_path(merged, source_files)
+    # Belt-and-suspenders project_path filter
+    if project_path:
+        merged = [h for h in merged if _source_file_matches(h.get("source_file", ""), project_path)]
 
     return {
         "query": query,
@@ -1310,7 +1328,7 @@ async def code_search_async(
     import functools
 
     async with _search_semaphore:
-        return await asyncio.get_event_loop().run_in_executor(
+        return await asyncio.get_running_loop().run_in_executor(
             _search_executor,
             functools.partial(code_search, query=query, palace_path=palace_path,
                 n_results=n_results, language=language, symbol_name=symbol_name,

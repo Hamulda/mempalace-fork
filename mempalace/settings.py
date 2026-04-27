@@ -58,8 +58,8 @@ class MemPalaceSettings(BaseSettings):
     # Collection name: canonical source is MempalaceConfig (config.json).
     collection_name: str = "mempalace_drawers"
 
-    # Storage backend — mirrors MempalaceConfig.backend defaults
-    db_backend: Literal["lance", "chroma"] = "lance"
+    # Storage backend — LanceDB only (ChromaDB support removed)
+    db_backend: Literal["lance"] = "lance"
 
     @model_validator(mode="after")
     def _sync_db_path(self) -> "MemPalaceSettings":

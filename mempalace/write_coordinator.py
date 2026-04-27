@@ -12,6 +12,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -19,6 +20,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Schema constants
 _SCHEMA = """
@@ -448,8 +451,11 @@ class WriteCoordinator:
                         self.rollback_intent(intent_id, session_id)
                         rolled_back += 1
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Intent %s session %s lookup failed — treating as active: %s",
+                        intent_id, session_id, e,
+                    )
 
             # Session is still active — keep intent for potential replay
             recovered += 1

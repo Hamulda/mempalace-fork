@@ -24,8 +24,7 @@ from __future__ import annotations
 
 import time
 import threading
-from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any
 import hashlib
 import json
 import logging
@@ -64,7 +63,7 @@ class QueryCache:
         # Per-shard data structures — each shard is fully independent
         self._shards: list[dict] = [
             {
-                "cache": OrderedDict[str, tuple[Any, float]](),
+                "cache": dict[str, tuple[Any, float]](),
                 # Per-(palace_path, collection) write timestamps for cross-palace isolation.
                 "last_write": {},  # Key: (palace_path, collection_name)
             }
@@ -96,7 +95,7 @@ class QueryCache:
         collection: str,
         query_texts: list[str],
         n_results: int,
-    ) -> Optional[Any]:
+    ) -> Any | None:
         """Vrátí cached výsledek nebo None pokud cache miss/expired."""
         key = self._make_key(palace_path, collection, query_texts, n_results)
         now = time.monotonic()
@@ -131,7 +130,8 @@ class QueryCache:
                 return None
 
             # Cache hit – přesuň na konec (LRU update)
-            cache.move_to_end(key)
+            val = cache.pop(key)
+            cache[key] = val
             with self._global_lock:
                 self._hits += 1
             return result
@@ -153,12 +153,15 @@ class QueryCache:
 
         with lock:
             cache = shard["cache"]
+            # Pop and re-insert for LRU ordering
+            if key in cache:
+                del cache[key]
             cache[key] = (result, now)
-            cache.move_to_end(key)
 
             # Evict nejstarší položky pokud překračujeme maxsize (per-shard)
             while len(cache) > self._maxsize:
-                cache.popitem(last=False)
+                oldest = next(iter(cache))
+                del cache[oldest]
 
     def invalidate_collection(self, palace_path: str, collection: str) -> None:
         """
@@ -183,7 +186,7 @@ class QueryCache:
                     if isinstance(k, str) and k.startswith(prefix):
                         cache.pop(k, None)
 
-    def get_value(self, key: str, palace_path: str = "", collection: str = "") -> Optional[Any]:
+    def get_value(self, key: str, palace_path: str = "", collection: str = "") -> Any | None:
         """
         Return cached value by raw string key, or None if missing/expired.
 
@@ -260,10 +263,12 @@ class QueryCache:
             try:
                 now = time.monotonic()
                 cache = shard["cache"]
+                if key in cache:
+                    del cache[key]
                 cache[key] = (value, now)
-                cache.move_to_end(key)
                 while len(cache) > self._maxsize:
-                    cache.popitem(last=False)
+                    oldest = next(iter(cache))
+                    del cache[oldest]
             except Exception:
                 logger.warning("query_cache.set_value failed: shard=%d key=%s", shard_idx, key)
 
@@ -319,14 +324,14 @@ class EmbeddingCache:
     def __init__(self, maxsize: int = 512, ttl_seconds: float = 300.0):
         self._maxsize = maxsize
         self._ttl = ttl_seconds
-        self._cache: OrderedDict[str, tuple[list[float], float]] = OrderedDict()
+        self._cache: dict[str, tuple[list[float], float]] = {}
         self._lock = threading.Lock()
 
     def _hash_text(self, text: str) -> str:
         """Content hash as cache key — stable across process restarts."""
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    def get(self, text: str) -> Optional[list[float]]:
+    def get(self, text: str) -> list[float] | None:
         """Return cached embedding or None."""
         key = self._hash_text(text)
         with self._lock:
@@ -336,17 +341,23 @@ class EmbeddingCache:
             if time.monotonic() - ts > self._ttl:
                 del self._cache[key]
                 return None
-            self._cache.move_to_end(key)
+            # Move to end (LRU): pop and re-insert
+            val = self._cache.pop(key)
+            self._cache[key] = val
             return emb
 
     def set(self, text: str, embedding: list[float]) -> None:
         """Store embedding with TTL."""
         key = self._hash_text(text)
         with self._lock:
+            # Pop and re-insert for LRU ordering
+            if key in self._cache:
+                del self._cache[key]
             self._cache[key] = (embedding, time.monotonic())
-            self._cache.move_to_end(key)
             while len(self._cache) > self._maxsize:
-                self._cache.popitem(last=False)
+                # Evict oldest entry (first key in insertion-order dict)
+                oldest = next(iter(self._cache))
+                del self._cache[oldest]
 
     def clear(self) -> None:
         """Clear all entries."""

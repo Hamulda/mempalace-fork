@@ -124,6 +124,58 @@ class Foo:
             assert "type" in sym  # kind→type shim
             assert "line" in sym  # line_start alias
 
+    def test_tree_sitter_strict_fqn_when_available(self):
+        """Strict fqn assertions when tree-sitter is available."""
+        from mempalace.code_index.ast_extractor import is_tree_sitter_available, tree_sitter_diagnostics
+
+        if not is_tree_sitter_available():
+            pytest.skip("tree-sitter not available")
+
+        diag = tree_sitter_diagnostics()
+        if not diag.get("python_parser_works"):
+            pytest.skip(f"python parser not working: {diag.get('error')}")
+
+        from mempalace.code_index.ast_extractor import extract_code_structure
+
+        code = """
+class Outer:
+    def method(self):
+        pass
+
+    class Inner:
+        def inner_method(self):
+            pass
+
+class Foo:
+    def handle(self):
+        pass
+
+class Bar:
+    def handle(self):
+        pass
+"""
+        result = extract_code_structure(code, "test.py")
+        assert result["extraction_backend"] == "tree_sitter"
+
+        by_name = {s["name"]: s for s in result["symbols"]}
+
+        # Exact fqns when tree-sitter is working
+        assert by_name["Outer"]["fqn"] == "Outer"
+        assert by_name["method"]["fqn"] == "Outer.method"
+        assert by_name["Outer"]["parent"] is None
+
+        assert by_name["Inner"]["fqn"] == "Outer.Inner"
+        assert by_name["Inner"]["parent"] == "Outer"
+
+        assert by_name["inner_method"]["fqn"] == "Outer.Inner.inner_method"
+        assert by_name["inner_method"]["parent"] == "Inner"
+
+        # Duplicate method names in different classes
+        handles = [s for s in result["symbols"] if s["name"] == "handle"]
+        assert len(handles) == 2
+        fqns = {s["fqn"] for s in handles}
+        assert fqns == {"Foo.handle", "Bar.handle"}
+
     def test_tree_sitter_unavailable_still_works(self):
         """If tree-sitter import fails, extract_code_structure returns result."""
         from mempalace.code_index.ast_extractor import is_tree_sitter_available
