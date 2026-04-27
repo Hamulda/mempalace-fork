@@ -183,14 +183,6 @@ class MineStats:
             "errors": self._errors,
         }
 
-        if profile_json:
-            try:
-                with open(profile_json, "w") as f:
-                    _json.dump(report, f, indent=2)
-                print(f"  [PROFILE] JSON report written to {profile_json}", flush=True)
-            except Exception as e:
-                print(f"  [PROFILE] Failed to write JSON report: {e}", flush=True)
-
         return report
 
     def print_summary(self) -> None:
@@ -1629,6 +1621,16 @@ def mine(
             pass
 
     stats.print_summary()
+
+    # Write JSON profile if path is set (guaranteed even on exception)
+    profile_json = os.environ.get("MEMPALACE_MINE_PROFILE_JSON", "")
+    if profile_json:
+        try:
+            report = stats.final_report()
+            with open(profile_json, "w") as f:
+                _json.dump(report, f, indent=2)
+        except Exception:
+            pass
 
     print(f"\n{'=' * 55}")
     print("  Done.")

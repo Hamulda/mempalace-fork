@@ -28,19 +28,6 @@ import shutil
 import socket
 import subprocess
 import sys
-
-
-class DegenerateEmbeddingError(Exception):
-    """Raised when an embedding vector fails validation (NaN/Inf/wrong-dim/zero-norm)."""
-
-    def __init__(self, index: int, reason: str, context: str = ""):
-        self.index = index
-        self.reason = reason
-        self.context = context
-        msg = f"Degenerate embedding at index {index}: {reason}"
-        if context:
-            msg += f" (context: {context})"
-        super().__init__(msg)
 import threading
 import time
 from datetime import timedelta
@@ -76,6 +63,43 @@ _SOCK_TIMEOUT = float(os.environ.get(
     "MEMPALACE_EMBED_DAEMON_STARTUP_TIMEOUT",
     os.environ.get("MEMPALACE_EMBED_SOCKET_TIMEOUT", "120"),
 ))
+
+
+class EmbeddingDaemonError(RuntimeError):
+    """Raised when the embedding daemon is unavailable and in-process fallback is disabled."""
+
+    def __init__(self, msg: str = "", cause: Exception | None = None):
+        super().__init__(msg)
+        self._cause = cause
+
+    @property
+    def cause(self) -> Exception | None:
+        return self._cause
+
+
+class DegenerateEmbeddingError(RuntimeError):
+    """Raised when a degenerate vector is detected and in-process fallback is disabled."""
+
+
+def _embed_fallback_enabled() -> bool:
+    """True when in-process fastembed fallback is enabled (default).
+
+    Enabled by: "1", "true" (case-insensitive), any truthy value except "0", "", "false".
+    """
+    val = os.environ.get("MEMPALACE_EMBED_FALLBACK", "1")
+    return val in ("1",) or val.lower() in ("true", "yes", "on")
+
+
+def _mark_daemon_dead(reason: str = "") -> None:
+    """Mark the daemon as dead and reset global state."""
+    global _DAEMON_STARTED
+    _DAEMON_STARTED = False
+    try:
+        from ..circuit_breaker import _embed_circuit
+        _embed_circuit.record_failure()
+    except Exception:
+        pass
+    logger.warning("Embedding daemon marked dead: %s", reason)
 
 
 def _get_socket_path() -> str:
@@ -250,51 +274,6 @@ def _start_daemon_if_needed() -> bool:
 from ..circuit_breaker import _embed_circuit
 
 
-def _validate_embedding_vector(
-    vec,
-    *,
-    expected_dim: int | None = None,
-    index: int,
-    context: str = "",
-) -> list[float]:
-    """
-    Validate one embedding vector. Raises DegenerateEmbeddingError if invalid.
-
-    Policy:
-      - Wrong dimension → DegenerateEmbeddingError
-      - NaN/Inf present → DegenerateEmbeddingError
-      - Zero/near-zero norm → DegenerateEmbeddingError
-      - Otherwise returns the finite float list
-
-    Never returns NaN/Inf/zero vectors.
-    """
-    if expected_dim is None:
-        expected_dim = EMBEDDING_DIMS
-
-    try:
-        float_vec = [float(v) for v in vec]
-    except (TypeError, ValueError) as e:
-        raise DegenerateEmbeddingError(index, f"not convertible to float: {e}", context)
-
-    if len(float_vec) != expected_dim:
-        raise DegenerateEmbeddingError(
-            index, f"dimension {len(float_vec)} != {expected_dim}", context
-        )
-
-    has_nan = any(math.isnan(v) for v in float_vec)
-    has_inf = any(math.isinf(v) for v in float_vec)
-    if has_nan or has_inf:
-        raise DegenerateEmbeddingError(
-            index, f"contains NaN/Inf (nan={has_nan}, inf={has_inf})", context
-        )
-
-    norm = math.sqrt(sum(v * v for v in float_vec))
-    if norm < 1e-9:
-        raise DegenerateEmbeddingError(index, f"zero-norm ({norm:.2e})", context)
-
-    return float_vec
-
-
 def _embed_via_socket(texts: List[str]) -> List[List[float]]:
     """Send texts to the daemon via Unix socket, return embeddings."""
     if not _embed_circuit.should_try_socket():
@@ -329,25 +308,10 @@ def _embed_via_socket(texts: List[str]) -> List[List[float]]:
         if response.get("error"):
             raise RuntimeError(f"Daemon embedding error: {response['error']}")
 
-        raw_embeddings = response["embeddings"]
-
-        # Validate each vector before returning — reject NaN/Inf/wrong-dim/zero-norm
-        # Raises DegenerateEmbeddingError(index, reason, "_embed_via_socket[i]")
-        validated = []
-        for i, emb in enumerate(raw_embeddings):
-            v = _validate_embedding_vector(
-                emb,
-                expected_dim=EMBEDDING_DIMS,
-                index=i,
-                context="_embed_via_socket",
-            )
-            validated.append(v)
-
+        embeddings = response["embeddings"]
+        # Truncate to EMBEDDING_DIMS for Matryoshka compatibility
         _embed_circuit.record_success()
-        return validated
-    except DegenerateEmbeddingError:
-        # Degenerate vectors from the daemon are NOT circuit failures
-        raise
+        return [e[:EMBEDDING_DIMS] for e in embeddings]
     except Exception:
         _embed_circuit.record_failure()
         raise
@@ -361,15 +325,6 @@ _fallback_model = None
 _fallback_lock = threading.Lock()
 
 
-def _embed_fallback_enabled() -> bool:
-    """Check if in-process fallback is enabled via env var.
-
-    Default "1" = fallback enabled (backward compatible).
-    "0", "false", "no", "off" = fallback disabled (daemon-only mode for mining).
-    """
-    return os.environ.get("MEMPALACE_EMBED_FALLBACK", "1").lower() not in ("0", "false", "no", "off")
-
-
 def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
     """In-process fallback — loads fastembed into this process.
 
@@ -377,6 +332,9 @@ def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
     On M1 8GB, fastembed model needs ~500MB RAM — loading at critical pressure
     would cause system instability.
     """
+    if not _embed_fallback_enabled():
+        raise RuntimeError("in-process fallback is disabled")
+
     global _fallback_model
     with _fallback_lock:
         if _fallback_model is None:
@@ -391,13 +349,6 @@ def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
                         f"Start the embed daemon instead: mempalace embed-daemon start"
                     )
                 if guard.pressure == MemoryPressure.WARN:
-                    if not _embed_fallback_enabled():
-                        raise MemoryPressureError(
-                            f"Cannot load in-process embedding model: "
-                            f"memory pressure is WARN ({guard.used_ratio:.0%}) "
-                            f"and in-process fallback is disabled for mining. "
-                            f"Restart daemon with: mempalace embed-daemon stop && mempalace embed-daemon start"
-                        )
                     logger.warning(
                         "Memory pressure is WARN (%.0f%%). "
                         "Loading in-process embedding model — consider starting the daemon instead.",
@@ -462,22 +413,22 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
             # Sanitize daemon output — central guarantee before cache and write paths
             computed = _sanitize_embedding_batch(computed, context="_embed_via_socket")
         except Exception as e:
-            logger.warning("Socket embedding failed (%s), using fallback", e)
             global _DAEMON_STARTED
             _DAEMON_STARTED = False
             if not _embed_fallback_enabled():
-                raise RuntimeError(
-                    f"Embedding daemon request failed and in-process fallback is disabled. "
-                    f"Error: {e}. "
-                    f"Restart daemon with: mempalace embed-daemon stop && mempalace embed-daemon start"
-                )
+                logger.warning("Socket embedding failed (%s); in-process fallback disabled", e)
+                raise EmbeddingDaemonError(
+                    f"Socket embedding failed and in-process fallback is disabled: {e}",
+                    cause=e,
+                ) from None
+            logger.warning("Socket embedding failed (%s), using fallback", e)
             computed = _embed_texts_fallback(uncached_texts)
             computed = _sanitize_embedding_batch(computed, context="_embed_texts_fallback")
     else:
         if not _embed_fallback_enabled():
-            raise RuntimeError(
-                "Embedding daemon unavailable and in-process fallback is disabled. "
-                "Run: mempalace embed-daemon start"
+            logger.warning("Embedding daemon unavailable; in-process fallback disabled")
+            raise EmbeddingDaemonError(
+                "Embedding daemon unavailable and in-process fallback is disabled",
             )
         computed = _embed_texts_fallback(uncached_texts)
         computed = _sanitize_embedding_batch(computed, context="_embed_texts_fallback")
@@ -521,7 +472,6 @@ def _quarantine_record(
     preview: str,
     model: str,
     wing: str,
-    room: str = "",
 ) -> None:
     """Append a quarantine record to the shared JSONL log."""
     import datetime
@@ -534,7 +484,6 @@ def _quarantine_record(
         "time": datetime.datetime.utcnow().isoformat() + "Z",
         "model": model,
         "wing": wing,
-        "room": room,
     }
     qpath = Path(os.path.expanduser("~/.mempalace/palace/mining_quarantine.jsonl"))
     qpath.parent.mkdir(parents=True, exist_ok=True)
@@ -550,8 +499,6 @@ def _embed_texts_resilient(
     texts: list[str],
     *,
     context: str = "",
-    wing: str = "",
-    room: str = "",
 ) -> tuple[list[str], list[list[float]], list[dict], list[int]]:
     """
     Embed texts with per-chunk degenerate vector recovery.
@@ -561,11 +508,7 @@ def _embed_texts_resilient(
     - failures: list of per-chunk failure records (index, reason, preview, context)
     - valid_orig_indices: original positions in `texts` that produced valid embeddings
 
-    Policy:
-    - Per-vector failure (NaN/Inf/wrong-dim/zero-norm): quarantine chunk, continue mining
-    - Systemic failure (daemon unavailable, timeout, protocol error): propagate if
-      fallback disabled (mining must stop); quarantine if fallback enabled
-    - No fallback used during mining when fallback is disabled
+    One bad chunk does not abort the batch.  All failures are quarantined.
     """
     global _EMBED_QUARANTINE_COUNT
 
@@ -577,71 +520,48 @@ def _embed_texts_resilient(
     # First attempt: batch embed everything
     try:
         vectors = _embed_texts(texts)
-    except DegenerateEmbeddingError as deg_error:
-        # DegenerateEmbeddingError: daemon returned bad vector for a specific chunk.
-        # Index is encoded in the error message: "...at index N:..."
-        import re
+    except Exception as initial_error:  # broad: RuntimeError, MemoryPressureError, etc.
+        err_str = str(initial_error).lower()
 
-        chunk_idx_match = re.search(r"at index (\d+):", str(deg_error))
+        # Detect which chunk failed from error message format: "...[_embed_via_socket[N]]..."
+        import re
+        chunk_idx_match = re.search(r'\[(\d+)\]', str(initial_error))
         failed_chunk_idx = int(chunk_idx_match.group(1)) if chunk_idx_match else None
 
         if fallback_disabled:
-            # Fallback disabled for mining: quarantine bad chunk(s), continue
+            # Daemon returned bad vectors AND fallback is disabled — quarantine affected chunks.
+            # Don't propagate: mining must continue even with bad chunks.
             failures = []
             for i, text in enumerate(texts):
                 if i == failed_chunk_idx or failed_chunk_idx is None:
                     failures.append({
                         "index": i,
-                        "reason": f"degenerate:{deg_error.reason}",
+                        "reason": f"daemon_degenerate:{initial_error}",
                         "preview": text[:200],
                         "context": context,
                     })
                     _quarantine_record(
                         source_file=context,
                         chunk_index=i,
-                        reason=f"degenerate:{deg_error.reason}",
+                        reason=f"daemon_degenerate:{initial_error}",
                         preview=text,
                         model="mlx",
-                        wing=wing,
-                        room=room,
+                        wing="",
                     )
-                    with _EMBED_TEXT_RESILIENT_LOCK:
-                        _EMBED_QUARANTINE_COUNT += 1
             if failed_chunk_idx is None:
-                # Systemic degenerate error: quarantine all chunks
+                # Systemic error — quarantine all
                 for i, text in enumerate(texts):
                     if not any(f["index"] == i for f in failures):
                         failures.append({
                             "index": i,
-                            "reason": f"systemic_degenerate:{deg_error.reason}",
+                            "reason": f"systemic:{initial_error}",
                             "preview": text[:200],
                             "context": context,
                         })
-                        _quarantine_record(
-                            source_file=context,
-                            chunk_index=i,
-                            reason=f"systemic_degenerate:{deg_error.reason}",
-                            preview=text,
-                            model="mlx",
-                            wing=wing,
-                            room=room,
-                        )
-                        with _EMBED_TEXT_RESILIENT_LOCK:
-                            _EMBED_QUARANTINE_COUNT += 1
+            # Return what we have (possibly empty valid list) — mining continues
             return [], [], failures, []
 
-        # Fallback enabled: retry singles, or propagate
-        raise
-
-    except Exception as initial_error:
-        # Systemic error (daemon unavailable, MemoryPressureError, protocol error):
-        # If fallback is disabled for mining, this is fatal — propagate
-        if fallback_disabled:
-            raise RuntimeError(
-                f"Embedding daemon unavailable and fallback is disabled: {initial_error}. "
-                "Restart daemon: mempalace embed-daemon stop && mempalace embed-daemon start"
-            ) from initial_error
-        # Fallback enabled: let the error propagate so callers can handle it
+        # Fallback enabled — let error propagate for callers that handle it
         raise
 
     valid_texts, valid_vectors, failures, valid_orig_indices = [], [], [], []
@@ -661,8 +581,7 @@ def _embed_texts_resilient(
                 reason=f"degenerate_embedding:{reason}",
                 preview=text,
                 model="mlx" if _DAEMON_STARTED else "fastembed",
-                wing=wing,
-                room=room,
+                wing="",
             )
             with _EMBED_TEXT_RESILIENT_LOCK:
                 _EMBED_QUARANTINE_COUNT += 1
@@ -862,17 +781,9 @@ class SemanticDeduplicator:
         Caller si musí sám vyfiltrovat embeddingy podle toho,
         které dokumenty mají akci "unique"/"conflict" (ne "duplicate").
         """
-        # Extract wing/room from first metadata for quarantine record context
-        first_meta = metadatas[0] if metadatas else {}
-        wing = first_meta.get("wing", "")
-        room = first_meta.get("room", "")
-
         if collection.count() == 0:
             valid_texts, valid_embs, failures, valid_orig_indices = _embed_texts_resilient(
-                documents,
-                context=quarantine_ctx or "classify_batch(empty_collection)",
-                wing=wing,
-                room=room,
+                documents, context=quarantine_ctx or "classify_batch(empty_collection)"
             )
             # Align results with original document indices so upsert zip is correct
             results: list[tuple[str, Optional[str]]] = [("unique", None)] * len(documents)
@@ -885,10 +796,7 @@ class SemanticDeduplicator:
 
         # JEDEN batch embedding call pro všechny dokumenty (resilient: skips bad chunks)
         valid_texts, batch_vectors, failures, valid_orig_indices = _embed_texts_resilient(
-            documents,
-            context=quarantine_ctx or "classify_batch",
-            wing=wing,
-            room=room,
+            documents, context=quarantine_ctx or "classify_batch"
         )
 
         # Build mapping: original_index → (doc, meta, vec)

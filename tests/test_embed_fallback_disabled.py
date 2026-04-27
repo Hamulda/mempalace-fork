@@ -1,9 +1,6 @@
 """Test for daemon-only mining mode (MEMPALACE_EMBED_FALLBACK)."""
 import pytest
 import os
-import sys
-
-sys.path.insert(0, '/Users/vojtechhamada/.claude/plugins/marketplaces/mempalace-fork')
 
 from mempalace.backends.lance import _embed_fallback_enabled
 
@@ -45,7 +42,7 @@ class TestEmbedFallbackEnabled:
         assert _embed_fallback_enabled() is True
 
     def test_true_enables(self):
-        """'true' should enable fallback."""
+        """'true' should enable fallback (same as '1')."""
         os.environ['MEMPALACE_EMBED_FALLBACK'] = 'true'
         assert _embed_fallback_enabled() is True
 

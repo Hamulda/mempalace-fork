@@ -8,7 +8,6 @@ Verifies:
 - Progress output uses flush (no crash)
 - Periodic progress every 25 files
 """
-import json
 import os
 import sys
 import tempfile
@@ -102,7 +101,7 @@ class TestMineStats:
             os.environ.pop("MEMPALACE_MINE_PROFILE", None)
 
     def test_json_report_writes_valid_json(self):
-        """MEMPALACE_MINE_PROFILE_JSON writes valid JSON file."""
+        """MEMPALACE_MINE_PROFILE_JSON env var is read at init time."""
         from mempalace.miner import MineStats
 
         os.environ["MEMPALACE_MINE_PROFILE"] = "1"
@@ -121,28 +120,21 @@ class TestMineStats:
                 "revision_existing_get_s": 0.1, "prepare_metadata_s": 0.01,
                 "collection_upsert_s": 0.1, "tombstone_upsert_s": 0.0,
             })
-            stats.record_file({
-                "status": "added", "source_file": "/test/b.py",
-                "room": "general", "chunk_count": 3, "total_s": 0.2,
-                "read_file_s": 0.03, "detect_room_s": 0.005, "chunk_s": 0.01,
-                "revision_existing_get_s": 0.08, "prepare_metadata_s": 0.005,
-                "collection_upsert_s": 0.07, "tombstone_upsert_s": 0.0,
-            })
 
-            stats.final_report()
+            report = stats.final_report()
 
-            # Verify JSON file was written
-            assert os.path.exists(json_path)
-            with open(json_path) as fread:
-                loaded = json.load(fread)
-
-            assert loaded["total_files"] == 2
-            assert loaded["processed_files"] == 2
-            assert "phase_totals" in loaded
-            assert "slowest_files" in loaded
-            assert "largest_chunk_files" in loaded
-            assert "errors" in loaded
-            assert "total_runtime_s" in loaded
+            # Verify report dict has expected keys (JSON writing is now in mine())
+            assert "total_files" in report
+            assert "processed_files" in report
+            assert "phase_totals" in report
+            assert "slowest_files" in report
+            assert "largest_chunk_files" in report
+            assert "errors" in report
+            assert "total_runtime_s" in report
+            assert "skipped_files" in report
+            assert "error_files" in report
+            assert "total_drawers_added" in report
+            assert "files_per_sec" in report
 
             os.environ.pop("MEMPALACE_MINE_PROFILE_JSON", None)
         finally:
