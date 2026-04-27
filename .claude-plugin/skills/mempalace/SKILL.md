@@ -80,16 +80,18 @@ Every workflow tool result contains `workflow_state`:
 
 ## Server not running?
 
-If MemPalace MCP tools return an error, start the server:
+If MemPalace MCP tools return an error, ensure the shared server is running:
+
+**Via plugin (recommended for Claude Code):** The plugin starts `mempalace serve`
+automatically on first session. No manual server start needed.
+
+**Manual server:**
 ```bash
-python3 -m mempalace.fastmcp_server
+mempalace serve --host 127.0.0.1 --port 8765
 ```
-Server URL: `http://127.0.0.1:8765/mcp`
 
 **Verify health:**
 ```bash
 curl http://127.0.0.1:8765/health
 # → {"status": "ok", "service": "mempalace"}
 ```
-
-**Using the Claude Code plugin?** The plugin handles MCP registration persistently. After running `claude plugin install --scope user mempalace` and restarting Claude Code, tools appear automatically.

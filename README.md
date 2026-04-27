@@ -123,20 +123,39 @@ claude plugin install --scope user mempalace
 
 Restart Claude Code, then type `/skills` to verify "mempalace" appears.
 
-### With Claude, ChatGPT, Cursor, Gemini (MCP-compatible tools)
+## Claude Code Plugin (Recommended for Claude Code Users)
+
+The plugin manages the shared HTTP server lifecycle automatically via hooks.
+No manual MCP registration needed — the plugin handles everything.
 
 ```bash
-# Connect MemPalace once
-claude mcp add mempalace -- python -m mempalace.fastmcp_server
+claude plugin marketplace add hamulda/mempalace-fork
+claude plugin install --scope user mempalace
 ```
 
-Now your AI has 56 tools available through MCP. Ask it anything:
+Restart Claude Code. The plugin starts `mempalace serve` on first session,
+connects MCP tools via `.claude-plugin/.mcp.json`, and shuts down the server
+when the last session exits.
 
-> *"What did we decide about auth last month?"*
+Verify with:
+```bash
+curl http://127.0.0.1:8765/health
+/mempalace:status
+```
 
-Claude calls `mempalace_search` automatically, gets verbatim results, and answers you. You never type `mempalace search` again. The AI handles it.
+## Any MCP-Compatible Tool (Cursor, Continue, Zed, etc.)
 
-MemPalace also works natively with **Gemini CLI** (which handles the server and save hooks automatically) — see the [Gemini CLI Integration Guide](examples/gemini_cli_setup.md).
+For non-Claude-Code MCP clients, start the shared HTTP server manually:
+
+```bash
+mempalace serve --host 127.0.0.1 --port 8765
+```
+
+Then connect your MCP client to `http://127.0.0.1:8765/mcp`.
+The `claude mcp add` command spawns a stdio-mode server — use `mempalace serve`
+instead for multi-session coordination (up to 6 parallel sessions).
+
+See [Session Coordination](#session-coordination) for details.
 
 ### With local models (Llama, Mistral, or any offline LLM)
 
@@ -451,23 +470,36 @@ Letta charges $20–200/mo for agent-managed memory. MemPalace does it with a wi
 
 ### With Claude Code (recommended plugin)
 
+## Claude Code Plugin
+
+The Claude Code plugin is the recommended way to run MemPalace. It manages
+server lifecycle via hooks — start on first session, stop when the last exits.
+
 ```bash
-# Install once — handles MCP registration persistently
-claude plugin marketplace add hamulda/mempalace-fork  # your fork URL
+claude plugin marketplace add hamulda/mempalace-fork
 claude plugin install --scope user mempalace
-
-# Restart Claude Code — tools appear automatically, no manual registration
 ```
 
-### With any MCP-compatible tool (Cursor, Continue, Zed, etc.)
+Restart Claude Code. Tools appear automatically via `.claude-plugin/.mcp.json`
+pointing to the shared HTTP server at `http://127.0.0.1:8765/mcp`.
+
+Verify:
+```bash
+curl http://127.0.0.1:8765/health
+/mempalace:status
+```
+
+## Any MCP-Compatible Tool
+
+For non-Claude-Code MCP clients, run the server manually:
 
 ```bash
-claude mcp add mempalace -- python -m mempalace.fastmcp_server
+mempalace serve --host 127.0.0.1 --port 8765
 ```
 
-> **Single-session only** — `claude mcp add` spawns a stdio-mode server. For multi-session
-> coordination (up to 6 parallel Claude Code sessions), use `mempalace serve` instead
-> (HTTP on port 8765, with session coordinators active). See [Session Coordination](#session-coordination) below.
+Then connect to `http://127.0.0.1:8765/mcp`. The `claude mcp add` command
+spawns a single-session stdio-mode server. For multi-session coordination
+(up to 6 parallel sessions), use `mempalace serve` with the HTTP transport.
 
 ### Session Coordination
 
@@ -659,7 +691,6 @@ Plain text. Becomes Layer 0 — loaded every session.
 | File | What |
 |------|------|
 | `cli.py` | CLI entry point — init, mine, search, serve, status, split, compress, wake-up, hook, repair, cleanup |
-| `fastmcp_server.py` | MCP server module — re-exports `create_server` from `server.factory` |
 | `server/factory.py` | Canonical server factory — `create_server()`, wires all tool groups and session coordinators |
 | `server/http_transport.py` | **DEPRECATED** backward-compat shim — redirects to streamable-http via `create_server()` |
 | `searcher.py` | Semantic search via LanceDB |
@@ -690,7 +721,6 @@ mempalace/
 ├── README.md                  ← you are here
 ├── mempalace/                 ← core package (README)
 │   ├── cli.py                 ← CLI entry point
-│   ├── fastmcp_server.py          ← MCP server entry point
 │   ├── knowledge_graph.py     ← temporal entity graph
 │   ├── palace_graph.py        ← room navigation graph
 │   ├── dialect.py             ← AAAK compression

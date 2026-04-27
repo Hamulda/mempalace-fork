@@ -112,7 +112,6 @@ One server process, multiple Claude Code sessions. Session coordination (ClaimsM
 |---------|-----|
 | `fastmcp` not found | `pip install git+https://github.com/Hamulda/mempalace-fork` |
 | Server not running | Claude Code plugin starts it automatically (Mode A); or run `mempalace serve --host 127.0.0.1 --port 8765` (Mode B) |
-| Wrong port | Check `.mcp.json` port matches server port |
 | Plugin installed but no tools | `/reload-plugins` in Claude Code |
 | Tools not appearing | Restart Claude Code after plugin install |
 | Server won't shut down | Check `~/.mempalace/runtime/sessions/` for stale session files; set `MEMPALANCE_SESSION_TTL_SECONDS=0` to force immediate cleanup |
