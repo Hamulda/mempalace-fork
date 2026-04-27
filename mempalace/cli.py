@@ -542,6 +542,11 @@ def cmd_embed_daemon(args):
         else:
             print(f"Embedding daemon is not running (socket: {sock_path})")
 
+    elif args.action == "doctor":
+        from .embed_daemon import run_embed_doctor
+        ok = run_embed_doctor()
+        sys.exit(0 if ok else 1)
+
 
 def _run_embed_benchmark():
     """Run 100 embeddings and measure CoreML vs CPU performance."""
@@ -1334,8 +1339,8 @@ def main():
     )
     p_embed.add_argument(
         "action",
-        choices=["start", "stop", "status", "benchmark"],
-        help="Action: start (background), stop, status check, or benchmark",
+        choices=["start", "stop", "status", "benchmark", "doctor"],
+        help="Action: start (background), stop, status check, benchmark, or doctor",
     )
 
     # serve (HTTP MCP server)

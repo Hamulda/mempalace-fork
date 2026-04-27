@@ -357,7 +357,7 @@ class TestMiningLoopContinues:
 
         good_vec = [0.1] * EMBEDDING_DIMS
 
-        def fake_embed_texts_resilient(texts, *, context=""):
+        def fake_embed_texts_resilient(texts, *, context="", wing="", room=""):
             if not texts:
                 return [], [], [], []
             # File with "bad" in content → quarantined

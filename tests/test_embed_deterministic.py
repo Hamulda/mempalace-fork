@@ -133,7 +133,7 @@ class TestEmbedDeterministic:
             dedup = SemanticDeduplicator()
 
             # Empty collection — all unique
-            results, vecs = dedup.classify_batch(
+            results, vecs, _failures = dedup.classify_batch(
                 documents=["hello", "world"],
                 metadatas=[{}, {}],
                 collection=col,

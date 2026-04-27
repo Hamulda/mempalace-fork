@@ -286,6 +286,162 @@ def _handle_client(conn: socket.socket, model) -> None:
         conn.close()
 
 
+def _send_socket(payload: dict, timeout: float = 30.0) -> dict:
+    """Send JSON payload via unix socket, return parsed response."""
+    import socket as _sock
+    sock = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(get_socket_path())
+        encoded = json.dumps(payload).encode("utf-8")
+        sock.sendall(len(encoded).to_bytes(4, "big") + encoded)
+        raw_len = b""
+        while len(raw_len) < 4:
+            chunk = sock.recv(4 - len(raw_len))
+            if not chunk:
+                raise ConnectionError("Daemon closed connection")
+            raw_len += chunk
+        msg_len = int.from_bytes(raw_len, "big")
+        if msg_len > 10_000_000:
+            raise RuntimeError(f"Response too large: {msg_len} bytes")
+        data = b""
+        while len(data) < msg_len:
+            chunk = sock.recv(min(65536, msg_len - len(data)))
+            if not chunk:
+                raise ConnectionError("Daemon closed connection mid-message")
+            data += chunk
+        return json.loads(data.decode("utf-8"))
+    finally:
+        sock.close()
+
+
+def run_embed_doctor() -> bool:
+    """Run protocol validation on the embed daemon. Returns True if healthy."""
+    import math
+    import time
+
+    print("=== MemPalace Embed Daemon Doctor ===\n")
+
+    sock_path = get_socket_path()
+    pid_path = get_pid_path()
+
+    # 1. Socket exists
+    if not os.path.exists(sock_path):
+        print(f"FAIL: Socket not found: {sock_path}")
+        return False
+    print(f"OK   socket exists: {sock_path}")
+
+    # 2. PID file
+    if os.path.exists(pid_path):
+        try:
+            pid = int(Path(pid_path).read_text())
+            print(f"OK   PID file: {pid}")
+        except Exception:
+            print("WARN PID file unreadable")
+    else:
+        print("WARN no PID file")
+
+    # 3. Process alive (PID from pid file)
+    alive = False
+    if os.path.exists(pid_path):
+        try:
+            pid = int(Path(pid_path).read_text())
+            os.kill(pid, 0)
+            alive = True
+            print(f"OK   process alive (PID {pid})")
+        except ProcessLookupError:
+            print("FAIL process not running (stale PID)")
+            return False
+        except Exception as e:
+            print(f"WARN cannot check process: {e}")
+
+    # 4. Empty batch probe
+    print("\n--- Protocol Tests ---")
+    try:
+        resp = _send_socket({"texts": []})
+        if isinstance(resp, dict) and "embeddings" in resp:
+            print("OK   empty batch → valid JSON with embeddings key")
+        else:
+            print(f"FAIL empty batch returned unexpected structure: {type(resp)}")
+            return False
+    except Exception as e:
+        print(f"FAIL empty batch probe failed: {e}")
+        return False
+
+    # 5. Single embedding
+    try:
+        t0 = time.monotonic()
+        resp = _send_socket({"texts": ["hello"]})
+        latency_1 = time.monotonic() - t0
+        if not isinstance(resp, dict) or "embeddings" not in resp:
+            print(f"FAIL single embedding returned no embeddings key")
+            return False
+        embeds = resp["embeddings"]
+        if len(embeds) != 1:
+            print(f"FAIL expected 1 embedding, got {len(embeds)}")
+            return False
+        vec = embeds[0]
+        if len(vec) != 256:
+            print(f"FAIL dimension {len(vec)} != 256 (possible 384-dim model leak)")
+            return False
+        if not all(math.isfinite(x) for x in vec):
+            print(f"FAIL vector contains NaN/Inf")
+            return False
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm < 1e-6:
+            print(f"FAIL zero-norm vector (norm={norm:.2e})")
+            return False
+        print(f"OK   1 embedding: dim=256 norm={norm:.4f} latency={latency_1*1000:.1f}ms")
+    except Exception as e:
+        print(f"FAIL single embedding failed: {e}")
+        return False
+
+    # 6. Batch 10
+    try:
+        t0 = time.monotonic()
+        resp = _send_socket({"texts": [f"text{i}" for i in range(10)]})
+        latency_10 = time.monotonic() - t0
+        embeds = resp["embeddings"]
+        if len(embeds) != 10:
+            print(f"FAIL batch 10: expected 10, got {len(embeds)}")
+            return False
+        for i, vec in enumerate(embeds):
+            if len(vec) != 256:
+                print(f"FAIL batch 10: vector[{i}] dim={len(vec)}")
+                return False
+            if not all(math.isfinite(x) for x in vec):
+                print(f"FAIL batch 10: vector[{i}] contains NaN/Inf")
+                return False
+        print(f"OK   batch 10: 10 embeddings, latency={latency_10*1000:.1f}ms")
+    except Exception as e:
+        print(f"FAIL batch 10 failed: {e}")
+        return False
+
+    # 7. Batch 100
+    try:
+        t0 = time.monotonic()
+        resp = _send_socket({"texts": [f"short text {i}" for i in range(100)]})
+        latency_100 = time.monotonic() - t0
+        embeds = resp["embeddings"]
+        if len(embeds) != 100:
+            print(f"FAIL batch 100: expected 100, got {len(embeds)}")
+            return False
+        for i, vec in enumerate(embeds):
+            if len(vec) != 256:
+                print(f"FAIL batch 100: vector[{i}] dim={len(vec)}")
+                return False
+            if not all(math.isfinite(x) for x in vec):
+                print(f"FAIL batch 100: vector[{i}] contains NaN/Inf")
+                return False
+        print(f"OK   batch 100: 100 embeddings, latency={latency_100*1000:.1f}ms")
+    except Exception as e:
+        print(f"FAIL batch 100 failed: {e}")
+        return False
+
+    print("\n=== All checks passed ===")
+    return True
+
+
 def run_daemon() -> None:
     """Main daemon loop."""
     logging.basicConfig(
