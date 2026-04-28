@@ -228,9 +228,11 @@ async def test_search_code_scoped_to_projA_only(scoped_client):
         {"query": "AuthManager", "project_path": projA_path, "limit": 20},
     )
     data = _get_result_data(result)
+    print(f"DIAG search_code AuthManager: data={data}")
     assert data is not None, f"Got None result: {result}"
 
     chunks = data.get("results", data.get("chunks", []))
+    print(f"  chunks={len(chunks)}, intent={data.get('filters',{}).get('intent')}")
     projB_hits = [c for c in chunks if c.get("source_file", "").startswith(projB_path)]
     assert len(projB_hits) == 0, (
         f"project_path=projA returned {len(projB_hits)} projB chunks: "
@@ -314,9 +316,11 @@ async def test_semantic_query_scoped_to_projA_not_projB(scoped_client):
         },
     )
     data = _get_result_data(result)
+    print(f"DIAG semantic: data={data}")
     assert data is not None, f"Got None result: {result}"
 
     chunks = data.get("chunks", [])
+    print(f"DIAG semantic: chunks={len(chunks)}, intent={data.get('intent')}, filters={data.get('filters')}")
     projB_hits = [c for c in chunks if c.get("source_file", "").startswith(projB_path)]
     assert len(projB_hits) == 0, (
         f"semantic query for projA returned projB chunks: "
@@ -425,8 +429,80 @@ def test_fts5_scoped_retrieval(mined_palace):
     assert len(results) > 0, "Expected AuthManager in FTS5 index"
 
     # FTS5 returns document_id (= source_file path from mining). Verify isolation.
-    projA_results = [r for r in results if r["document_id"].startswith(projA_path)]
-    projB_results = [r for r in results if r["document_id"].startswith(projB_path)]
+    # FTS5 KeywordIndex returns document_id (drawer ID), but we can enrich
+    # by looking up Lance metadata. Use _source_file_matches for correct scoping.
+    from mempalace.backends.lance import LanceBackend
+    from mempalace.config import MempalaceConfig
+    cfg = MempalaceConfig()
+    backend = LanceBackend()
+    col = backend.get_collection(palace_path, cfg.collection_name, create=False)
+    doc_ids = [r["document_id"] for r in results]
+    batch = col.get(ids=doc_ids, include=["metadatas"]) if doc_ids else {"ids": [], "metadatas": []}
+    metas_map = {id_: meta for id_, meta in zip(batch.get("ids", []), batch.get("metadatas", []))}
+    projA_results = [r for r in results if metas_map.get(r["document_id"], {}).get("source_file", "").startswith(projA_path)]
+    projB_results = [r for r in results if metas_map.get(r["document_id"], {}).get("source_file", "").startswith(projB_path)]
 
     assert len(projA_results) > 0, "Expected projA results in FTS5"
     assert len(projB_results) > 0, "Expected projB results in FTS5 (separate project)"
+
+# ---------------------------------------------------------------------------
+# PHASE 5D — Diagnostic test (temporary, to be removed after diagnosis)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_PHASE5D_diagnostic_mining_state(scoped_client):
+    """DIAGNOSTIC: Inspect what's actually stored after mining both projects."""
+    client, palace_path, projA_path, projB_path = scoped_client
+
+    from mempalace.backends.lance import LanceBackend
+    from mempalace.config import MempalaceConfig
+    import json
+
+    cfg = MempalaceConfig()
+    backend = LanceBackend()
+    col = backend.get_collection(palace_path, cfg.collection_name, create=False)
+
+    # Get all records
+    all_ids = col._table.to_pandas()["id"].tolist()
+    print(f"\nDIAG: Total IDs in collection: {len(all_ids)}")
+
+    if all_ids:
+        batch = col.get(ids=all_ids, include=["metadatas"])
+        for id_, meta in zip(batch.get("ids", []), batch.get("metadatas", [])):
+            sf = meta.get("source_file", "") if meta else ""
+            ci = meta.get("chunk_index", "") if meta else ""
+            pr = meta.get("project_root", "") if meta else ""
+            print(f"  id={id_[:32]}, source_file={sf}, chunk_index={ci}, project_root={pr}")
+
+    # Check FTS5
+    from mempalace.lexical_index import KeywordIndex
+    idx = KeywordIndex.get(palace_path)
+    fts5_results = idx.search("AuthManager", n_results=20)
+    print(f"DIAG: FTS5 hits: {len(fts5_results)}")
+    for r in fts5_results:
+        print(f"  doc_id={r['document_id'][:32]}, score={r.get('score')}")
+
+    # Check SymbolIndex
+    from mempalace.symbol_index import SymbolIndex
+    sym_idx = SymbolIndex.get(palace_path)
+    sym_results = sym_idx.search_symbols("AuthManager", limit=20)
+    print(f"DIAG: SymbolIndex hits: {len(sym_results)}")
+    for r in sym_results:
+        print(f"  file={r.get('file')}, name={r.get('name')}")
+
+    # THE ACTUAL ASSERTIONS that should pass
+    all_source_files = []
+    if all_ids:
+        batch = col.get(ids=all_ids, include=["metadatas"])
+        for meta in batch.get("metadatas", []):
+            if meta:
+                all_source_files.append(meta.get("source_file", ""))
+
+    projA_count = sum(1 for sf in all_source_files if sf.startswith(projA_path))
+    projB_count = sum(1 for sf in all_source_files if sf.startswith(projB_path))
+    print(f"DIAG: Lance records: projA={projA_count}, projB={projB_count}")
+
+    # This is the core invariant — both projects MUST be present
+    assert projA_count > 0, f"PROJA has 0 records in Lance! Files: {all_source_files}"
+    assert projB_count > 0, f"PROJB has 0 records in Lance! Files: {all_source_files}"
+

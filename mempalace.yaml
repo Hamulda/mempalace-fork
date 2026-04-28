@@ -1,0 +1,350 @@
+wing: mempalace
+rooms:
+- name: si_stats_5719613264
+  description: Files from si_stats_5719613264/
+  keywords:
+  - si_stats_5719613264
+  - si_stats_5719613264
+- name: si_readwrite_5647782448
+  description: Files from si_readwrite_5647782448/
+  keywords:
+  - si_readwrite_5647782448
+  - si_readwrite_5647782448
+- name: si_empty_5721419200
+  description: Files from si_empty_5721419200/
+  keywords:
+  - si_empty_5721419200
+  - si_empty_5721419200
+- name: si_readwrite_4871187232
+  description: Files from si_readwrite_4871187232/
+  keywords:
+  - si_readwrite_4871187232
+  - si_readwrite_4871187232
+- name: si_exact_5719607888
+  description: Files from si_exact_5719607888/
+  keywords:
+  - si_exact_5719607888
+  - si_exact_5719607888
+- name: si_classmethod_5721419200
+  description: Files from si_classmethod_5721419200/
+  keywords:
+  - si_classmethod_5721419200
+  - si_classmethod_5721419200
+- name: si_limit_5721419200
+  description: Files from si_limit_5721419200/
+  keywords:
+  - si_limit_5721419200
+  - si_limit_5721419200
+- name: si_contract_file_5719607888
+  description: Files from si_contract_file_5719607888/
+  keywords:
+  - si_contract_file_5719607888
+  - si_contract_file_5719607888
+- name: si_direct_import_5719605536
+  description: Files from si_direct_import_5719605536/
+  keywords:
+  - si_direct_import_5719605536
+  - si_direct_import_5719605536
+- name: si_concurrent_5348579520
+  description: Files from si_concurrent_5348579520/
+  keywords:
+  - si_concurrent_5348579520
+  - si_concurrent_5348579520
+- name: si_readwrite_4773041584
+  description: Files from si_readwrite_4773041584/
+  keywords:
+  - si_readwrite_4773041584
+  - si_readwrite_4773041584
+- name: si_identity_5721419200
+  description: Files from si_identity_5721419200/
+  keywords:
+  - si_identity_5721419200
+  - si_identity_5721419200
+- name: si_underscore_5721419200
+  description: Files from si_underscore_5721419200/
+  keywords:
+  - si_underscore_5721419200
+  - si_underscore_5721419200
+- name: si_rlock_5719605536
+  description: Files from si_rlock_5719605536/
+  keywords:
+  - si_rlock_5719605536
+  - si_rlock_5719605536
+- name: si_nonexist_5719613264
+  description: Files from si_nonexist_5719613264/
+  keywords:
+  - si_nonexist_5719613264
+  - si_nonexist_5719613264
+- name: probe_plugin
+  description: Files from probe_plugin/
+  keywords:
+  - probe_plugin
+  - probe_plugin
+- name: si_scoped3_5721419200
+  description: Files from si_scoped3_5721419200/
+  keywords:
+  - si_scoped3_5721419200
+  - si_scoped3_5721419200
+- name: si_readwrite_4724347776
+  description: Files from si_readwrite_4724347776/
+  keywords:
+  - si_readwrite_4724347776
+  - si_readwrite_4724347776
+- name: si_no_self_call_5719605536
+  description: Files from si_no_self_call_5719605536/
+  keywords:
+  - si_no_self_call_5719605536
+  - si_no_self_call_5719605536
+- name: si_full_5721419200
+  description: Files from si_full_5721419200/
+  keywords:
+  - si_full_5721419200
+  - si_full_5721419200
+- name: si_concurrent_4430884608
+  description: Files from si_concurrent_4430884608/
+  keywords:
+  - si_concurrent_4430884608
+  - si_concurrent_4430884608
+- name: si_ls_le_5719605536
+  description: Files from si_ls_le_5719605536/
+  keywords:
+  - si_ls_le_5719605536
+  - si_ls_le_5719605536
+- name: si_scoped_5721419200
+  description: Files from si_scoped_5721419200/
+  keywords:
+  - si_scoped_5721419200
+  - si_scoped_5721419200
+- name: si_scoped4_5721419200
+  description: Files from si_scoped4_5721419200/
+  keywords:
+  - si_scoped4_5721419200
+  - si_scoped4_5721419200
+- name: si_suffix_5721419200
+  description: Files from si_suffix_5721419200/
+  keywords:
+  - si_suffix_5721419200
+  - si_suffix_5721419200
+- name: si_concurrent_5647782448
+  description: Files from si_concurrent_5647782448/
+  keywords:
+  - si_concurrent_5647782448
+  - si_concurrent_5647782448
+- name: si_readwrite_4724266752
+  description: Files from si_readwrite_4724266752/
+  keywords:
+  - si_readwrite_4724266752
+  - si_readwrite_4724266752
+- name: si_concurrent_4773041584
+  description: Files from si_concurrent_4773041584/
+  keywords:
+  - si_concurrent_4773041584
+  - si_concurrent_4773041584
+- name: si_readwrite_5348579520
+  description: Files from si_readwrite_5348579520/
+  keywords:
+  - si_readwrite_5348579520
+  - si_readwrite_5348579520
+- name: si_callers_empty_5719605536
+  description: Files from si_callers_empty_5719605536/
+  keywords:
+  - si_callers_empty_5719605536
+  - si_callers_empty_5719605536
+- name: testing
+  description: Files from tests/
+  keywords:
+  - testing
+  - tests
+- name: si_concurrent_4724261152
+  description: Files from si_concurrent_4724261152/
+  keywords:
+  - si_concurrent_4724261152
+  - si_concurrent_4724261152
+- name: si_concurrent_find_5719605536
+  description: Files from si_concurrent_find_5719605536/
+  keywords:
+  - si_concurrent_find_5719605536
+  - si_concurrent_find_5719605536
+- name: si_multiclass_5721419200
+  description: Files from si_multiclass_5721419200/
+  keywords:
+  - si_multiclass_5721419200
+  - si_multiclass_5721419200
+- name: mempalace
+  description: Files from mempalace/
+  keywords:
+  - mempalace
+  - mempalace
+- name: documentation
+  description: Files from docs/
+  keywords:
+  - documentation
+  - docs
+- name: si_contract_find_5719607888
+  description: Files from si_contract_find_5719607888/
+  keywords:
+  - si_contract_find_5719607888
+  - si_contract_find_5719607888
+- name: si_concurrent_4724347776
+  description: Files from si_concurrent_4724347776/
+  keywords:
+  - si_concurrent_4724347776
+  - si_concurrent_4724347776
+- name: si_update_5721419200
+  description: Files from si_update_5721419200/
+  keywords:
+  - si_update_5721419200
+  - si_update_5721419200
+- name: integrations
+  description: Files from integrations/
+  keywords:
+  - integrations
+  - integrations
+- name: si_concurrent_4785422512
+  description: Files from si_concurrent_4785422512/
+  keywords:
+  - si_concurrent_4785422512
+  - si_concurrent_4785422512
+- name: si_scoped2_5721419200
+  description: Files from si_scoped2_5721419200/
+  keywords:
+  - si_scoped2_5721419200
+  - si_scoped2_5721419200
+- name: si_readwrite_4715021024
+  description: Files from si_readwrite_4715021024/
+  keywords:
+  - si_readwrite_4715021024
+  - si_readwrite_4715021024
+- name: si_build_5719613264
+  description: Files from si_build_5719613264/
+  keywords:
+  - si_build_5719613264
+  - si_build_5719613264
+- name: probe_chroma_remove
+  description: Files from probe_chroma_remove/
+  keywords:
+  - probe_chroma_remove
+  - probe_chroma_remove
+- name: si_dedup_5719605536
+  description: Files from si_dedup_5719605536/
+  keywords:
+  - si_dedup_5719605536
+  - si_dedup_5719605536
+- name: hooks
+  description: Files from hooks/
+  keywords:
+  - hooks
+  - hooks
+- name: examples
+  description: Files from examples/
+  keywords:
+  - examples
+  - examples
+- name: benchmarks
+  description: Files from benchmarks/
+  keywords:
+  - benchmarks
+  - benchmarks
+- name: si_readwrite_5664548768
+  description: Files from si_readwrite_5664548768/
+  keywords:
+  - si_readwrite_5664548768
+  - si_readwrite_5664548768
+- name: si_percent_5721419200
+  description: Files from si_percent_5721419200/
+  keywords:
+  - si_percent_5721419200
+  - si_percent_5721419200
+- name: scripts
+  description: Files from scripts/
+  keywords:
+  - scripts
+  - scripts
+- name: si_sym_alias_5719605536
+  description: Files from si_sym_alias_5719605536/
+  keywords:
+  - si_sym_alias_5719605536
+  - si_sym_alias_5719605536
+- name: si_file_syms_5721419200
+  description: Files from si_file_syms_5721419200/
+  keywords:
+  - si_file_syms_5721419200
+  - si_file_syms_5721419200
+- name: si_readwrite_4777640336
+  description: Files from si_readwrite_4777640336/
+  keywords:
+  - si_readwrite_4777640336
+  - si_readwrite_4777640336
+- name: si_callers_5719605536
+  description: Files from si_callers_5719605536/
+  keywords:
+  - si_callers_5719605536
+  - si_callers_5719605536
+- name: si_readwrite_4785422512
+  description: Files from si_readwrite_4785422512/
+  keywords:
+  - si_readwrite_4785422512
+  - si_readwrite_4785422512
+- name: si_prefix_5721419200
+  description: Files from si_prefix_5721419200/
+  keywords:
+  - si_prefix_5721419200
+  - si_prefix_5721419200
+- name: si_concurrent_4715021024
+  description: Files from si_concurrent_4715021024/
+  keywords:
+  - si_concurrent_4715021024
+  - si_concurrent_4715021024
+- name: si_concurrent_5664548768
+  description: Files from si_concurrent_5664548768/
+  keywords:
+  - si_concurrent_5664548768
+  - si_concurrent_5664548768
+- name: si_contract_search_5719607888
+  description: Files from si_contract_search_5719607888/
+  keywords:
+  - si_contract_search_5719607888
+  - si_contract_search_5719607888
+- name: design
+  description: Files from assets/
+  keywords:
+  - design
+  - assets
+- name: si_line_end_5719605536
+  description: Files from si_line_end_5719605536/
+  keywords:
+  - si_line_end_5719605536
+  - si_line_end_5719605536
+- name: si_concurrent_4880685248
+  description: Files from si_concurrent_4880685248/
+  keywords:
+  - si_concurrent_4880685248
+  - si_concurrent_4880685248
+- name: si_concurrent_4777640336
+  description: Files from si_concurrent_4777640336/
+  keywords:
+  - si_concurrent_4777640336
+  - si_concurrent_4777640336
+- name: si_empty_5719613264
+  description: Files from si_empty_5719613264/
+  keywords:
+  - si_empty_5719613264
+  - si_empty_5719613264
+- name: si_alias_5719605536
+  description: Files from si_alias_5719605536/
+  keywords:
+  - si_alias_5719605536
+  - si_alias_5719605536
+- name: si_search_exact_5721419200
+  description: Files from si_search_exact_5721419200/
+  keywords:
+  - si_search_exact_5721419200
+  - si_search_exact_5721419200
+- name: backend
+  description: Files from server/
+  keywords:
+  - backend
+  - server
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

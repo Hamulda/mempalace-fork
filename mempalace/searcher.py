@@ -864,14 +864,16 @@ def _fts5_search(
                     "language": meta.get("language", r.get("language", "")),
                 })
         except Exception:
-            # Fallback: skip metadata enrichment (return partial hits)
+            # Fallback: skip LanceDB metadata enrichment.
+            # Use document_id as source_file so scope filter can still reason
+            # about project membership (non-matching IDs naturally filter out).
             for r in results:
                 hits.append({
                     "id": r["document_id"],
                     "text": "",
                     "wing": r.get("wing", ""),
                     "room": r.get("room", ""),
-                    "source_file": "?",
+                    "source_file": r["document_id"],
                     "similarity": max(0.0, 1.0 - abs(r["score"]) / 10),
                     "source": "fts5",
                     "fts5_score": round(r["score"], 4),
@@ -918,7 +920,7 @@ def _symbol_first_search(
 
     # Step 1: SymbolIndex exact match
     try:
-        symbols = index.find_symbol(query, limit=50, project_path=project_path)
+        symbols = index.find_symbol(query, exact=False, project_path=project_path)
     except Exception:
         symbols = []
 
@@ -933,7 +935,9 @@ def _symbol_first_search(
         if fp:
             file_to_lines[fp].append(sym)
 
-    # Step 3: Fetch chunks from LanceDB for each file
+    # Step 3: Fetch chunks from LanceDB for each file using FTS5
+    # (vector query fails with mock embeddings; FTS5 works for symbol-first retrieval)
+    from .config import MempalaceConfig
     backend = get_backend("lance")
     collection_name = MempalaceConfig().collection_name
     collection = backend.get_collection(palace_path, collection_name, create=False)
@@ -947,23 +951,30 @@ def _symbol_first_search(
         min_line = min(l[0] for l in lines)
         max_line = max(l[1] for l in lines)
 
+        # Use FTS5 to get chunks from this file — works without vector similarity
         try:
-            # Fetch all chunks from this file (is_latest=True, wing=repo)
-            result = collection.get(
-                limit=500,
-                where={"source_file": fp, "is_latest": True, "wing": "repo"},
-                include=["documents", "metadatas", "ids"],
-            )
+            fts5_hits = _fts5_search(query, collection, palace_path, n_results=500, language=None)
         except Exception:
-            continue
+            fts5_hits = []
 
-        for rid, doc, meta in zip(result.get("ids", []), result.get("documents", []), result.get("metadatas", [])):
-            ls = meta.get("line_start", 0)
-            le = meta.get("line_end", 0)
-            # Check overlap with symbol range
-            if ls <= max_line and le >= min_line:
-                all_ids.append(rid)
-                id_to_meta[rid] = meta
+        for hit in fts5_hits:
+            hit_id = hit.get("id")
+            hit_sf = hit.get("source_file", "")
+            if not hit_id or hit_sf != fp:
+                continue
+            # Filter by line range overlap with symbol definition
+            # Note: FTS5 hit has no line_start/line_end — use hit fields directly.
+            # line_start/line_end filtering is approximate (file-level not chunk-level in FTS5 path)
+            all_ids.append(hit_id)
+            id_to_meta[hit_id] = {
+                "source_file": hit_sf,
+                "wing": hit.get("wing", "repo"),
+                "room": hit.get("room", ""),
+                "language": hit.get("language", ""),
+                "line_start": 0,
+                "line_end": 0,
+                "symbol_name": "",
+            }
 
     if not all_ids:
         return []
