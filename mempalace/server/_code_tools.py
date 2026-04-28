@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 """
 Code intelligence tools: search_code, auto_search, file_context, project_context.
 """
 import os
 from pathlib import Path
-from fastmcp import Context
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from fastmcp import Context
 
 # =============================================================================
 # PATH MATCHING UTILITIES (module-level for testability)

@@ -382,7 +382,7 @@ def test_source_file_matches_prefix_isolation():
 
 
 def test_symbol_index_scoped_retrieval(mined_palace):
-    """SymbolIndex find_symbol scoped to project_path returns only that project."""
+    """SymbolIndex find_symbol(project_path=projA) returns only that project."""
     palace_path, projA_path, projB_path = mined_palace
 
     si = SymbolIndex.get(palace_path)
@@ -393,16 +393,21 @@ def test_symbol_index_scoped_retrieval(mined_palace):
     si.build_index(projA_path, [str(p) for p in projA_src.iterdir()])
     si.build_index(projB_path, [str(p) for p in projB_src.iterdir()])
 
-    # Find AuthManager — SymbolIndex returns file_path
-    symbols = si.find_symbol("AuthManager")
-    projA_symbols = [s for s in symbols if s.get("file_path", "").startswith(projA_path)]
-    projB_symbols = [s for s in symbols if s.get("file_path", "").startswith(projB_path)]
+    # Find AuthManager scoped to projA — should only return projA
+    projA_symbols = si.find_symbol("AuthManager", project_path=projA_path)
+    projB_symbols = si.find_symbol("AuthManager", project_path=projB_path)
 
     assert len(projA_symbols) > 0, "Expected AuthManager in projA"
-    assert len(projB_symbols) == 0, (
-        f"find_symbol for projA returned projB symbols: "
-        f"{[s.get('file_path') for s in projB_symbols]}"
-    )
+    assert len(projB_symbols) > 0, "Expected AuthManager in projB"
+    # Scoped results must not leak to other project
+    for s in projA_symbols:
+        assert s["file_path"].startswith(projA_path), f"projA symbol leaked: {s['file_path']}"
+    for s in projB_symbols:
+        assert s["file_path"].startswith(projB_path), f"projB symbol leaked: {s['file_path']}"
+
+    # Also verify global find without scope finds both
+    all_symbols = si.find_symbol("AuthManager")
+    assert len(all_symbols) == 2, f"Expected 2 global symbols, got {len(all_symbols)}"
 
 
 # ---------------------------------------------------------------------------

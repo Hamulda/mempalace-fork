@@ -310,7 +310,7 @@ class SymbolIndex:
                     pass
                 self._conn = None
 
-    def find_symbol(self, symbol_name: str, exact: bool = False) -> list[dict]:
+    def find_symbol(self, symbol_name: str, exact: bool = False, project_path: str | None = None) -> list[dict]:
         """
         Find all definitions of symbol_name (exact, case-sensitive match by default).
 
@@ -319,6 +319,9 @@ class SymbolIndex:
             exact: if True, uses COLLATE BINARY for guaranteed case-sensitive
                    comparison; if False (default), uses case-sensitive '='
                    which is also case-sensitive in SQLite for ASCII strings.
+            project_path: optional path to scope results to that project only.
+                   When provided, only symbols whose file_path starts with
+                   project_path are returned.
 
         Returns one entry per unique (symbol_name, file_path, line_start) triple.
         Multiple definitions with the same name in the same file at different
@@ -335,16 +338,33 @@ class SymbolIndex:
                 # exact=True uses COLLATE BINARY for guaranteed case-sensitive match
                 # exact=False (default) uses '=' which is case-sensitive for ASCII
                 collation = "COLLATE BINARY" if exact else ""
-                cur = self._conn.execute(
-                    f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end,
-                              file_signature, imports, exports, parent_symbol, symbol_fqn,
-                              extraction_backend
-                       FROM symbol_index
-                       WHERE symbol_name {collation} = ?
-                       ORDER BY file_path""",
-                    (symbol_name,),
-                )
-                rows = cur.fetchall()
+
+                rows = []
+                if project_path:
+                    pp_norm = project_path.rstrip("/").lower()
+                    cur = self._conn.execute(
+                        f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end,
+                                  file_signature, imports, exports, parent_symbol, symbol_fqn,
+                                  extraction_backend
+                           FROM symbol_index
+                           WHERE symbol_name {collation} = ?
+                           ORDER BY file_path""",
+                        (symbol_name,),
+                    )
+                    all_rows = cur.fetchall()
+                    rows = [r for r in all_rows if r[2] and r[2].lower().startswith(pp_norm + "/")]
+                else:
+                    cur = self._conn.execute(
+                        f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end,
+                                  file_signature, imports, exports, parent_symbol, symbol_fqn,
+                                  extraction_backend
+                           FROM symbol_index
+                           WHERE symbol_name {collation} = ?
+                           ORDER BY file_path""",
+                        (symbol_name,),
+                    )
+                    rows = cur.fetchall()
+
                 return [
                     {
                         "symbol_name": r[0],

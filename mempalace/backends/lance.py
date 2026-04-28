@@ -703,6 +703,40 @@ def _sanitize_embedding_batch(
     ]
 
 
+# ── Dedup Scope Helper ─────────────────────────────────────────────────────────
+
+
+def _dedup_scope_matches(new_meta: dict, old_meta: dict) -> bool:
+    """
+    Returns True when two memories are in the same dedup scope.
+
+    For code/repo chunks, dedup is scoped to the same source_file (optionally
+    same chunk_index). Cross-project or cross-file chunks are NEVER considered
+    duplicates — they must all be stored.
+
+    For non-code memories (no source_file), falls back to True (allow dedup).
+    """
+    new_sf = new_meta.get("source_file")
+    old_sf = old_meta.get("source_file")
+
+    if new_sf or old_sf:
+        # If either has a source_file but not both, don't dedup across boundary
+        if not new_sf or not old_sf:
+            return False
+        # Different source files → different scope
+        if str(new_sf) != str(old_sf):
+            return False
+        # Same source_file: optionally check chunk_index
+        new_chunk = new_meta.get("chunk_index")
+        old_chunk = old_meta.get("chunk_index")
+        if new_chunk is not None and old_chunk is not None:
+            return new_chunk == old_chunk
+        return True
+
+    # Neither has source_file → legacy dedup allowed
+    return True
+
+
 # ── Semantic Deduplicator ──────────────────────────────────────────────────────
 
 class SemanticDeduplicator:
@@ -734,7 +768,7 @@ class SemanticDeduplicator:
         new_metadata: dict,
         collection: "LanceCollection",
         n_candidates: int = 5,
-    ) -> tuple[str, Optional[str]]:
+    ) -> tuple[str, str | None]:
         """
         Returns (action, existing_id) where action is:
           "unique"    — write normally
@@ -765,10 +799,13 @@ class SemanticDeduplicator:
         best_similarity = max(0.0, 1.0 - best_dist)
 
         if best_similarity >= self.high_threshold:
-            return "duplicate", best_id
+            if _dedup_scope_matches(new_metadata, best_meta):
+                return "duplicate", best_id
+            return "unique", None
 
         if best_similarity >= self.low_threshold:
-            # Similar but not identical — check for conflict (same wing/room)
+            if not _dedup_scope_matches(new_metadata, best_meta):
+                return "unique", None
             new_wing = new_metadata.get("wing", "")
             new_room = new_metadata.get("room", "")
             old_wing = best_meta.get("wing", "")
@@ -786,7 +823,7 @@ class SemanticDeduplicator:
         collection: "LanceCollection",
         n_candidates: int = 5,
         quarantine_ctx: str = "",
-    ) -> tuple[list[tuple[str, Optional[str]]], list[Optional[list[float]]], list[dict]]:
+    ) -> tuple[list[tuple[str, str | None]], list[list[float] | None], list[dict]]:
         """
         Klasifikuje celý batch dokumentů najednou.
         Vrací (classifications, embeddings, failures) — embeddingy jsou vypočítány
@@ -803,10 +840,10 @@ class SemanticDeduplicator:
                 documents, context=quarantine_ctx or "classify_batch(empty_collection)"
             )
             # Align results with original document indices so upsert zip is correct
-            results: list[tuple[str, Optional[str]]] = [("unique", None)] * len(documents)
+            results: list[tuple[str, str | None]] = [("unique", None)] * len(documents)
             for qi in {f["index"] for f in failures}:
                 results[qi] = ("quarantined", None)
-            all_embs_aligned: list[Optional[list[float]]] = [None] * len(documents)
+            all_embs_aligned: list[list[float] | None] = [None] * len(documents)
             for vi, orig_i in enumerate(valid_orig_indices):
                 all_embs_aligned[orig_i] = valid_embs[vi]
             return results, all_embs_aligned, failures
@@ -825,17 +862,17 @@ class SemanticDeduplicator:
 
         n_workers = max(1, min(len(valid_orig_indices), 8))
 
-        results: list[tuple[str, Optional[str]]] = [("unique", None)] * len(documents)
+        results: list[tuple[str, str | None]] = [("unique", None)] * len(documents)
         # Mark quarantined indices as "quarantined" so upsert skips them
         failed_orig_indices = {f["index"] for f in failures}
         for qi in failed_orig_indices:
             results[qi] = ("quarantined", None)
 
         if not orig_vec_map:
-            all_embeddings_aligned: list[Optional[list[float]]] = [None] * len(documents)
+            all_embeddings_aligned: list[list[float] | None] = [None] * len(documents)
             return results, all_embeddings_aligned, failures
 
-        def _classify_one(args: tuple[int, str, dict, list[float]]) -> tuple[int, tuple[str, Optional[str]]]:
+        def _classify_one(args: tuple[int, str, dict, list[float]]) -> tuple[int, tuple[str, str | None]]:
             i, doc, meta, vec = args
             similar = collection.query_by_vector(vector=vec, n_results=n_candidates)
             if not similar["ids"] or not similar["ids"][0]:
@@ -845,8 +882,12 @@ class SemanticDeduplicator:
             best_meta = (similar["metadatas"][0][0] or {}) if similar["metadatas"] else {}
             best_similarity = max(0.0, 1.0 - best_dist)
             if best_similarity >= self.high_threshold:
-                return i, ("duplicate", best_id)
+                if _dedup_scope_matches(meta, best_meta):
+                    return i, ("duplicate", best_id)
+                return i, ("unique", None)
             if best_similarity >= self.low_threshold:
+                if not _dedup_scope_matches(meta, best_meta):
+                    return i, ("unique", None)
                 if (meta.get("room") == best_meta.get("room") or
                         meta.get("wing") == best_meta.get("wing")):
                     return i, ("conflict", best_id)
@@ -863,7 +904,7 @@ class SemanticDeduplicator:
                 results[orig_i] = classification
 
         # Build aligned embeddings list: None at quarantined indices so upsert zip stays aligned
-        all_embeddings_aligned: list[Optional[list[float]]] = [None] * len(documents)
+        all_embeddings_aligned: list[list[float] | None] = [None] * len(documents)
         for vi, orig_i in enumerate(valid_orig_indices):
             all_embeddings_aligned[orig_i] = batch_vectors[vi]
 
@@ -1146,7 +1187,7 @@ def _json_eq(k: str, v: Any) -> str:
     return f"json_extract({_json_col('metadata_json')}, '$.{k}') = {_sql_val(v)}"
 
 
-def _json_in(k: str, v: List[Any]) -> str:
+def _json_in(k: str, v: list[Any]) -> str:
     vals = ", ".join(_sql_val(x) for x in v)
     return f"json_extract({_json_col('metadata_json')}, '$.{k}') IN ({vals})"
 
@@ -1155,7 +1196,7 @@ def _json_cmp(k: str, op_: str, v: Any) -> str:
     return f"json_extract({_json_col('metadata_json')}, '$.{k}') {op_} {_sql_val(v)}"
 
 
-def _where_to_sql(where: Optional[Dict[str, Any]]) -> Optional[str]:
+def _where_to_sql(where: dict[str, Any] | None) -> str | None:
     """
     Convert ChromaDB-style where dict to SQL WHERE clause.
 
@@ -1249,7 +1290,7 @@ def _parse_metadata(df: "pandas.DataFrame") -> "pandas.DataFrame":
     return df
 
 
-def _apply_where_filter(df: "pandas.DataFrame", where: Optional[Dict[str, Any]]) -> "pandas.DataFrame":
+def _apply_where_filter(df: "pandas.DataFrame", where: dict[str, Any] | None) -> "pandas.DataFrame":
     """Apply a ChromaDB-style where filter to a pandas DataFrame.
 
     Handles:
@@ -1398,7 +1439,7 @@ class LanceCollection(BaseCollection):
         self._table = table
         self._palace_path = palace_path or ""
         self._collection_name = collection_name
-        self._optimizer: Optional[LanceOptimizer] = None
+        self._optimizer: LanceOptimizer | None = None
         if palace_path:
             self._optimizer = LanceOptimizer(palace_path, collection_name)
 
@@ -1437,7 +1478,7 @@ class LanceCollection(BaseCollection):
         self,
         vector: list[float],
         n_results: int = 5,
-        where: Optional[dict] = None,
+        where: dict | None = None,
     ) -> dict:
         """
         Vector search s předpočítaným vektorem (bez re-embedding).
@@ -1477,9 +1518,9 @@ class LanceCollection(BaseCollection):
     def add(
         self,
         *,
-        documents: List[str],
-        ids: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
+        documents: list[str],
+        ids: list[str],
+        metadatas: list[dict[str, Any]] | None = None,
     ) -> None:
         if not documents:
             return
@@ -1492,9 +1533,9 @@ class LanceCollection(BaseCollection):
     def _do_add(
         self,
         *,
-        documents: List[str],
-        ids: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
+        documents: list[str],
+        ids: list[str],
+        metadatas: list[dict[str, Any]] | None = None,
     ) -> None:
         """Internal add implementation. Bypasses coalescer. Used by WriteCoalescer."""
         if not documents:
@@ -1616,10 +1657,10 @@ class LanceCollection(BaseCollection):
     def upsert(
         self,
         *,
-        documents: List[str],
-        ids: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[str]:
+        documents: list[str],
+        ids: list[str],
+        metadatas: list[dict[str, Any]] | None = None,
+    ) -> str | None:
         if not documents:
             return
 
@@ -1727,7 +1768,7 @@ class LanceCollection(BaseCollection):
         ids: list[str],
         documents: list[str],
         metadatas: list[dict],
-    ) -> Optional[str]:
+    ) -> str | None:
         """Synchronize written records into the FTS5 keyword index.
 
         Called after every successful upsert/add. Uses batch upsert for
@@ -1761,12 +1802,12 @@ class LanceCollection(BaseCollection):
 
     def query(
         self,
-        query_texts: Optional[List[str]] = None,
+        query_texts: list[str] | None = None,
         n_results: int = 10,
-        where: Optional[Dict[str, Any]] = None,
-        include: Optional[List[str]] = None,
+        where: dict[str, Any] | None = None,
+        include: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, List[List[Any]]]:
+    ) -> dict[str, list[list[Any]]]:
         query_text = (query_texts or [""])[0]
 
         if not query_text:
@@ -1853,13 +1894,13 @@ class LanceCollection(BaseCollection):
 
     def get(
         self,
-        ids: Optional[List[str]] = None,
-        where: Optional[Dict[str, Any]] = None,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
-        include: Optional[List[str]] = None,
+        ids: list[str] | None = None,
+        where: dict[str, Any] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        include: list[str] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, List[Any]]:
+    ) -> dict[str, list[Any]]:
         try:
             if ids:
                 if len(ids) == 1:
@@ -1983,10 +2024,10 @@ class LanceCollection(BaseCollection):
 
     def delete(
         self,
-        ids: Optional[List[str]] = None,
-        where: Optional[Dict[str, Any]] = None,
+        ids: list[str] | None = None,
+        where: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> Optional[str]:
+    ) -> str | None:
         if ids:
             if len(ids) == 1:
                 where_clause = f"id = '{ids[0]}'"
@@ -2078,7 +2119,7 @@ class LanceCollection(BaseCollection):
         deleted_ids = ids if ids else (matching_ids if where else [])
         return self._sync_fts5delete(deleted_ids)
 
-    def _sync_fts5delete(self, ids: list[str]) -> Optional[str]:
+    def _sync_fts5delete(self, ids: list[str]) -> str | None:
         """Remove deleted document IDs from the FTS5 keyword index.
 
         Called after every successful delete. Returns None on success,
@@ -2102,7 +2143,7 @@ class LanceCollection(BaseCollection):
         except Exception:
             return 0
 
-    def get_by_id(self, record_id: str) -> Optional[Dict[str, Any]]:
+    def get_by_id(self, record_id: str) -> dict[str, Any] | None:
         result = self.get(ids=[record_id])
         if not result.get("ids"):
             return None

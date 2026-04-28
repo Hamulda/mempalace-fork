@@ -6,8 +6,7 @@ Reads mempalace.yaml from the project directory to know the wing + rooms.
 Routes each file to the right room based on content.
 Stores verbatim chunks as drawers. No summaries. Ever.
 
-Storage: Uses get_backend(config.backend) — LanceDB is canonical primary,
-ChromaDB is legacy compat via the same abstraction layer.
+Storage: LanceDB-only via get_backend(config.backend).
 """
 
 import logging
@@ -1676,7 +1675,7 @@ def mine(
 def status(palace_path: str):
     """Show what's been filed in the palace.
 
-    Uses canonical backend factory — Lance is primary, Chroma is legacy compat.
+    Uses canonical backend factory — Lance is primary.
     """
     from .config import MempalaceConfig
 

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .backends import get_backend
 from .query_sanitizer import sanitize_query
+from .retrieval_planner import classify_query as _canonical_classify_query
 from .server._code_tools import _source_file_matches
 
 logger = logging.getLogger("mempalace_mcp")
@@ -660,10 +661,14 @@ async def hybrid_search_async(
                 return []
 
         # Run all 3 layers concurrently — latency = max, not sum
-        vector_results, fts5_hits, kg_hits = await asyncio.gather(
-            asyncio.to_thread(_vector_layer),
-            asyncio.to_thread(_fts5_layer),
-            asyncio.to_thread(_kg_layer),
+        async with asyncio.TaskGroup() as tg:
+            v_task = tg.create_task(asyncio.to_thread(_vector_layer))
+            f_task = tg.create_task(asyncio.to_thread(_fts5_layer))
+            kg_task = tg.create_task(asyncio.to_thread(_kg_layer))
+        vector_results, fts5_hits, kg_hits = (
+            v_task.result(),
+            f_task.result(),
+            kg_task.result(),
         )
 
         hits = vector_results.get("results", [])
@@ -785,54 +790,11 @@ def is_path_query(query: str) -> bool:
 
 
 def classify_query(query: str) -> str:
+    """Canonical query classifier — delegates to retrieval_planner.classify_query.
+
+    Categories: path, symbol, code_exact, code_semantic, memory, mixed.
     """
-    Classify a query into one of six retrieval intent categories.
-
-    The returned category determines which retrieval path is used:
-
-    - path       : User is looking for a specific file or path literal.
-                   Use FTS5 prefix/path lookup first, skip vector.
-    - symbol     : User is looking for a symbol (function, class, constant).
-                   Query SymbolIndex first, then expand to chunks in same file/line.
-    - code_exact : Exact code pattern (def, import, -> etc.).
-                   FTS5 first, small vector shortlist for disambiguation.
-    - code_semantic : Semantic code query (≥4 words with code signal).
-                   FTS5 + vector + symbol expansion, RRF merge.
-    - memory     : Prose/memory style (short or conversational).
-                   Vector-first, FTS5 fallback.
-    - mixed      : Cannot determine intent; use full hybrid search.
-
-    This is the Phase 3 retrieval planner entry point.
-    """
-    query = query.strip()
-    if not query:
-        return "memory"
-
-    # Path: FTS5-exact, no vector needed
-    if _PATH_LIKE_RE.search(query):
-        return "path"
-
-    # Symbol: identifier that could be a function/class/variable name
-    # Heuristic: single camelCase/PascalCase word, or snake_case identifier
-    if _is_symbol_name(query):
-        return "symbol"
-
-    # Code exact: strong code pattern signals
-    if _CODE_QUERY_RE.search(query):
-        # If it's just a short identifier pattern, treat as symbol
-        if len(query.split()) == 1 and _SYMBOL_NAME_RE.search(query):
-            return "symbol"
-        return "code_exact"
-
-    # Memory/prose: short queries or non-code language
-    if len(query.split()) <= 2:
-        return "memory"
-
-    # Semantic code: ≥3 words with code-like vocabulary
-    if _query_complexity(query) == "complex":
-        return "code_semantic"
-
-    return "mixed"
+    return _canonical_classify_query(query)
 
 
 # Additional regex for symbol name detection
