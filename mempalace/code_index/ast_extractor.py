@@ -203,18 +203,15 @@ def _file_signature(content: str) -> str:
 
 # ── tree-sitter Python extraction ─────────────────────────────────────────────
 
-def _extract_py_tree_sitter(content: str) -> dict:
-    """Extract Python symbols with parent/fqn using tree-sitter."""
+def _extract_py_tree_sitter(content: str) -> dict | None:
+    """Extract Python symbols with parent/fqn using tree-sitter.
+
+    Returns None if tree-sitter is unavailable or parsing failed,
+    signalling to extract_code_structure to fall back to regex.
+    """
     parser = _get_tree_sitter_parser("python")
     if parser is None:
-        return {
-            "symbols": [],
-            "imports": [],
-            "direct_imports": [],
-            "exports": [],
-            "file_signature": "",
-            "extraction_backend": "tree_sitter",
-        }
+        return None
 
     # Build parent map and id→node map via single DFS pass
     parent_map: dict[int, Optional[int]] = {}
@@ -223,25 +220,11 @@ def _extract_py_tree_sitter(content: str) -> dict:
     try:
         tree = parser.parse(bytes(content, "utf-8"))
     except Exception:
-        return {
-            "symbols": [],
-            "imports": [],
-            "direct_imports": [],
-            "exports": [],
-            "file_signature": "",
-            "extraction_backend": "tree_sitter",
-        }
+        return None
 
     root = tree.root_node
     if root is None:
-        return {
-            "symbols": [],
-            "imports": [],
-            "direct_imports": [],
-            "exports": [],
-            "file_signature": "",
-            "extraction_backend": "tree_sitter",
-        }
+        return None
 
     stack: list[tuple[object, Optional[int]]] = [(root, None)]
     while stack:
@@ -576,7 +559,7 @@ def extract_code_structure(content: str, source_file: str) -> dict:
         if _ensure_tree_sitter():
             try:
                 result = _extract_py_tree_sitter(content)
-                if result.get("symbols") is not None:
+                if result is not None:
                     return result
             except Exception:
                 pass

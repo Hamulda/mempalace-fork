@@ -9,7 +9,7 @@ classify_query() routes each query to the optimal retrieval strategy:
   memory       — prose/memory query → vector primary, FTS5 supplement
   mixed        — ambiguous → multi-source RRF merge
 
-build_planner_filters() builds a ChromaDB-style where dict so project/language/wing
+build_planner_filters() builds a Lance-compatible metadata filter dict so project/language/wing
 filters are pushed into DB queries rather than post-retrieval Python filtering.
 """
 from __future__ import annotations
@@ -134,7 +134,7 @@ def build_planner_filters(
     is_latest: bool | None = True,
 ) -> dict:
     """
-    Build a ChromaDB-style WHERE dict with project_path pushed to DB level.
+    Build a Lance-compatible metadata filter dict with project_path pushed to DB level.
 
     This pushes filtering DOWN into the DB query (LanceDB where clause) rather
     than post-retrieval Python filtering. For large repos this prevents the
@@ -147,7 +147,7 @@ def build_planner_filters(
         is_latest: Filter only latest chunks (default: True).
 
     Returns:
-        ChromaDB-style where dict for use in col.query(where=...) / col.get(where=...).
+        Lance-compatible metadata filter dict for use in col.query(where=...) / col.get(where=...).
     """
     conditions = []
 

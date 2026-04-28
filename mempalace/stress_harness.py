@@ -135,7 +135,7 @@ class CacheChurn:
         self.keys_changed.update(keys)
 
 
-@dataclass
+@dataclass(slots=True)
 class MemoryStats:
     rss_before_kb: int = 0
     rss_after_kb: int = 0
@@ -158,7 +158,7 @@ class MemoryStats:
                 return 0
 
 
-@dataclass
+@dataclass(slots=True)
 class SessionMetrics:
     session_id: str
     ops_completed: int = 0
@@ -177,7 +177,7 @@ class SessionMetrics:
         self.latency_for(tool).record(latency_ms, failure=failure, retry=retry)
 
 
-@dataclass
+@dataclass(slots=True)
 class GlobalMetrics:
     tool_latencies: dict[str, ToolLatency] = field(default_factory=dict)
     conflict_stats: ConflictStats = field(default_factory=ConflictStats)

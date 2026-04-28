@@ -63,8 +63,8 @@ def get_backend(backend_type: BackendType = "lance") -> "LanceBackend":
         raise ValueError(
             "ChromaDB backend has been removed. "
             "LanceDB is the only supported backend. "
-            "If you have existing ChromaDB data, migrate it first with: "
-            "pip install chromadb && python -m mempalace.migrate chroma-to-lance"
+            "This Lance-only build cannot migrate Chroma data. "
+            "Use an older release/commit with Chroma support, or export data manually and re-mine into LanceDB."
         )
 
     raise ValueError(

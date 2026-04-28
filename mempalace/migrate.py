@@ -36,10 +36,8 @@ def migrate_chroma_to_lance(
     raise RuntimeError(
         "ChromaDB backend has been removed. "
         "Cannot import chromadb — it is no longer a mempalace dependency.\n"
-        "If you have existing ChromaDB data, migrate manually:\n"
-        "  pip install chromadb\n"
-        "  python -m mempalace.migrate chroma-to-lance --palace <path>\n"
-        "Or use the standalone migration script in docs/chroma_migration_legacy.py"
+        "This Lance-only build cannot migrate Chroma data. "
+        "Use an older release/commit with Chroma support, or export data manually and re-mine into LanceDB."
     )
 
 

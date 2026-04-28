@@ -6,7 +6,7 @@ to ensure compatibility with the rest of the MemPalace stack.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -85,9 +85,9 @@ class BaseCollection(ABC):
     def add(
         self,
         *,
-        documents: List[str],
-        ids: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
+        documents: list[str],
+        ids: list[str],
+        metadatas: list[dict[str, Any]] | None = None,
     ) -> None:
         """Insert new records. Raises ValueError if any id already exists."""
 
@@ -95,21 +95,21 @@ class BaseCollection(ABC):
     def upsert(
         self,
         *,
-        documents: List[str],
-        ids: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
+        documents: list[str],
+        ids: list[str],
+        metadatas: list[dict[str, Any]] | None = None,
     ) -> None:
         """Insert or replace records by id."""
 
     @abstractmethod
     def query(
         self,
-        query_texts: Optional[List[str]] = None,
+        query_texts: list[str] | None = None,
         n_results: int = 10,
-        where: Optional[Dict[str, Any]] = None,
-        include: Optional[List[str]] = None,
+        where: dict[str, Any] | None = None,
+        include: list[str] | None = None,
         **kwargs,
-    ) -> Dict[str, List[List[Any]]]:
+    ) -> dict[str, list[list[Any]]]:
         """
         Search for records.
 
@@ -125,12 +125,12 @@ class BaseCollection(ABC):
     @abstractmethod
     def get(
         self,
-        ids: Optional[List[str]] = None,
-        where: Optional[Dict[str, Any]] = None,
-        limit: Optional[int] = None,
-        include: Optional[List[str]] = None,
+        ids: list[str] | None = None,
+        where: dict[str, Any] | None = None,
+        limit: int | None = None,
+        include: list[str] | None = None,
         **kwargs,
-    ) -> Dict[str, List[Any]]:
+    ) -> dict[str, list[Any]]:
         """
         Get records by id or where filter.
 
@@ -143,7 +143,7 @@ class BaseCollection(ABC):
         """
 
     @abstractmethod
-    def delete(self, ids: Optional[List[str]] = None, where: Optional[Dict[str, Any]] = None, **kwargs) -> None:
+    def delete(self, ids: list[str] | None = None, where: dict[str, Any] | None = None, **kwargs) -> None:
         """Delete records by id or where filter."""
 
     @abstractmethod
@@ -151,5 +151,5 @@ class BaseCollection(ABC):
         """Return total number of records."""
 
     @abstractmethod
-    def get_by_id(self, record_id: str) -> Optional[Dict[str, Any]]:
+    def get_by_id(self, record_id: str) -> dict[str, Any] | None:
         """Get a single record by id. Returns None if not found."""

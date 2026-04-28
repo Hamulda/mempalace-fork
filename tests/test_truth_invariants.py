@@ -62,6 +62,29 @@ class TestRetrievalPlannerCanonical:
             "Drift from canonical retrieval_planner.classify_query."
         )
 
+    def test_classify_query_behavior_agreement(self):
+        """
+        searcher.classify_query and retrieval_planner.classify_query must agree
+        on a representative set of queries (behavior invariant, not just text).
+        """
+        from mempalace.retrieval_planner import classify_query as rp_classify
+        from mempalace.searcher import classify_query as sr_classify
+
+        test_queries = [
+            "src/auth.py",
+            "AuthManager",
+            "class UserAuth",
+            "how does login verify credentials",
+            "memory of past sessions",
+            "general knowledge question",
+        ]
+        for q in test_queries:
+            rp_result = rp_classify(q)
+            sr_result = sr_classify(q)
+            assert rp_result == sr_result, (
+                f"Query {q!r}: retrieval_planner={rp_result!r}, searcher={sr_result!r} — must agree"
+            )
+
 
 class TestPluginConfig:
     """Verify .claude-plugin/.mcp.json points to correct MCP endpoint."""

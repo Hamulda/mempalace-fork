@@ -356,6 +356,21 @@ class MyClass:
         assert "MyClass" in names
         assert "my_method" in names
 
+    def test_regex_fallback_on_parser_failure(self):
+        """If tree-sitter imports but Python parser is None, fall back to regex."""
+        import unittest.mock
+        from mempalace.code_index import ast_extractor
+        from mempalace.code_index.ast_extractor import extract_code_structure
+
+        code = "class Foo: pass"
+        with unittest.mock.patch.object(
+            ast_extractor, "_get_tree_sitter_parser", return_value=None
+        ):
+            result = extract_code_structure(code, "test.py")
+        names = {s["name"] for s in result["symbols"]}
+        assert "Foo" in names
+        assert result["extraction_backend"] == "regex"
+
     def test_import_only_file_no_duplicate_errors(self):
         """Import-only file (no symbols) stores placeholder row without error."""
         from mempalace.symbol_index import SymbolIndex

@@ -58,6 +58,14 @@ def _make_scoped_workspace(root: Path) -> tuple[Path, Path]:
     srcA.mkdir(parents=True)
     srcB.mkdir(parents=True)
 
+    # Write minimal mempalace.yaml so mine() finds config
+    (projA / "mempalace.yaml").write_text(
+        "project_name: projA\npalace_name: test_palace\nwing: repo\n"
+    )
+    (projB / "mempalace.yaml").write_text(
+        "project_name: projB\npalace_name: test_palace\nwing: repo\n"
+    )
+
     # projA auth — uses PROJA_AUTH_MARKER
     (srcA / "auth.py").write_text(
         '''"""projA auth module — PROJA_AUTH_MARKER."""
@@ -386,7 +394,7 @@ def test_symbol_index_scoped_retrieval(mined_palace):
     si.build_index(projB_path, [str(p) for p in projB_src.iterdir()])
 
     # Find AuthManager — SymbolIndex returns file_path
-    symbols = si.find_symbol("AuthManager", limit=50)
+    symbols = si.find_symbol("AuthManager")
     projA_symbols = [s for s in symbols if s.get("file_path", "").startswith(projA_path)]
     projB_symbols = [s for s in symbols if s.get("file_path", "").startswith(projB_path)]
 
@@ -411,9 +419,9 @@ def test_fts5_scoped_retrieval(mined_palace):
     results = idx.search("AuthManager", n_results=20)
     assert len(results) > 0, "Expected AuthManager in FTS5 index"
 
-    # Filter to projA only
-    projA_results = [r for r in results if r["source_file"].startswith(projA_path)]
-    projB_results = [r for r in results if r["source_file"].startswith(projB_path)]
+    # FTS5 returns document_id (= source_file path from mining). Verify isolation.
+    projA_results = [r for r in results if r["document_id"].startswith(projA_path)]
+    projB_results = [r for r in results if r["document_id"].startswith(projB_path)]
 
     assert len(projA_results) > 0, "Expected projA results in FTS5"
     assert len(projB_results) > 0, "Expected projB results in FTS5 (separate project)"

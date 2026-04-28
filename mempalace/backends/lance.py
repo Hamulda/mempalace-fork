@@ -32,7 +32,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 
@@ -271,7 +271,7 @@ def _start_daemon_if_needed() -> bool:
 from ..circuit_breaker import _embed_circuit
 
 
-def _embed_via_socket(texts: List[str]) -> List[List[float]]:
+def _embed_via_socket(texts: list[str]) -> list[list[float]]:
     """Send texts to the daemon via Unix socket, return embeddings."""
     if not _embed_circuit.should_try_socket():
         raise RuntimeError("Circuit open, using fallback")
@@ -322,7 +322,7 @@ _fallback_model = None
 _fallback_lock = threading.Lock()
 
 
-def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
+def _embed_texts_fallback(texts: list[str]) -> list[list[float]]:
     """In-process fallback — loads fastembed into this process.
 
     Memory guardrail: refuse to load model if memory is already critical.
@@ -370,7 +370,7 @@ def _embed_texts_fallback(texts: List[str]) -> List[List[float]]:
     return [e[:EMBEDDING_DIMS] for e in embeddings]
 
 
-def _embed_texts(texts: List[str]) -> List[List[float]]:
+def _embed_texts(texts: list[str]) -> list[list[float]]:
     """
     Return EMBEDDING_DIMS-dim embeddings for a list of texts.
 
