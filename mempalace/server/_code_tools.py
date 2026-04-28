@@ -7,8 +7,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from fastmcp import Context
+from fastmcp import Context
 
 # =============================================================================
 # PATH MATCHING UTILITIES (module-level for testability)
@@ -24,14 +23,16 @@ def _source_file_matches(source_file: str, project_path: str) -> bool:
     - project_path ends with source_file basename (full path to file matches relative)
     - project_path is a path component of source_file (partial dir names)
 
-    Case-insensitive path comparison.
+    Case-insensitive path comparison. Resolves symlinks (e.g. /tmp → /private/tmp
+    on macOS) to ensure consistent path comparisons.
     """
     if not source_file or not project_path:
         return False
-    sf_lower = source_file.lower()
-    pp_lower = project_path.lower()
-    pp_norm = pp_lower.rstrip("/")
-    sf_norm = sf_lower.rstrip("/")
+    # Resolve symlinks so /tmp and /private/tmp compare equal on macOS
+    sf_resolved = str(Path(source_file).expanduser().resolve()).lower()
+    pp_resolved = str(Path(project_path).expanduser().resolve()).lower()
+    pp_norm = pp_resolved.rstrip("/")
+    sf_norm = sf_resolved.rstrip("/")
 
     if sf_norm == pp_norm:
         return True

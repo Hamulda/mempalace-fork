@@ -13,9 +13,9 @@ Split-brain is prevented by having settings resolve palace_path from the same
 MempalaceConfig chain that factory.py uses.
 """
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
-from typing import Literal, Optional
+from typing import Literal
 import os
 
 
@@ -130,11 +130,11 @@ class MemPalaceSettings(BaseSettings):
     # - You have confirmed memory budget headroom (~90MB above baseline)
     reranker_warmup: bool = False  # opt-in eager load of cross-encoder at server start
 
-    model_config = {
-        "env_prefix": "MEMPALACE_",
-        "env_file": ".env",
-        "env_file_encoding": "utf-8",
-    }
+    model_config = ConfigDict(
+        env_prefix="MEMPALACE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
 settings = MemPalaceSettings()

@@ -341,7 +341,9 @@ class SymbolIndex:
 
                 rows = []
                 if project_path:
-                    pp_norm = project_path.rstrip("/").lower()
+                    # Resolve project_path to absolute path to handle /tmp → /private/tmp
+                    # symlink equivalence on macOS. Same for stored symbol file_path.
+                    pp_norm = str(Path(project_path).expanduser().resolve()).rstrip("/").lower()
                     cur = self._conn.execute(
                         f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end,
                                   file_signature, imports, exports, parent_symbol, symbol_fqn,
@@ -352,7 +354,13 @@ class SymbolIndex:
                         (symbol_name,),
                     )
                     all_rows = cur.fetchall()
-                    rows = [r for r in all_rows if r[2] and r[2].lower().startswith(pp_norm + "/")]
+                    rows = [
+                        r for r in all_rows
+                        if r[2] and (
+                            str(Path(r[2]).expanduser().resolve()).rstrip("/").lower().startswith(pp_norm + "/")
+                            or str(Path(r[2]).expanduser().resolve()).rstrip("/").lower() == pp_norm
+                        )
+                    ]
                 else:
                     cur = self._conn.execute(
                         f"""SELECT symbol_name, symbol_type, file_path, line_start, line_end,

@@ -1,0 +1,6 @@
+wing: fixture_eval_project
+rooms:
+  - name: src
+    description: Source code modules
+  - name: docs
+    description: Documentation

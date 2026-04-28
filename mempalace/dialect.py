@@ -41,10 +41,11 @@ FLAGS:
   TECHNICAL = technical architecture or implementation detail
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
-from typing import List, Dict, Optional
 from pathlib import Path
 
 
@@ -855,7 +856,7 @@ class Dialect:
                 lines.extend(section_lines)
                 lines.append("")
 
-        for date_key in sorted(by_date.keys()):
+        for date_key in sorted(by_date):
             lines.append(f"=MOMENTS[{date_key}]=")
             for z, fnum in by_date[date_key]:
                 entities = []

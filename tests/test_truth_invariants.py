@@ -138,6 +138,46 @@ class TestPyprojectConsistency:
         )
 
 
+class TestPython314Truth:
+    """Canonical Python 3.14 runtime truth — no older version fiction."""
+
+    def test_requires_python_floor_is_314(self):
+        """requires-python floor must be >=3.14."""
+        pyproject = REPO_ROOT / "pyproject.toml"
+        content = pyproject.read_text()
+        m = re.search(r'requires-python\s*=\s*">=(\d+)\.(\d+)"', content, re.MULTILINE)
+        assert m, "requires-python not parseable"
+        major, minor = int(m.group(1)), int(m.group(2))
+        assert (major, minor) >= (3, 14), (
+            f"requires-python must be >=3.14, got {major}.{minor}"
+        )
+
+    def test_ruff_target_is_py314(self):
+        """ruff target-version must be py314."""
+        pyproject = REPO_ROOT / "pyproject.toml"
+        content = pyproject.read_text()
+        m = re.search(r'target-version\s*=\s*"py(\d+)"', content, re.MULTILINE)
+        assert m, "ruff target-version not found"
+        target = int(m.group(1))
+        assert target == 314, f"ruff target-version must be py314, got py{target}"
+
+    def test_no_old_python_classifiers(self):
+        """classifiers must not contain Python 3.10/3.11/3.12/3.13."""
+        pyproject = REPO_ROOT / "pyproject.toml"
+        content = pyproject.read_text()
+        old = {"3.10", "3.11", "3.12", "3.13"}
+        found = [v for v in old if f"Python :: 3. {v}" in content or f"Python :: {v}" in content]
+        assert not found, f"Old Python classifiers still present: {found}"
+
+    def test_314_classifier_exists(self):
+        """Python 3.14 classifier must be present."""
+        pyproject = REPO_ROOT / "pyproject.toml"
+        content = pyproject.read_text()
+        assert "Programming Language :: Python :: 3.14" in content, (
+            "Python 3.14 classifier missing"
+        )
+
+
 class TestDoctorCommand:
     """Verify doctor command does not contain invalid stale-session cleanup."""
 

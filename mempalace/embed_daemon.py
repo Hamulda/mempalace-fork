@@ -319,13 +319,13 @@ def run_embed_doctor() -> bool:
     pid_path = get_pid_path()
 
     # 1. Socket exists
-    if not os.path.exists(sock_path):
+    if not Path(sock_path).exists():
         print(f"FAIL: Socket not found: {sock_path}")
         return False
     print(f"OK   socket exists: {sock_path}")
 
     # 2. PID file
-    if os.path.exists(pid_path):
+    if Path(pid_path).exists():
         try:
             pid = int(Path(pid_path).read_text())
             print(f"OK   PID file: {pid}")
@@ -336,7 +336,7 @@ def run_embed_doctor() -> bool:
 
     # 3. Process alive (PID from pid file)
     alive = False
-    if os.path.exists(pid_path):
+    if Path(pid_path).exists():
         try:
             pid = int(Path(pid_path).read_text())
             os.kill(pid, 0)
@@ -465,7 +465,6 @@ def run_daemon() -> None:
         model = _create_embedding_model()
     except Exception as e:
         logger.error("Model load failed: %s — exiting", e)
-        sys.stderr.write(f"FATAL: model load failed: {e}\n")
         sys.exit(1)
     warmup_ms = (time.monotonic() - t0) * 1000
     logger.info(

@@ -176,14 +176,14 @@ class SessionTrackingMiddleware(Middleware):
                 session_id = getattr(context.fastmcp_context, "session_id", None)
                 if session_id:
                     session_label = session_id[:8]
-        except Exception:
+        except AttributeError:
             pass
 
         tool_name = "unknown"
         try:
             if isinstance(context.message, dict):
                 tool_name = context.message.get("name", "unknown")
-        except Exception:
+        except AttributeError:
             pass
 
         if settings.log_sessions:

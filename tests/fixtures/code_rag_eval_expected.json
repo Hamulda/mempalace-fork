@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "fixture": "code_rag_eval_repo",
+  "fixture_version_hash": "v1",
+  "queries": [
+    {
+      "id": "exact_symbol_authmanager",
+      "query": "AuthManager",
+      "type": "exact_symbol",
+      "expected_file": "src/auth.py",
+      "expected_class": "AuthManager",
+      "expected_method": null,
+      "line_estimate": "10-28",
+      "cross_project_leak": false,
+      "note": "Short symbol name triggers symbol-first path + FTS5"
+    },
+    {
+      "id": "method_scoped_login",
+      "query": "login",
+      "type": "method_scoped",
+      "expected_file": "src/auth.py",
+      "expected_class": "AuthManager",
+      "expected_method": "login",
+      "line_estimate": "22-30",
+      "cross_project_leak": false,
+      "note": "Short symbol triggers symbol-first; FTS5 also matches"
+    },
+    {
+      "id": "caller_connect_db",
+      "query": "connect_db",
+      "type": "caller_import",
+      "expected_file": "src/db.py",
+      "expected_symbol": "connect_db",
+      "line_estimate": "71-73",
+      "cross_project_leak": false,
+      "note": "Short symbol name"
+    },
+    {
+      "id": "path_lookup_config",
+      "query": "config.py",
+      "type": "path_lookup",
+      "expected_file": "src/config.py",
+      "line_estimate": "1-60",
+      "cross_project_leak": false,
+      "note": "File name triggers path complexity"
+    },
+    {
+      "id": "semantic_is_authenticated",
+      "query": "is_authenticated",
+      "type": "semantic_behavior",
+      "expected_file": "src/auth.py",
+      "expected_symbol": "is_authenticated",
+      "line_estimate": "35-37",
+      "cross_project_leak": false,
+      "note": "Short symbol"
+    },
+    {
+      "id": "config_debug_flag",
+      "query": "debug mode AppConfig",
+      "type": "config_query",
+      "expected_file": "src/config.py",
+      "expected_class": "AppConfig",
+      "expected_field": "debug",
+      "line_estimate": "19-26",
+      "cross_project_leak": false,
+      "note": "Short class name + field"
+    },
+    {
+      "id": "disambiguation_legacyauth",
+      "query": "LegacyAuth",
+      "type": "disambiguation",
+      "expected_file": "src/auth.py",
+      "expected_class": "LegacyAuth",
+      "expected_method": "login",
+      "misleading_readme_text": "LegacyAuth is the recommended way",
+      "line_estimate": "41-55",
+      "cross_project_leak": false,
+      "note": "Must distinguish LegacyAuth (deprecated) from AuthManager"
+    },
+    {
+      "id": "password_hashing",
+      "query": "hash_password",
+      "type": "exact_symbol",
+      "expected_file": "src/auth.py",
+      "expected_symbol": "hash_password",
+      "line_estimate": "57-63",
+      "cross_project_leak": false
+    },
+    {
+      "id": "connection_pool",
+      "query": "ConnectionPool",
+      "type": "semantic_behavior",
+      "expected_file": "src/db.py",
+      "expected_class": "ConnectionPool",
+      "line_estimate": "14-35",
+      "cross_project_leak": false
+    },
+    {
+      "id": "query_builder",
+      "query": "QueryBuilder execute_query",
+      "type": "method_scoped",
+      "expected_file": "src/db.py",
+      "expected_class": "QueryBuilder",
+      "expected_method": "execute_query",
+      "line_estimate": "38-56",
+      "cross_project_leak": false
+    }
+  ],
+  "thresholds": {
+    "top1_file_hit_min": 0.5,
+    "top5_file_hit_min": 0.7,
+    "symbol_hit_min": 0.6,
+    "line_range_hit_min": 0.4,
+    "max_latency_ms": 5000,
+    "cross_project_leak_max": 0
+  }
+}

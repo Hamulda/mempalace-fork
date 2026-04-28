@@ -918,7 +918,7 @@ def _symbol_first_search(
 
     # Step 1: SymbolIndex exact match
     try:
-        symbols = index.find_symbol(query, limit=50)
+        symbols = index.find_symbol(query, limit=50, project_path=project_path)
     except Exception:
         symbols = []
 

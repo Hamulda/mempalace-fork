@@ -941,7 +941,9 @@ async def run_harness(palace_path: str | None = None) -> GlobalMetrics:
                 await run_session(sm.session_id, client, metrics, sm, lock,
                                    ops_target=OPS_PER_SESSION)
 
-        await asyncio.gather(*[session_task(sm) for sm in sessions])
+        async with asyncio.TaskGroup() as tg:
+            for sm in sessions:
+                tg.create_task(session_task(sm))
 
         wall_time = time.perf_counter() - t0
         metrics.wall_time_s = wall_time
