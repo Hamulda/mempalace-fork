@@ -204,7 +204,7 @@ def lance_palace(tmp_path):
 
     os.environ["MEMPALACE_COALESCE_MS"] = "0"
     os.environ["MEMPALACE_DEDUP_HIGH"] = "1.0"
-    os.environ["MEMPALACE_DEDUP_LOW"] = "0.99"
+    os.environ["MEMPALACE_DEDUP_LOW"] = "0.0"
 
     import mempalace.backends.lance as lance_mod
 
@@ -230,7 +230,7 @@ async def seeded_lance_palace(tmp_path):
 
     os.environ["MEMPALACE_COALESCE_MS"] = "0"
     os.environ["MEMPALACE_DEDUP_HIGH"] = "1.0"
-    os.environ["MEMPALACE_DEDUP_LOW"] = "0.99"
+    os.environ["MEMPALACE_DEDUP_LOW"] = "0.0"
 
     import mempalace.backends.lance as lance_mod
 

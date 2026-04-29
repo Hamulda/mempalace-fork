@@ -13,7 +13,7 @@ Split-brain is prevented by having settings resolve palace_path from the same
 MempalaceConfig chain that factory.py uses.
 """
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings
 from typing import Literal
 import os
@@ -129,6 +129,17 @@ class MemPalaceSettings(BaseSettings):
     # - You run latency-sensitive workloads where the first rerank call can't wait ~3s
     # - You have confirmed memory budget headroom (~90MB above baseline)
     reranker_warmup: bool = False  # opt-in eager load of cross-encoder at server start
+
+    # ── File context security ───────────────────────────────────────────────
+    # Safe default: mempalace_file_context rejects files outside allowed roots.
+    # MEMPALACE_FILE_CONTEXT_ALLOW_ANY=1 restores the old permissive behavior.
+    file_context_allow_any: bool = False
+
+    # Colon-separated list of allowed root directories for file_context reads.
+    # Each path is resolved (symlinks expanded, trailing slashes stripped) before comparison.
+    # Example: /Users/me/projects:/Users/me/chats
+    # Not enforced when file_context_allow_any=True.
+    file_context_allowed_roots: str = ""
 
     model_config = ConfigDict(
         env_prefix="MEMPALACE_",

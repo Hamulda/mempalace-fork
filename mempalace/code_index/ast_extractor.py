@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Optional
@@ -267,12 +268,8 @@ def _extract_py_tree_sitter(content: str) -> dict | None:
 
     SYMBOL_TYPES = ("function_definition", "async_generator_function_definition", "class_definition")
 
-    symbols = []
-
     for node in root.preorder():
         nid = id(node)
-        if nid in id_to_node and nid != id(root):
-            pass
         if node.type not in SYMBOL_TYPES:
             continue
 
@@ -343,6 +340,109 @@ def _extract_py_tree_sitter(content: str) -> dict | None:
         "exports": exports,
         "file_signature": _file_signature(content),
         "extraction_backend": "tree_sitter",
+    }
+
+
+# ── stdlib ast Python extraction ──────────────────────────────────────────────
+
+def _extract_py_stdlib_ast(content: str) -> dict:
+    """Extract Python symbols using the stdlib ast module.
+
+    Provides class/function/async function detection with correct parent scope
+    and fully-qualified names (FQN). Falls back to regex for non-Python files.
+
+    This is the M1 Air safe path when tree-sitter is unavailable.
+    """
+    try:
+        tree = ast.parse(content)
+    except Exception:
+        return _extract_py_regex(content)
+
+    symbols = []
+    imports = []
+    direct_imports = []
+    exports = []
+
+    # Stack entries: (node, parent_scope_list)
+    # parent_scope_list tracks the enclosing class/function names
+    stack: list[tuple[object, list[str]]] = []
+
+    # Seed with top-level body and empty parent scope
+    stack.append((tree.body, []))
+
+    while stack:
+        nodes, parents = stack.pop()
+        for node in nodes:
+            # ── class ──────────────────────────────────────────────────────────
+            if isinstance(node, ast.ClassDef):
+                fqn = ".".join(parents + [node.name]) if parents else node.name
+                parent_name = parents[-1] if parents else None
+                symbols.append({
+                    "name": node.name,
+                    "kind": "class",
+                    "line_start": node.lineno,
+                    "line_end": node.lineno + 1,
+                    "parent": parent_name,
+                    "fqn": fqn,
+                })
+                stack.append((node.body, parents + [node.name]))
+
+            # ── function (sync or async) ────────────────────────────────────────
+            elif isinstance(node, ast.FunctionDef):
+                fqn = ".".join(parents + [node.name]) if parents else node.name
+                parent_name = parents[-1] if parents else None
+                symbols.append({
+                    "name": node.name,
+                    "kind": "function",
+                    "line_start": node.lineno,
+                    "line_end": node.lineno + 1,
+                    "parent": parent_name,
+                    "fqn": fqn,
+                })
+                stack.append((node.body, parents))
+
+            # ── async function ────────────────────────────────────────────────
+            elif isinstance(node, ast.AsyncFunctionDef):
+                fqn = ".".join(parents + [node.name]) if parents else node.name
+                parent_name = parents[-1] if parents else None
+                symbols.append({
+                    "name": node.name,
+                    "kind": "async_function",
+                    "line_start": node.lineno,
+                    "line_end": node.lineno + 1,
+                    "parent": parent_name,
+                    "fqn": fqn,
+                })
+                stack.append((node.body, parents))
+
+            # ── import statements ─────────────────────────────────────────────
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports.append(alias.name)
+
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imports.append(node.module)
+                for alias in node.names:
+                    direct_imports.append(alias.name)
+
+            # ── top-level assignment (export heuristic) ────────────────────────
+            elif isinstance(node, ast.Assign):
+                # Only consider top-level assignments
+                if not parents:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            name = target.id
+                            if name and name[0].isupper() and name not in ("True", "False", "None"):
+                                exports.append(name)
+
+    return {
+        "symbols": symbols,
+        "imports": imports,
+        "direct_imports": direct_imports,
+        "exports": exports,
+        "file_signature": _file_signature(content),
+        "extraction_backend": "stdlib_ast",
     }
 
 
@@ -547,14 +647,16 @@ def extract_code_structure(content: str, source_file: str) -> dict:
     - direct_imports: list of directly imported symbol names
     - exports: list of public names (heuristic)
     - file_signature: module-level docstring or shebang
-    - extraction_backend: "tree_sitter" or "regex"
+    - extraction_backend: "tree_sitter", "stdlib_ast", or "regex"
 
-    Tree-sitter is preferred for Python if available.
-    Falls back to regex for all languages.
+    Extraction priority for Python:
+      1. tree-sitter (if available and Python parser works)
+      2. stdlib ast (for .py/.pyi when tree-sitter unavailable)
+      3. regex fallback for all languages.
     """
     ext = Path(source_file).suffix.lower()
 
-    # Python: try tree-sitter first if available
+    # Python: try tree-sitter first if available, then stdlib ast, then regex
     if ext in (".py", ".pyi"):
         if _ensure_tree_sitter():
             try:
@@ -563,10 +665,8 @@ def extract_code_structure(content: str, source_file: str) -> dict:
                     return result
             except Exception:
                 pass
-
-    # Regex fallback for all languages
-    if ext in (".py", ".pyi"):
-        return _extract_py_regex(content)
+        # tree-sitter unavailable or failed — use stdlib ast
+        return _extract_py_stdlib_ast(content)
     elif ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"):
         return _extract_js_regex(content)
     elif ext == ".go":

@@ -1,21 +1,39 @@
 ---
-description: Diagnose MemPalace server health — check health endpoint, palace status, and server process.
+description: Diagnose MemPalace server and palace health — shared server status, runtime dir, sessions, palace path, backend, Python version, Lance availability, Chroma import check.
 allowed-tools: Bash, Read
 ---
 
 # MemPalace Doctor
 
-## Run All Checks
+## Full Health Check
 
 ```bash
-echo "=== Health ===" && curl -s http://127.0.0.1:8765/health && echo "" && echo "=== Palace Status ===" && curl -s http://127.0.0.1:8765/health | jq -r '.palace_path // empty' 2>/dev/null && echo "" && echo "=== Server Process ===" && cat ~/.mempalace/runtime/server.pid 2>/dev/null && echo "" && echo "=== Session Count ===" && ls ~/.mempalace/runtime/sessions/ 2>/dev/null | wc -l | tr -d ' '
+echo "=== Shared Server ===" && curl -s http://127.0.0.1:8765/health | python3 -c "import json,sys; d=json.load(sys.stdin); print('status:', d.get('status')); print('version:', d.get('version')); print('transport:', d.get('transport')); print('shared_server_mode:', d.get('shared_server_mode')); print('palace_path:', d.get('palace_path')); print('backend:', d.get('backend')); print('memory_pressure:', d.get('memory_pressure'))"
+echo "" && echo "=== Runtime Directory ===" && ls -la ~/.mempalace/runtime/ 2>/dev/null || echo "runtime dir: not found"
+echo "" && echo "=== Server PID ===" && cat ~/.mempalace/runtime/server.pid 2>/dev/null || echo "server.pid: not found"
+echo "" && echo "=== Session Files ===" && ls ~/.mempalace/runtime/sessions/ 2>/dev/null | wc -l | tr -d ' ' && echo " active sessions"
+echo "" && echo "=== Palace Path ===" && curl -s http://127.0.0.1:8765/health | python3 -c "import json,sys; print(json.load(sys.stdin).get('palace_path','?'))"
+echo "" && echo "=== Backend ===" && curl -s http://127.0.0.1:8765/health | python3 -c "import json,sys; print(json.load(sys.stdin).get('backend','?'))"
+echo "" && echo "=== Python Version ===" && python3 --version
+echo "" && echo "=== LanceDB Available ===" && python3 -c "import lancedb; print('lancedb', lancedb.__version__)" 2>/dev/null || echo "lancedb: not installed"
+echo "" && echo "=== Chroma NOT Imported ===" && python3 -c "import sys; mods=[k for k in sys.modules.keys() if 'chroma' in k.lower()]; exit(len(mods))" && echo "chroma: clean" || echo "WARNING: chroma modules present"
 ```
 
 ## Individual Checks
 
-**Health endpoint:**
+**Shared server health:**
 ```bash
 curl http://127.0.0.1:8765/health
+```
+
+**Runtime directory:**
+```bash
+ls -la ~/.mempalace/runtime/
+```
+
+**Session count:**
+```bash
+ls ~/.mempalace/runtime/sessions/ 2>/dev/null | wc -l
 ```
 
 **Server PID:**
@@ -23,27 +41,44 @@ curl http://127.0.0.1:8765/health
 cat ~/.mempalace/runtime/server.pid
 ```
 
-**Active sessions:**
+**Palace path:**
 ```bash
-ls ~/.mempalace/runtime/sessions/ | wc -l
+curl -s http://127.0.0.1:8765/health | python3 -c "import json,sys; print(json.load(sys.stdin).get('palace_path','?'))"
 ```
 
-**Server-control status:**
+**Backend:**
 ```bash
-bash ~/.claude/plugins/marketplaces/mempalace/.claude-plugin/hooks/mempal-server-control.sh status 2>/dev/null || echo "server-control: unavailable"
+curl -s http://127.0.0.1:8765/health | python3 -c "import json,sys; print(json.load(sys.stdin).get('backend','?'))"
+```
+
+**Python version (3.14 target):**
+```bash
+python3 --version
+```
+
+**LanceDB availability:**
+```bash
+python3 -c "import lancedb; print('lancedb', lancedb.__version__)"
+```
+
+**Chroma not imported:**
+```bash
+python3 -c "import sys; mods=[k for k in sys.modules.keys() if 'chroma' in k.lower()]; exit(len(mods))" && echo "chroma not loaded" || echo "WARNING: chroma modules present"
 ```
 
 ## Common Issues
 
 | Symptom | Check | Fix |
 |---------|-------|-----|
-| MCP tools return connection error | Health check | Start server: `mempalace serve --host 127.0.0.1 --port 8765` |
-| `connection refused` | Server PID missing | Server not running — start it or check hooks registration |
+| MCP tools return connection error | `curl http://127.0.0.1:8765/health` | Start server: `mempalace serve --host 127.0.0.1 --port 8765` |
+| `connection refused` | server.pid missing | Server not running — ensure hooks registered in `settings.json` |
 | Stale sessions | Session count high | Sessions auto-expire via TTL (6h) — no manual prune needed |
-| Slow searches | Memory pressure | Check `memory_guard` in `mempalace_status` output |
+| Slow searches | memory_pressure | Check `memory_pressure` in health output — nominal is good |
+| Backend shows `chroma` | health backend field | Switch to LanceDB: `mempalace init --backend lance ~/palace` |
+| Wrong Python version | python3 --version | Requires Python 3.14 — use pyenv or virtualenv |
 
 ## If All Checks Pass but Slow
 
-- Use `mempalace_search_code` with `limit: 5` instead of full searches
-- Avoid large exports (`mempalace_export_claude_md` without filters)
-- Rerank only for complex semantic queries
+- Use `mempalace_search_code` with `limit: 5-10` instead of full searches
+- Avoid `mempalace_export_claude_md` with large room filters
+- Rerank only for complex semantic queries (FTS5 is fast for keyword matching)

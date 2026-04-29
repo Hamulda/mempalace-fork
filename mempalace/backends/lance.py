@@ -888,7 +888,7 @@ class SemanticDeduplicator:
             if best_similarity >= self.low_threshold:
                 if not _dedup_scope_matches(meta, best_meta):
                     return i, ("unique", None)
-                if (meta.get("room") == best_meta.get("room") or
+                if (meta.get("room") == best_meta.get("room") and
                         meta.get("wing") == best_meta.get("wing")):
                     return i, ("conflict", best_id)
                 return i, ("unique", None)

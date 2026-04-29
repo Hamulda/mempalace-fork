@@ -3,9 +3,7 @@ from __future__ import annotations
 """
 Code intelligence tools: search_code, auto_search, file_context, project_context.
 """
-import os
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from fastmcp import Context
 
@@ -72,6 +70,38 @@ def _filter_by_project_path(docs: list, metas: list, project_path: str) -> list:
     return result
 
 
+def _is_path_allowed(file_path: str, project_path: str | None, allow_any: bool, allowed_roots: str) -> bool:
+    """Check if file_path is within an allowed root.
+
+    Resolves symlinks and normalizes paths before comparison.
+    Returns True if:
+      - allow_any is True (preserves old permissive behavior); OR
+      - project_path is provided and file_path is under it; OR
+      - file_path is under any colon-separated allowed_root.
+
+    Path traversal (../) is resolved before checking, so
+    /proj/../etc/hosts resolves to /etc/hosts and is denied if outside roots.
+    """
+    if allow_any:
+        return True
+
+    p_resolved = str(Path(file_path).expanduser().resolve())
+
+    if project_path:
+        if _source_file_matches(p_resolved, project_path):
+            return True
+
+    if allowed_roots:
+        for root in allowed_roots.split(":"):
+            root = root.strip()
+            if not root:
+                continue
+            if _source_file_matches(p_resolved, root):
+                return True
+
+    return False
+
+
 # =============================================================================
 # TOOL REGISTRATION
 # =============================================================================
@@ -82,7 +112,7 @@ def register_code_tools(server, backend, config, settings):
     Register all code-intel @mcp.tool() as closures.
     Called by factory._register_tools().
     """
-    from ..searcher import code_search_async, auto_search, is_code_query, hybrid_search_async, _compute_repo_rel_path
+    from ..searcher import code_search_async, is_code_query, hybrid_search_async, _compute_repo_rel_path
 
     def _get_collection(create=False):
         try:
@@ -160,9 +190,16 @@ def register_code_tools(server, backend, config, settings):
         line_start: int | None = None,
         line_end: int | None = None,
         context_lines: int = 5,
+        project_path: str | None = None,
     ) -> dict:
         """
         Read a file with surrounding context lines.
+
+        Security: by default (MEMPALACE_FILE_CONTEXT_ALLOW_ANY=0), reads are
+        restricted to files under project_path (if provided) or any path in
+        MEMPALACE_ALLOWED_ROOTS (colon-separated). Path traversal (../) is
+        resolved before the check. Set MEMPALACE_FILE_CONTEXT_ALLOW_ANY=1 to
+        restore the old permissive behavior.
 
         Args:
             file_path: Absolute path to the file to read.
@@ -171,12 +208,24 @@ def register_code_tools(server, backend, config, settings):
             context_lines: Number of extra lines to include around the range
                 (default 5). Applied on both sides when line_start/line_end
                 are specified.
+            project_path: Optional root to scope the read to. If provided and
+                MEMPALACE_FILE_CONTEXT_ALLOW_ANY=0, only files under this path
+                are allowed.
 
         Returns:
             dict with file_path, total_lines, range_start, range_end,
             has_more_before, has_more_after, and lines list with
             line_num and text for each line in the slice.
         """
+        # Security check — path traversal (..) resolved by Path().resolve()
+        if not _is_path_allowed(
+            file_path,
+            project_path,
+            settings.file_context_allow_any,
+            settings.file_context_allowed_roots,
+        ):
+            return {"error": "file_context denied: path is outside allowed roots"}
+
         p = Path(file_path).expanduser().resolve()
         if not p.exists():
             return {"error": f"File not found: {file_path}"}

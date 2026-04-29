@@ -6,6 +6,7 @@ Verifies that code/repo chunks are only deduplicated within the same source_file
 (and optionally same chunk_index), and never across projects or files.
 """
 
+import os
 import pytest
 
 pytest.importorskip("lancedb", reason="LanceDB required for mempalace.backends.lance")
@@ -123,6 +124,8 @@ class TestClassifyBatchScope:
             }
         ])
 
+        os.environ["MEMPALACE_DEDUP_HIGH"] = "0.92"
+        os.environ["MEMPALACE_DEDUP_LOW"] = "0.82"
         sd = SemanticDeduplicator(high_threshold=0.92, low_threshold=0.82)
         docs = ["projA login implementation"]
         metas = [{"source_file": "/projA/src/auth.py", "chunk_index": 0,

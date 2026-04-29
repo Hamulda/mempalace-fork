@@ -77,6 +77,9 @@ def _mock_embed_for_all_tests():
 
     # Disable MEMPALACE_COALESCE_MS to avoid 500ms window delays in tests
     os.environ.setdefault("MEMPALACE_COALESCE_MS", "0")
+    # Prevent cross-project conflict classification in tests (low=0 means
+    # only exact duplicates above high_threshold are deduplicated)
+    os.environ.setdefault("MEMPALACE_DEDUP_LOW", "0.0")
 
     yield
 

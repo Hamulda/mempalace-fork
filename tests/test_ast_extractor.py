@@ -54,7 +54,7 @@ def standalone():
         assert by_name["standalone"]["parent"] is None
         assert by_name["standalone"]["fqn"] == "standalone"
 
-        if backend == "tree_sitter":
+        if backend in ("tree_sitter", "stdlib_ast"):
             # Outer is top-level class
             assert by_name["Outer"]["parent"] is None
             assert by_name["Outer"]["fqn"] == "Outer"
@@ -104,7 +104,7 @@ class Bar:
         result = extract_code_structure(code, "test.py")
 
         assert "extraction_backend" in result
-        assert result["extraction_backend"] in ("tree_sitter", "regex")
+        assert result["extraction_backend"] in ("tree_sitter", "stdlib_ast", "regex")
 
     def test_extract_symbols_shim_returns_legacy_format(self):
         """Legacy extract_symbols shim returns name/type/line fields."""
@@ -214,7 +214,7 @@ def standalone():
         rows = si.get_file_symbols("/test/file.py")
 
         symbols = rows["symbols"]
-        assert rows["extraction_backend"] in ("tree_sitter", "regex")
+        assert rows["extraction_backend"] in ("tree_sitter", "stdlib_ast", "regex")
 
         # Container class
         container = next((s for s in symbols if s["name"] == "Container"), None)
@@ -309,7 +309,7 @@ class Outer:
         result = si.get_file_symbols("/test/rich.py")
 
         assert "extraction_backend" in result
-        assert result["extraction_backend"] in ("tree_sitter", "regex")
+        assert result["extraction_backend"] in ("tree_sitter", "stdlib_ast", "regex")
         assert "parent_symbols" in result
         assert "fqns" in result
         assert isinstance(result["parent_symbols"], list)
@@ -369,7 +369,7 @@ class MyClass:
             result = extract_code_structure(code, "test.py")
         names = {s["name"] for s in result["symbols"]}
         assert "Foo" in names
-        assert result["extraction_backend"] == "regex"
+        assert result["extraction_backend"] in ("regex", "stdlib_ast")
 
     def test_import_only_file_no_duplicate_errors(self):
         """Import-only file (no symbols) stores placeholder row without error."""
