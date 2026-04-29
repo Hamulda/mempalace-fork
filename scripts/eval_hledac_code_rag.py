@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+from pathlib import Path
 """
 eval_hledac_code_rag.py -- MemPalace Real-World Code-RAG Evaluation against Hledac
 
@@ -32,8 +34,6 @@ Exit codes:
     4  = swap detected on M1 (use --force to override)
 """
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
@@ -48,6 +48,10 @@ from typing import Any
 # --------------------------------------------------------------------------- #
 # Path setup                                                                  #
 # --------------------------------------------------------------------------- #
+
+
+# Source-code-first ranking constants
+(_CODE_EXTENSIONS, _PROSE_EXTENSIONS) = (frozenset({".py",".js",".ts",".tsx",".jsx",".go",".rs",".java",".c",".cpp",".h",".hpp",".cs",".rb",".php",".swift",".kt"}), frozenset({".md",".txt",".rst",".html",".xml",".json",".yaml",".yml",".toml"}))
 
 _REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
@@ -434,6 +438,7 @@ async def _eval_project(
             "latency_ms": round(latency, 1),
             "status": status,
             "top_sources": top_srcs,
+            "top_source_exts": [Path(h.get("source_file","?")).suffix for h in results_list[:3]],
         })
 
         t1_str = "✓" if t1 >= 1.0 else "✗"
@@ -462,6 +467,19 @@ async def _eval_project(
     lat_avg = sum(r["latency_ms"] for r in rows) / n
     total_leaks = sum(r["leak"] for r in rows)
 
+    # Source-code-first ranking metrics
+    source_code_top1 = 0
+    docs_top1 = 0
+    for r in rows:
+        exts = r.get("top_source_exts", [])
+        top_ext = exts[0] if exts else ""
+        if top_ext in _CODE_EXTENSIONS:
+            source_code_top1 += 1
+        elif top_ext in _PROSE_EXTENSIONS:
+            docs_top1 += 1
+    source_code_top1_pct = source_code_top1 / n if n else 0
+    docs_top1_pct = docs_top1 / n if n else 0
+
     print(f"\n{'─'*70}")
     print(f"  METRIC                    VALUE       THRESHOLD   STATUS")
     print(f"{'─'*70}")
@@ -479,8 +497,9 @@ async def _eval_project(
           f"{'PASS' if zero_pct <= 0.3 else 'FAIL'}")
     print(f"  cross_project_leak_count  {total_leaks:<8}     <= 0          "
           f"{'PASS' if total_leaks == 0 else 'FAIL'}")
-    print(f"{'─'*70}")
-
+    print(f"  source_code_top1_pct     {source_code_top1_pct:6.2%}       (code ext top1)")
+    print(f"  docs_top1_pct             {docs_top1_pct:6.2%}       (prose ext top1)")
+    print(f"─" * 70)
     all_pass = (
         top1_avg >= 0.5
         and top5_avg >= 0.6
@@ -502,6 +521,8 @@ async def _eval_project(
                 "zero_result_count": zero_result_count,
                 "zero_result_pct": round(zero_pct, 4),
                 "cross_project_leak_count": total_leaks,
+                "source_code_top1_pct": round(source_code_top1_pct, 4),
+                "docs_top1_pct": round(docs_top1_pct, 4),
             },
             "thresholds": {
                 "top1_file_hit_min": 0.5,

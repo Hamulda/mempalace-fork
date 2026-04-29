@@ -675,6 +675,7 @@ async def hybrid_search_async(
 
         # RRF merge
         merged = _rrf_merge([hits, fts5_hits, kg_hits])[:n_results]
+        merged = _apply_code_boost(merged, query, "mixed")
 
         return {
             "query": query,
@@ -1187,6 +1188,7 @@ def code_search(
                                     language=language, file_path=file_path,
                                     project_path=project_path)
         if hits:
+            hits = _apply_code_boost(hits, query, intent)
             return {
                 "query": query, "filters": kind, "results": hits[:n_results],
                 "sources": {"symbol_index": len(hits)},
@@ -1217,6 +1219,7 @@ def code_search(
         merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
         source_files = [h.get("source_file", "") for h in merged]
         merged = _add_repo_rel_path(merged, source_files)
+        merged = _apply_code_boost(merged, query, intent)
         # Belt-and-suspenders project_path filter
         if project_path:
             merged = [h for h in merged if _source_file_matches(h.get("source_file", ""), project_path)]
@@ -1275,6 +1278,7 @@ def code_search(
     merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
     source_files = [h.get("source_file", "") for h in merged]
     merged = _add_repo_rel_path(merged, source_files)
+    merged = _apply_code_boost(merged, query, intent)
     # Belt-and-suspenders project_path filter
     if project_path:
         merged = [h for h in merged if _source_file_matches(h.get("source_file", ""), project_path)]
@@ -1347,6 +1351,7 @@ async def auto_search(
         # Fall back to code_search if FTS5 finds nothing — inject complexity into result
         result = await code_search_async(query, palace_path, n_results=n_results)
         result["filters"]["complexity"] = complexity
+        result["results"] = _apply_code_boost(result["results"], query, result.get("filters", {}).get("intent", "mixed"))
         return result
     elif complexity == "code":
         # code_search returns its own filters dict — inject complexity
@@ -1358,4 +1363,89 @@ async def auto_search(
         result = await hybrid_search_async(query, palace_path, n_results=n_results)
         result["filters"]["complexity"] = complexity
         return result
+
+# =============================================================================
+# SOURCE-CODE-FIRST RANKING
+# =============================================================================
+
+_CODE_EXTENSIONS = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt"})
+_PROSE_EXTENSIONS = frozenset({".md", ".txt", ".rst", ".html", ".htm", ".xml", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg"})
+_PROSE_PATH_PREFIXES = frozenset({"docs/", "reports/", "logs/", "observations/", "probe_", ".git/", "__pycache__/", "node_modules/", ".venv/", "venv/", ".env/"})
+_CODE_CHUNK_KINDS = frozenset({"function", "class", "method", "import", "code_block", "mixed"})
+_PROSE_CHUNK_KINDS = frozenset({"comment", "docstring", "prose"})
+
+
+
+def _code_relevance_boost(hit: dict, query: str, intent: str) -> float:
+    """
+    Deterministic boost for source-code preference on code queries.
+
+    Applied after RRF merge as a multiplicative factor on rrf_score.
+    Smaller boosts avoid rank inversion on high-signal hits.
+
+    Args:
+        hit: result dict with source_file, language, chunk_kind, symbol_name, line_start
+        query: original query string
+        intent: one of symbol, code_exact, code_semantic, mixed, memory, path
+    """
+    code_intents = {"symbol", "code_exact", "code_semantic", "mixed"}
+    memory_intents = {"memory"}
+
+    # Memory queries: minimal code preference
+    if intent in memory_intents:
+        ext = Path(hit.get("source_file", "")).suffix.lower()
+        return 1.05 if ext in _CODE_EXTENSIONS else 1.0
+
+    if intent not in code_intents:
+        return 1.0
+
+    sf = hit.get("source_file", "") or ""
+    ext = Path(sf).suffix.lower() if sf else ""
+
+    boost = 1.0
+
+    # Extension-based
+    if ext in _CODE_EXTENSIONS:
+        boost *= 1.25
+    elif ext in _PROSE_EXTENSIONS:
+        boost *= 0.55
+    else:
+        for pp in _PROSE_PATH_PREFIXES:
+            if pp in sf.lower():
+                boost *= 0.45
+                break
+
+    # Language-based
+    lang = (hit.get("language") or "").lower()
+    if lang in ("python", "javascript", "typescript", "go", "rust", "java", "c", "cpp", "ruby", "swift", "kotlin", "php", "c#"):
+        boost *= 1.12
+
+    # chunk_kind signal
+    chunk_kind = hit.get("chunk_kind", "") or ""
+    if chunk_kind in _CODE_CHUNK_KINDS:
+        boost *= 1.18
+    elif chunk_kind in _PROSE_CHUNK_KINDS:
+        boost *= 0.60
+
+    # symbol_name presence
+    if hit.get("symbol_name"):
+        boost *= 1.20
+
+    # line_start > 0
+    line_start = hit.get("line_start", 0) or 0
+    if line_start > 0:
+        boost *= 1.10
+
+    return boost
+
+
+def _apply_code_boost(hits: list[dict], query: str, intent: str) -> list[dict]:
+    """Apply source-code boost and re-sort by boosted rrf_score."""
+    if not hits:
+        return hits
+    for hit in hits:
+        boost = _code_relevance_boost(hit, query, intent)
+        hit["rrf_score"] = hit.get("rrf_score", 0.0) * boost
+    hits.sort(key=lambda h: h.get("rrf_score", 0.0), reverse=True)
+    return hits
 
