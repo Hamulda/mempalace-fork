@@ -1,11 +1,71 @@
 @~/.claude/RTK.md
 
-## Shell Commands
-Always use shell commands instead of built-in tools when possible:
-- Use `cat file` instead of Read tool
-- Use `rg pattern` instead of Grep tool
-- Use `find` instead of Glob tool
-This ensures RTK hook can compress outputs before they reach context.
+<!-- context-mode v1 -->
+## Context-Mode Defaults (Token Budget)
+
+**Rule: ctx_execute for analysis, Read only for editing.**
+
+| Situation | Tool | Why |
+|-----------|------|-----|
+| CLI output, API calls, test runs | `ctx_execute` | Token-filtered, sandboxed |
+| File content for analysis | `ctx_execute_file` | Summary only enters context |
+| Large log/data files | `ctx_execute_file` | Process in sandbox, print findings |
+| Fetching web docs | `ctx_fetch_and_index` | Indexed, searchable, no raw HTML |
+| File to edit | `Read` | Need full content to modify |
+| Git writes, mkdir, navigation | `Bash` | Whitelisted, safe |
+| Playwright snapshots | `browser_snapshot(filename)` + `ctx_index` | Never raw to context |
+
+**Decision tree:**
+```
+About to run a command or read a file?
+├── Bash whitelist (git, mkdir, cd)? → Bash
+├── Edit this file? → Read
+├── Analyze output / run tests / call API? → ctx_execute
+├── Read file for analysis (not editing)? → ctx_execute_file
+└── Web fetch? → ctx_fetch_and_index
+```
+
+**Why this matters here:** `/clear` rate is 4.5/session. Context overflow is the primary efficiency loss. Every large raw output that enters context unfiltered costs tokens permanently. RTK compresses Bash output; it cannot compress tool output already in context.
+
+**Bash whitelist (safe to run directly):**
+- File mutations: `mkdir`, `mv`, `cp`, `rm`, `touch`, `chmod`
+- Git writes: `git add`, `git commit`, `git push`, `git checkout`, `git branch`, `git merge`
+- Navigation: `cd`, `pwd`, `which`
+- Process control: `kill`, `pkill`
+- Package management: `npm install`, `pip install`
+
+## Skill Activation Triggers
+
+**Invoke before the work, not after:**
+
+| Before... | Invoke | Why |
+|-----------|--------|-----|
+| Python async, performance, patterns | `/python-development:async-python-patterns` | Avoid async anti-patterns from day 1 |
+| Python perf work | `/python-development:python-performance-optimization` | Profile first, then optimize |
+| Python design decisions | `/python-development:python-design-patterns` | KISS, DRY, SOLID checks |
+| Python resource management | `/python-development:python-resource-management` | Memory, context managers |
+| Agent team work | `/agent-teams:team-composition-patterns` | Right size, right agents |
+| Team communication | `/agent-teams:team-communication-protocols` | Avoid broadcast spam, use shutdown protocol |
+| Multi-reviewer work | `/agent-teams:team-review` | Parallel review dimensions |
+| SQL work | `/developer-essentials:sql-optimization-patterns` | Index hints, query plans |
+| E2E testing | `/developer-essentials:e2e-testing-patterns` | Playwright best practices |
+| Code quality review | `/python-development:python-anti-patterns` | Catch anti-patterns before they land |
+| Memory/codebase graph | `/codebase-memory-quality` | Check graph health before critical work |
+
+## File Read Discipline
+
+**Analyze with ctx_execute_file, not Read.** Read dumps full content into context. ctx_execute_file processes in sandbox and prints only findings.
+
+| Goal | Wrong | Right |
+|------|-------|-------|
+| Find a pattern across files | Read 10 files | `ctx_execute_file` + grep in sandbox |
+| Count lines/functions | Read the file | `ctx_execute_file` with analysis code |
+| Read a log file | Read 500-line log | `ctx_execute_file` → extract errors only |
+| Parse JSON/CSV data | Read into context | `ctx_execute_file` → process and print summary |
+| Review diff | Read full diff | `ctx_execute_file` → summarize changes |
+
+**Exception:** Read is correct when you intend to Edit the file next. Context needs the full content to compute the edit.
+<!-- /context-mode -->
 
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands

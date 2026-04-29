@@ -45,6 +45,12 @@ CACHE_DIR = os.path.expanduser("~/.cache/fastembed")
 # This prevents OOM when 6 parallel Claude Code sessions each send large batches.
 MAX_BATCH = 32  # baseline — adaptive sizing via _get_embed_batch_size()
 
+# Request-size guards — prevent oversized requests from causing memory pressure or OOM.
+# Configurable via environment variables.
+MAX_REQUEST_BYTES = int(os.environ.get("MEMPALACE_EMBED_MAX_REQUEST_BYTES", "2_000_000"))
+MAX_TEXTS = int(os.environ.get("MEMPALACE_EMBED_MAX_TEXTS", "512"))
+MAX_CHARS_PER_TEXT = int(os.environ.get("MEMPALACE_EMBED_MAX_CHARS_PER_TEXT", "8192"))
+
 
 def _get_embed_batch_size() -> int:
     """
@@ -200,7 +206,7 @@ def _daemon_sanitize_embeddings(
     Raises RuntimeError if an embedding is all-invalid (cannot be repaired).
     """
     repaired = 0
-    for emb in embeddings:
+    for i, emb in enumerate(embeddings):
         has_bad = any(not math.isfinite(v) for v in emb)
         if not has_bad:
             continue
@@ -211,6 +217,7 @@ def _daemon_sanitize_embeddings(
             factor = 1.0 / norm
             for idx in range(len(cleaned)):
                 cleaned[idx] *= factor
+            embeddings[i] = cleaned
             repaired += 1
             logger.debug("Daemon repaired NaN/Inf embedding [%d values]", sum(1 for v in emb if not math.isfinite(v)))
         else:
@@ -246,6 +253,15 @@ def _handle_client(conn: socket.socket, model) -> None:
             raw_len += chunk
         msg_len = int.from_bytes(raw_len, "big")
 
+        # Guard: reject oversized msg_len before reading body
+        if msg_len > MAX_REQUEST_BYTES:
+            err = json.dumps({
+                "embeddings": [],
+                "error": f"Request too large: {msg_len} bytes (max {MAX_REQUEST_BYTES})",
+            }).encode("utf-8")
+            conn.sendall(len(err).to_bytes(4, "big") + err)
+            return
+
         # Read message body
         data = b""
         while len(data) < msg_len:
@@ -255,7 +271,42 @@ def _handle_client(conn: socket.socket, model) -> None:
             data += chunk
 
         request = json.loads(data.decode("utf-8"))
-        texts: List[str] = request.get("texts", [])
+
+        # Guard: validate texts structure
+        texts = request.get("texts", [])
+        if not isinstance(texts, list):
+            err = json.dumps({
+                "embeddings": [],
+                "error": f"Expected 'texts' to be a list, got {type(texts).__name__}",
+            }).encode("utf-8")
+            conn.sendall(len(err).to_bytes(4, "big") + err)
+            return
+
+        # Guard: reject too many texts
+        if len(texts) > MAX_TEXTS:
+            err = json.dumps({
+                "embeddings": [],
+                "error": f"Too many texts: {len(texts)} (max {MAX_TEXTS})",
+            }).encode("utf-8")
+            conn.sendall(len(err).to_bytes(4, "big") + err)
+            return
+
+        # Guard: reject any text exceeding char limit
+        for i, text in enumerate(texts):
+            if not isinstance(text, str):
+                err = json.dumps({
+                    "embeddings": [],
+                    "error": f"texts[{i}] is not a string (got {type(text).__name__})",
+                }).encode("utf-8")
+                conn.sendall(len(err).to_bytes(4, "big") + err)
+                return
+            if len(text) > MAX_CHARS_PER_TEXT:
+                err = json.dumps({
+                    "embeddings": [],
+                    "error": f"texts[{i}] too long: {len(text)} chars (max {MAX_CHARS_PER_TEXT})",
+                }).encode("utf-8")
+                conn.sendall(len(err).to_bytes(4, "big") + err)
+                return
 
         if not texts:
             response = {"embeddings": [], "error": None}
@@ -364,7 +415,10 @@ def run_embed_doctor() -> dict:
     dims = 256
     print(f"Provider:  {provider}")
     print(f"Model ID:  {model_id}")
-    print(f"Dims:      {dims}\n")
+    print(f"Dims:      {dims}")
+    print(f"Max request bytes: {MAX_REQUEST_BYTES:,}")
+    print(f"Max texts:        {MAX_TEXTS:,}")
+    print(f"Max chars/text:   {MAX_CHARS_PER_TEXT:,}\n")
 
     sock_path = get_socket_path()
     pid_path = get_pid_path()

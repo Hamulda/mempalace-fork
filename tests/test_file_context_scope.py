@@ -11,7 +11,82 @@ import os
 import tempfile
 from pathlib import Path
 
-from mempalace.server._code_tools import _is_path_allowed, _source_file_matches
+from mempalace.server._code_tools import _is_path_allowed, _source_file_matches, _path_is_under_or_equal
+
+
+class TestPathIsUnderOrEqual:
+    """Unit tests for the strict security helper _path_is_under_or_equal."""
+
+    def test_exact_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            assert _path_is_under_or_equal(d, d)
+
+    def test_subdirectory_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            assert _path_is_under_or_equal(f"{d}/src/auth.py", d)
+            assert _path_is_under_or_equal(f"{d}/src/utils/helpers.py", d)
+
+    def test_parent_traversal_denied(self):
+        with tempfile.TemporaryDirectory() as d:
+            # /tmp/proj/../etc → should NOT be under /tmp/proj
+            assert not _path_is_under_or_equal(f"{d}/../etc/hosts", d)
+
+    def test_sibling_dir_denied(self):
+        with tempfile.TemporaryDirectory() as d:
+            sibling = tempfile.gettempdir()
+            # sibling is not under d
+            assert not _path_is_under_or_equal(f"{sibling}/foo.py", d)
+
+    def test_basename_only_not_enough(self):
+        """A file whose basename matches the project_path must still be denied.
+
+        E.g. project_path=/tmp/proj, file_path=/etc/passwd
+        /etc/passwd is NOT under /tmp/proj even though "passwd" ≠ "proj".
+        """
+        with tempfile.TemporaryDirectory() as proj:
+            # /etc/passwd is not under proj even if basenames differ
+            assert not _path_is_under_or_equal("/etc/passwd", proj)
+
+    def test_proj_old_not_matching_proj(self):
+        """Ensure /proj-old does not match /proj via substring heuristic.
+
+        Strict containment requires commonpath to equal root, not just overlap.
+        """
+        with tempfile.TemporaryDirectory() as proj:
+            proj_old = proj + "-old"
+            Path(proj_old).mkdir(exist_ok=True)
+            assert not _path_is_under_or_equal(f"{proj_old}/auth.py", proj)
+            assert not _path_is_under_or_equal(proj_old, proj)
+
+    def test_traversal_outside_denied(self):
+        with tempfile.TemporaryDirectory() as d:
+            assert not _path_is_under_or_equal(f"{d}/../foo.py", d)
+            assert not _path_is_under_or_equal(f"{d}/src/../../etc/hosts", d)
+
+    def test_traversal_inside_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(f"{d}/src").mkdir()
+            assert _path_is_under_or_equal(f"{d}/src/../src/auth.py", d)
+
+    def test_symlink_to_subdir_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "real"
+            real.mkdir()
+            link = Path(d) / "link"
+            link.symlink_to(real)
+            assert _path_is_under_or_equal(str(link), d)
+
+    def test_symlink_outside_denied(self):
+        with tempfile.TemporaryDirectory() as d:
+            other = tempfile.gettempdir()
+            link = Path(d) / "evil_link"
+            link.symlink_to(other)
+            assert not _path_is_under_or_equal(str(link), d)
+
+    def test_invalid_path_returns_false(self):
+        """OSError or ValueError from path resolution returns False safely."""
+        assert not _path_is_under_or_equal("", "/tmp")
+        assert not _path_is_under_or_equal("/nonexistent", "")
 
 
 class TestSourceFileMatches:
@@ -119,6 +194,33 @@ class TestIsPathAllowedProjectPath:
         # Even with empty allowed_roots, project_path alone grants access
         with tempfile.TemporaryDirectory() as proj:
             assert _is_path_allowed(f"{proj}/x.py", project_path=proj, allow_any=False, allowed_roots="")
+
+    def test_same_basename_outside_project_path_denied(self):
+        """Files outside project_path with the same basename must be blocked.
+
+        e.g. project_path=/tmp/proj/auth.py, file_path=/etc/auth.py
+        /etc/auth.py must NOT be allowed via basename heuristic.
+        """
+        with tempfile.TemporaryDirectory() as proj:
+            auth_in_proj = f"{proj}/auth.py"
+            Path(auth_in_proj).touch()
+            # /etc/auth.py has same basename "auth.py" but is outside proj
+            assert not _is_path_allowed("/etc/auth.py", project_path=auth_in_proj, allow_any=False, allowed_roots="")
+            # Also test sibling directory with same basename
+            sibling = Path(tempfile.gettempdir()) / "other_project"
+            sibling.mkdir(exist_ok=True)
+            sibling_auth = sibling / "auth.py"
+            sibling_auth.touch()
+            assert not _is_path_allowed(str(sibling_auth), project_path=auth_in_proj, allow_any=False, allowed_roots="")
+
+    def test_proj_old_not_matching_proj(self):
+        """Directory with -old suffix must not match the base project directory."""
+        with tempfile.TemporaryDirectory() as proj:
+            proj_old = Path(f"{proj}-old")
+            proj_old.mkdir()
+            (proj_old / "auth.py").touch()
+            # /proj-old/auth.py is NOT under /proj
+            assert not _is_path_allowed(str(proj_old / "auth.py"), project_path=proj, allow_any=False, allowed_roots="")
 
 
 class TestIsPathAllowedTraversal:

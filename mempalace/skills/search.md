@@ -32,8 +32,12 @@ mempalace_file_symbols(file_path="/src/myfile.py")
 
 If MCP tools are available, use them in this priority order:
 
-- mempalace_auto_search(query, n_results) -- Auto-detects code vs prose, routes automatically.
+- mempalace_auto_search(query, n_results, project_path) -- Auto-detects code vs prose, routes automatically.
   Use this as the DEFAULT entry point for unknown query types.
+  **Pass `project_path` when Claude Code has an active project context** — this
+  pushes the scope into the retrieval layer so cross-project results are excluded
+  at the source. All code-search tools (`mempalace_search_code`,
+  `mempalace_project_context`) also support `project_path`.
 - mempalace_search(query, wing, room, rerank, is_latest, agent_id) -- Fast semantic search.
   Use for keyword/topic search. rerank=True for better precision on complex queries.
 - mempalace_hybrid_search(query, wing, room, use_kg, rerank) -- Hybrid search combining
@@ -63,9 +67,14 @@ If MCP tools are not available, fall back to the CLI:
 | Symbol lookup | "where is process_file defined" | mempalace_find_symbol |
 | Caller search | "who calls validate_token" | mempalace_callers |
 | Code search | "find Python code about auth" | mempalace_code_search |
-| Semantic | "sessions don't expire correctly" | mempalace_auto_search |
+| Semantic (project-scoped) | "how does auth work" | mempalace_auto_search + project_path |
+| Semantic (global) | "sessions don't expire correctly" | mempalace_auto_search |
 | Entity/fact | "what did we decide about JWT" | mempalace_hybrid_search |
 | File symbols | "what's in auth.py" | mempalace_file_symbols |
+
+**Tip:** When Claude Code has an active project, always pass `project_path` to
+`mempalace_auto_search` or `mempalace_search_code` — the scope is applied at
+the retrieval layer, preventing cross-project leakage before results are ranked.
 
 ## Recent Changes Awareness
 

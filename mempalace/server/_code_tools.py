@@ -12,6 +12,44 @@ from fastmcp import Context
 # =============================================================================
 
 
+def _path_is_under_or_equal(file_path: str, root: str) -> bool:
+    """Strict path containment check for security decisions.
+
+    Returns True only if file_path is at or under root in the filesystem tree.
+    Uses resolved (symlink-free) absolute paths and commonpath comparison.
+
+    Rules:
+    - Resolves both paths via Path().expanduser().resolve()
+    - Allows exact equality: file == root
+    - Allows subtree: commonpath([file, root]) == root
+    - No basename-only matching (prevents /etc/passwd matching via "passwd" substring)
+    - Returns False safely on ValueError (invalid paths, access denied)
+    """
+    try:
+        f_resolved = Path(file_path).expanduser().resolve()
+        r_resolved = Path(root).expanduser().resolve()
+    except (OSError, ValueError):
+        return False
+
+    try:
+        # Manual commonpath: find the longest common prefix of both paths
+        f_parts = f_resolved.parts
+        r_parts = r_resolved.parts
+        common_len = 0
+        min_len = min(len(f_parts), len(r_parts))
+        for i in range(min_len):
+            if f_parts[i].lower() == r_parts[i].lower():
+                common_len += 1
+            else:
+                break
+        if common_len == 0:
+            return False
+        common = Path(*f_parts[:common_len])
+        return common == r_resolved
+    except (OSError, ValueError):
+        return False
+
+
 def _source_file_matches(source_file: str, project_path: str) -> bool:
     """Check if source_file is inside or matches the project path.
 
@@ -81,6 +119,10 @@ def _is_path_allowed(file_path: str, project_path: str | None, allow_any: bool, 
 
     Path traversal (../) is resolved before checking, so
     /proj/../etc/hosts resolves to /etc/hosts and is denied if outside roots.
+
+    Security: uses strict path containment (_path_is_under_or_equal) to prevent
+    basename-only matching attacks (e.g. /etc/passwd slipping through via "passwd"
+    substring match). Retrieval still uses loose _source_file_matches.
     """
     if allow_any:
         return True
@@ -88,7 +130,7 @@ def _is_path_allowed(file_path: str, project_path: str | None, allow_any: bool, 
     p_resolved = str(Path(file_path).expanduser().resolve())
 
     if project_path:
-        if _source_file_matches(p_resolved, project_path):
+        if _path_is_under_or_equal(p_resolved, project_path):
             return True
 
     if allowed_roots:
@@ -96,7 +138,7 @@ def _is_path_allowed(file_path: str, project_path: str | None, allow_any: bool, 
             root = root.strip()
             if not root:
                 continue
-            if _source_file_matches(p_resolved, root):
+            if _path_is_under_or_equal(p_resolved, root):
                 return True
 
     return False
@@ -162,7 +204,12 @@ def register_code_tools(server, backend, config, settings):
         )
 
     @server.tool(timeout=settings.timeout_read)
-    async def mempalace_auto_search(ctx: Context, query: str, limit: int = 10) -> dict:
+    async def mempalace_auto_search(
+        ctx: Context,
+        query: str,
+        limit: int = 10,
+        project_path: str | None = None,
+    ) -> dict:
         """
         Unified search that automatically routes to the best retrieval strategy.
 
@@ -170,18 +217,29 @@ def register_code_tools(server, backend, config, settings):
         - Code query → mempalace_search_code (vector similarity)
         - General query → hybrid_search_async (FTS5 + vector + KG)
 
+        When project_path is supplied, code_search_async is called with it
+        so results are scoped to that project — recommended for Claude Code
+        tool calls that have an active project context.
+
         Args:
             query: Natural-language search query.
             limit: Maximum number of results to return (default 10).
+            project_path: Optional project root to scope results. When provided,
+                code searches are pushed down into the retrieval layer so
+                cross-project leakage is prevented at the source.
 
         Returns:
             Search results dict from the appropriate search strategy.
         """
-        return await code_search_async(
-            query=query, palace_path=settings.db_path, n_results=limit,
-        ) if is_code_query(query) else await hybrid_search_async(
-            query=query, palace_path=settings.db_path, n_results=limit,
-        )
+        if is_code_query(query) or project_path:
+            return await code_search_async(
+                query=query, palace_path=settings.db_path, n_results=limit,
+                project_path=project_path,
+            )
+        else:
+            return await hybrid_search_async(
+                query=query, palace_path=settings.db_path, n_results=limit,
+            )
 
     @server.tool(timeout=settings.timeout_read)
     def mempalace_file_context(
@@ -315,7 +373,10 @@ def register_code_tools(server, backend, config, settings):
                     hits = _symbol_first_search(
                         query, settings.db_path, col,
                         n_results=limit, language=language,
+                        project_path=project_path,
                     )
+                    # Belt-and-suspenders: filter by project_path in case SymbolIndex
+                    # returned results from another project before the push-down was added
                     if project_path:
                         hits = [h for h in hits if _source_file_matches(h.get("source_file", ""), project_path)]
                     for h in hits:

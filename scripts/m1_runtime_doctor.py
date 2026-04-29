@@ -52,7 +52,13 @@ if _PSUTIL_AVAILABLE:
     except Exception:
         pass
 
-# ── Import checks (lazy, no heavy model loads) ─────────────────────────────────
+# ── Import checks via find_spec (no model loads) ───────────────────────────────
+import importlib.util
+
+def _spec_available(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
 LANCEDB_VERSION: str | None = None
 LANCEDB_IMPORT_ERROR: str | None = None
 try:
@@ -77,14 +83,15 @@ try:
 except ImportError:
     pass
 
-FASTEMBED_AVAILABLE: bool = False
+# Fastembed can trigger model downloads — use find_spec only
+FASTEMBED_AVAILABLE: bool = _spec_available("fastembed")
 FASTEMBED_VERSION: str | None = None
-try:
-    import fastembed
-    FASTEMBED_AVAILABLE = True
-    FASTEMBED_VERSION = getattr(fastembed, '__version__', 'unknown')
-except ImportError:
-    pass
+if FASTEMBED_AVAILABLE:
+    try:
+        import fastembed
+        FASTEMBED_VERSION = getattr(fastembed, '__version__', 'unknown')
+    except ImportError:
+        FASTEMBED_AVAILABLE = False
 
 MLX_AVAILABLE: bool = False
 MLX_VERSION: str | None = None
@@ -95,12 +102,8 @@ try:
 except ImportError:
     pass
 
-SENTENCE_TRANSFORMERS_AVAILABLE: bool = False
-try:
-    import sentence_transformers
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    pass
+# sentence_transformers imports torch which is heavy on M1 — use find_spec only
+SENTENCE_TRANSFORMERS_AVAILABLE: bool = _spec_available("sentence_transformers")
 
 CHROMADB_IN_MODULES: bool = 'chromadb' in sys.modules
 
@@ -178,6 +181,8 @@ def get_report() -> dict:
         "mlx_available": MLX_AVAILABLE,
         "mlx_version": MLX_VERSION,
         "sentence_transformers_available": SENTENCE_TRANSFORMERS_AVAILABLE,
+        "heavy_imports_avoided": True,
+        "checked_by_spec": ["fastembed", "sentence_transformers"],
         "chromadb_in_modules": CHROMADB_IN_MODULES,
         "default_backend": BACKEND,
         "palace_path": PALACE_PATH,

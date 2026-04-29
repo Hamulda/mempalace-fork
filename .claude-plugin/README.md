@@ -10,7 +10,7 @@ A Claude Code plugin that gives your AI a persistent memory system powered by Me
 
 ## Prerequisites
 
-- Python 3.14 (the target version; 3.9+ is the minimum)
+- Python 3.14 (the target and minimum version)
 - MemPalace installed: `pip install git+https://github.com/Hamulda/mempalace-fork`
 - Shared MemPalace MCP server (start manually with `mempalace serve --host 127.0.0.1 --port 8765`, or enable auto-start by registering the hooks in `settings.json` — see Hooks section below)
 

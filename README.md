@@ -84,6 +84,31 @@ Other memory systems try to fix this by letting AI decide what's worth rememberi
 
 ---
 
+---
+
+## Private Fork Runtime Truth
+
+This is a **private fork** for a single-user Claude Code RAG setup on MacBook Air M1 8GB.
+
+**Runtime constraints:**
+- Python 3.14 only (pyproject.toml `requires-python >= 3.14`)
+- LanceDB only — ChromaDB runtime has been removed
+- MacBook Air M1 8GB bounded mode is the primary target
+
+**How Claude Code connects:**
+- One shared HTTP MCP server at `http://127.0.0.1:8765/mcp`
+- Start manually: `mempalace serve --host 127.0.0.1 --port 8765`
+- Or enable auto-start via hook registration in `settings.json` (see `.claude-plugin/README.md`)
+
+**Plugin lifecycle truth:**
+- Hook lifecycle (`SessionStart`, `Stop`, `PreCompact`) depends on **manual registration** in `settings.json` — not automatic
+- The plugin provides skills + hooks; it does not auto-spawn an MCP server without registration
+- See `.claude-plugin/README.md` for the authoritative hook registration instructions
+
+**Docker/cloud:** not part of the intended hot path for this fork.
+
+---
+
 ## Quick Start
 
 ```bash
@@ -752,7 +777,7 @@ mempalace/
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.14 (from `requires-python >= 3.14` in pyproject.toml)
 - `lancedb>=0.20.0`
 - `fastembed>=0.4.0`
 - `pyyaml>=6.0`
@@ -776,7 +801,7 @@ MIT — see [LICENSE](LICENSE).
 <!-- Link Definitions -->
 [version-shield]: https://img.shields.io/badge/version-3.1.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/Hamulda/mempalace-fork/releases
-[python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
+[python-shield]: https://img.shields.io/badge/python-3.14-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/
 [license-shield]: https://img.shields.io/badge/license-MIT-b0e8ff?style=flat-square&labelColor=0a0e14
 [license-link]: https://github.com/Hamulda/mempalace-fork/blob/main/LICENSE
