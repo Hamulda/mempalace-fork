@@ -673,9 +673,11 @@ async def hybrid_search_async(
 
         hits = vector_results.get("results", [])
 
-        # RRF merge
-        merged = _rrf_merge([hits, fts5_hits, kg_hits])[:n_results]
+        # RRF merge, THEN boost, THEN slice — source code boost must be able to
+        # pull docs outside the initial top-k into the final results.
+        merged = _rrf_merge([hits, fts5_hits, kg_hits])
         merged = _apply_code_boost(merged, query, "mixed")
+        merged = merged[:n_results]
 
         return {
             "query": query,
@@ -1216,10 +1218,11 @@ def code_search(
         except Exception as e:
             logger.warning("Vector search in code_search (code_exact) failed: %s", e)
 
-        merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
+        merged = _rrf_merge([vector_hits, fts5_hits])
         source_files = [h.get("source_file", "") for h in merged]
         merged = _add_repo_rel_path(merged, source_files)
         merged = _apply_code_boost(merged, query, intent)
+        merged = merged[:n_results]
         # Belt-and-suspenders project_path filter
         if project_path:
             merged = [h for h in merged if _source_file_matches(h.get("source_file", ""), project_path)]
@@ -1275,10 +1278,11 @@ def code_search(
     except Exception as e:
         logger.warning("Vector search in code_search failed: %s", e)
 
-    merged = _rrf_merge([vector_hits, fts5_hits])[:n_results]
+    merged = _rrf_merge([vector_hits, fts5_hits])
     source_files = [h.get("source_file", "") for h in merged]
     merged = _add_repo_rel_path(merged, source_files)
     merged = _apply_code_boost(merged, query, intent)
+    merged = merged[:n_results]
     # Belt-and-suspenders project_path filter
     if project_path:
         merged = [h for h in merged if _source_file_matches(h.get("source_file", ""), project_path)]
