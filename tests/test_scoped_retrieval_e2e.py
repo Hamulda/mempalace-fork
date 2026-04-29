@@ -240,11 +240,12 @@ async def test_search_code_scoped_to_projA_only(scoped_client):
         {"query": "AuthManager", "project_path": projA_path, "limit": 20},
     )
     data = _get_result_data(result)
-    print(f"DIAG search_code AuthManager: data={data}")
+    if os.environ.get("MEMPALACE_TEST_DIAG") == "1":
+        print(f"DIAG search_code AuthManager: data={data}")
+        print(f"  chunks={len(chunks)}, intent={data.get('filters',{}).get('intent')}")
     assert data is not None, f"Got None result: {result}"
 
     chunks = data.get("results", data.get("chunks", []))
-    print(f"  chunks={len(chunks)}, intent={data.get('filters',{}).get('intent')}")
     projB_hits = [c for c in chunks if c.get("source_file", "").startswith(projB_path)]
     assert len(projB_hits) == 0, (
         f"project_path=projA returned {len(projB_hits)} projB chunks: "
@@ -333,11 +334,12 @@ async def test_semantic_query_scoped_to_projA_not_projB(scoped_client):
         },
     )
     data = _get_result_data(result)
-    print(f"DIAG semantic: data={data}")
+    if os.environ.get("MEMPALACE_TEST_DIAG") == "1":
+        print(f"DIAG semantic: data={data}")
+        print(f"  chunks={len(chunks)}, intent={data.get('intent')}, filters={data.get('filters')}")
     assert data is not None, f"Got None result: {result}"
 
     chunks = data.get("chunks", [])
-    print(f"DIAG semantic: chunks={len(chunks)}, intent={data.get('intent')}, filters={data.get('filters')}")
     projB_hits = [c for c in chunks if c.get("source_file", "").startswith(projB_path)]
     assert len(projB_hits) == 0, (
         f"semantic query for projA returned projB chunks: "
