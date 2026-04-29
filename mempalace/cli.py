@@ -314,9 +314,9 @@ def cmd_status(args):
     if backend_type == "chroma":
         print(f"Backend: chroma (LEGACY — no longer supported)")
         print(f"  ChromaDB backend has been removed. LanceDB is the only supported backend.")
-        print(f"  If you have existing ChromaDB data, migrate it first:")
-        print(f"    pip install chromadb")
-        print(f"    python -m mempalace.migrate chroma-to-lance --palace {palace_path}")
+        print(f"  If you have existing ChromaDB data, use an older release with Chroma")
+        print(f"  support to export your data, then re-mine source files into LanceDB.")
+        print(f"  In-build 'migrate chroma-to-lance' is not available in this build.")
         return
 
     if os.path.isdir(palace_path):

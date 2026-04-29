@@ -1,0 +1,143 @@
+{
+  "project": "/Users/vojtechhamada/PycharmProjects/Hledac/hledac/universal",
+  "palace": "/tmp/mempalace_hledac_eval",
+  "query_count": 18,
+  "metrics": {
+    "top1_file_hit": 0.0,
+    "top5_file_hit": 0.0556,
+    "avg_latency_ms": 241.31
+  },
+  "passed": false,
+  "thresholds": {
+    "top1_file_hit_min": 0.5,
+    "top5_file_hit_min": 0.6
+  },
+  "rows": [
+    {
+      "id": "run_sprint",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 500.6
+    },
+    {
+      "id": "DuckDBShadowStore",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 168.3
+    },
+    {
+      "id": "CanonicalFinding",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 648.2
+    },
+    {
+      "id": "live_public_pipeline",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 212.3
+    },
+    {
+      "id": "async_run_live_public_pipeline",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 340.8
+    },
+    {
+      "id": "MLXEmbeddingManager",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 248.4
+    },
+    {
+      "id": "PatternMatcher",
+      "top1": 0,
+      "top5": 1,
+      "result_count": 10,
+      "latency_ms": 389.4
+    },
+    {
+      "id": "_windup_synthesis",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 404.8
+    },
+    {
+      "id": "where is canonical sprint entrypoint",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 107.2
+    },
+    {
+      "id": "how are findings accepted into store",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 104.6
+    },
+    {
+      "id": "where does live public pipeline create CanonicalFinding",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 122.8
+    },
+    {
+      "id": "where is FTS or vector retrieval implemented",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 87.6
+    },
+    {
+      "id": "where is MLX memory cleanup handled",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 222.4
+    },
+    {
+      "id": "where is io-only latch or memory pressure handled",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 133.2
+    },
+    {
+      "id": "where can storage fail-soft happen",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 169.4
+    },
+    {
+      "id": "where are findings deduplicated",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 303.0
+    },
+    {
+      "id": "where are async tasks bounded",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 10,
+      "latency_ms": 135.3
+    },
+    {
+      "id": "where does export handoff happen",
+      "top1": 0,
+      "top5": 0,
+      "result_count": 0,
+      "latency_ms": 45.2
+    }
+  ]
+}
