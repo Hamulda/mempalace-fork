@@ -276,6 +276,12 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — skip files larger than this
 _MEMPALACE_MINE_BATCH_FILES = int(os.environ.get("MEMPALACE_MINE_BATCH_FILES", "8"))
 _MEMPALACE_MINE_BATCH_DRAWERS = int(os.environ.get("MEMPALACE_MINE_BATCH_DRAWERS", "256"))
 
+# Budget limits (0 = unlimited)
+_MEMPALACE_MINE_MAX_FILES = int(os.environ.get("MEMPALACE_MINE_MAX_FILES", "0"))
+_MEMPALACE_MINE_MAX_CHUNKS = int(os.environ.get("MEMPALACE_MINE_MAX_CHUNKS", "0"))
+_MEMPALACE_MINE_MAX_SECONDS = float(os.environ.get("MEMPALACE_MINE_MAX_SECONDS", "0"))
+_MEMPALACE_MINE_ABORT_ON_SWAP_MB = float(os.environ.get("MEMPALACE_MINE_ABORT_ON_SWAP_MB", "0"))
+
 # Language detection from file extension
 LANGUAGE_MAP = {
     ".py": "Python", ".pyi": "Python",
@@ -1450,6 +1456,29 @@ def scan_project(
 # =============================================================================
 
 
+def _get_swap_mb() -> float | None:
+    """Return current swap used in MB, or None if unavailable."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            # Output: "Physical: 512MB, Logical: 1GB, Used: 128M, Available: 896M"
+            output = result.stdout.strip()
+            # Find "Used: X" — parse "128M" or "1.2G"
+            import re
+            m = re.search(r"Used:\s+([0-9.]+)([MG])", output)
+            if m:
+                val = float(m.group(1))
+                unit = m.group(2)
+                return val * (1024 if unit == "G" else 1)
+    except Exception:
+        pass
+    return None
+
+
 def mine(
     project_dir: str,
     palace_path: str,
@@ -1459,8 +1488,8 @@ def mine(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
-):
-    """Mine a project directory into the palace."""
+) -> dict:
+    """Mine a project directory into the palace. Returns a partial mining report dict."""
     # Mining is daemon-only by default to prevent OOM on M1 8GB.
     # The in-process fallback model (~500MB) causes memory pressure.
     # User can override with: MEMPALACE_EMBED_FALLBACK=1 mempalace mine ...
@@ -1477,16 +1506,44 @@ def mine(
         respect_gitignore=respect_gitignore,
         include_ignored=include_ignored,
     )
+
+    # Budget: stop scanning after max_files
+    files_seen = len(files)
+    if _MEMPALACE_MINE_MAX_FILES > 0 and len(files) > _MEMPALACE_MINE_MAX_FILES:
+        files = files[:_MEMPALACE_MINE_MAX_FILES]
+
+    # CLI limit param: truncate after MAX_FILES budget so both can coexist
     if limit > 0:
         files = files[:limit]
+    files_seen = max(files_seen, len(files))  # files_seen reflects all scanned files
+
+    # Budget report (populated throughout the run)
+    budget_report = {
+        "completed": True,
+        "abort_reason": None,
+        "files_seen": files_seen,
+        "files_processed": 0,
+        "chunks_written": 0,
+        "elapsed_s": 0.0,
+        "swap_mb": None,
+    }
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
-    print(f"  Files:   {len(files)}")
+    print(f"  Files:   {len(files)} (seen: {files_seen})")
     print(f"  Palace:  {palace_path}")
+    if _MEMPALACE_MINE_MAX_FILES > 0:
+        print(f"  Budget:  max_files={_MEMPALACE_MINE_MAX_FILES}", end="")
+        if _MEMPALACE_MINE_MAX_CHUNKS > 0:
+            print(f" max_chunks={_MEMPALACE_MINE_MAX_CHUNKS}", end="")
+        if _MEMPALACE_MINE_MAX_SECONDS > 0:
+            print(f" max_seconds={_MEMPALACE_MINE_MAX_SECONDS}", end="")
+        if _MEMPALACE_MINE_ABORT_ON_SWAP_MB > 0:
+            print(f" abort_swap={_MEMPALACE_MINE_ABORT_ON_SWAP_MB}MB", end="")
+        print()
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     if not respect_gitignore:
@@ -1543,8 +1600,20 @@ def mine(
         pending.clear()
 
     exc_raised = False
+    _start_time = time.monotonic()
     try:
         for i, filepath in enumerate(files, 1):
+            # --- Budget: time limit (check first, before any processing) ---
+            if _MEMPALACE_MINE_MAX_SECONDS > 0:
+                elapsed = time.monotonic() - _start_time
+                if elapsed >= _MEMPALACE_MINE_MAX_SECONDS:
+                    budget_report["completed"] = False
+                    budget_report["abort_reason"] = "max_seconds"
+                    budget_report["elapsed_s"] = elapsed
+                    budget_report["swap_mb"] = _get_swap_mb()
+                    print(f"\n  [BUDGET] max_seconds={_MEMPALACE_MINE_MAX_SECONDS}s reached after {elapsed:.1f}s — stopping gracefully")
+                    break
+
             # --- Manifest skip: compute fingerprint before expensive work ---
             if manifest is not None and not dry_run:
                 try:
@@ -1616,12 +1685,36 @@ def mine(
                     except Exception:
                         pass  # Fail-open: no manifest data
 
+                # --- Budget: chunk limit (checked BEFORE appending to pending) ---
+                # Account for pending drawers (not yet committed) + this file's drawers
+                prepared_drawers = len(prepared["documents"])
+                pending_drawers = sum(len(p["documents"]) for p in pending)
+                if _MEMPALACE_MINE_MAX_CHUNKS > 0 and total_drawers + pending_drawers + prepared_drawers > _MEMPALACE_MINE_MAX_CHUNKS:
+                    budget_report["completed"] = False
+                    budget_report["abort_reason"] = "max_chunks"
+                    budget_report["elapsed_s"] = time.monotonic() - _start_time
+                    budget_report["swap_mb"] = _get_swap_mb()
+                    print(f"\n  [BUDGET] max_chunks={_MEMPALACE_MINE_MAX_CHUNKS} reached ({total_drawers} written) — stopping gracefully")
+                    break
+
                 pending.append(prepared)
 
                 # Flush on thresholds
                 drawer_count = sum(len(p["documents"]) for p in pending)
                 if len(pending) >= _MEMPALACE_MINE_BATCH_FILES or drawer_count >= _MEMPALACE_MINE_BATCH_DRAWERS:
                     _flush_pending()
+                    # total_drawers already updated by _flush_pending via nonlocal
+
+            # --- Budget: time limit (check after each file completes) ---
+            if _MEMPALACE_MINE_MAX_SECONDS > 0 and not budget_report["completed"]:
+                swap_mb = _get_swap_mb()
+                if swap_mb is not None and swap_mb >= _MEMPALACE_MINE_ABORT_ON_SWAP_MB:
+                    budget_report["completed"] = False
+                    budget_report["abort_reason"] = "swap_threshold"
+                    budget_report["elapsed_s"] = time.monotonic() - _start_time
+                    budget_report["swap_mb"] = swap_mb
+                    print(f"\n  [BUDGET] swap={swap_mb:.0f}MB >= threshold={_MEMPALACE_MINE_ABORT_ON_SWAP_MB}MB — aborting cleanly")
+                    break
 
         # Final flush
         if not dry_run and pending:
@@ -1630,11 +1723,16 @@ def mine(
         if manifest is not None:
             manifest.close()
 
-        # Build cross-reference symbol index for all files
+        # Build cross-reference symbol index for all files processed
+        # (only files that were actually committed, respecting max_files budget)
         if not dry_run and files:
+            processed_files = [str(f) for f in files]
+            # Respect max_files: SymbolIndex iterates over the sliced list
+            if _MEMPALACE_MINE_MAX_FILES > 0:
+                processed_files = processed_files[:_MEMPALACE_MINE_MAX_FILES]
             try:
                 si = SymbolIndex.get(palace_path)
-                si.build_index(str(project_path), [str(f) for f in files])
+                si.build_index(str(project_path), processed_files)
                 si_stats = si.stats()
                 print(f"  Symbol index: {si_stats['total_symbols']} symbols, {si_stats['total_files']} files")
             except Exception:
@@ -1655,6 +1753,14 @@ def mine(
             except Exception:
                 pass
 
+        # Finalize budget report (always, even on exception)
+        if budget_report["completed"]:
+            budget_report["elapsed_s"] = time.monotonic() - _start_time
+        budget_report["files_processed"] = len(files) - files_skipped
+        budget_report["chunks_written"] = total_drawers
+        if budget_report["swap_mb"] is None:
+            budget_report["swap_mb"] = _get_swap_mb()
+
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {len(files) - files_skipped}")
@@ -1663,8 +1769,12 @@ def mine(
     print("\n  By room:")
     for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
         print(f"    {room:20} {count} files")
+    if not budget_report["completed"]:
+        print(f"\n  Budget abort: {budget_report['abort_reason']}")
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
+
+    return budget_report
 
 
 # =============================================================================

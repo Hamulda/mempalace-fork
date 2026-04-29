@@ -285,22 +285,31 @@ def _mine_project(
     max_files: int | None = None,
     skip_patterns: tuple[str, ...] | None = None,
     mining_timeout_sec: int | None = 600,
+    eval_mode: str = "lexical",
 ) -> None:
-    """Mine real project into palace, patching embeddings globally."""
+    """Mine real project into palace, patching embeddings per eval_mode.
+
+    eval_mode effects:
+      lexical      — patch for mining phase only; restore before query;
+                     lexical queries (MEMPALACE_EVAL_MODE=lexical) route FTS5-only.
+      mock-vector  — patch stays active through query execution (patch never restored).
+      real-vector  — no patching; real embeddings throughout.
+    """
     import mempalace.backends.lance as lance_mod
 
-    orig_embed = lance_mod._embed_texts
-    lance_mod._embed_texts = _mock_embed_texts
-    if hasattr(lance_mod, "_embed_via_socket"):
-        lance_mod._embed_via_socket = _mock_embed_texts
+    orig_embed = None
+    should_patch = eval_mode in ("lexical", "mock-vector")
 
-    os.environ["MEMPALACE_EMBED_FALLBACK"] = "1"
+    if should_patch:
+        orig_embed = lance_mod._embed_texts
+        lance_mod._embed_texts = _mock_embed_texts
+        if hasattr(lance_mod, "_embed_via_socket"):
+            lance_mod._embed_via_socket = _mock_embed_texts
+        os.environ["MEMPALACE_EMBED_FALLBACK"] = "1"
 
     try:
         from mempalace.miner import mine
 
-        # Build a minimal config override for scan_project skip patterns
-        # The miner.mine() limit= parameter controls how many files are processed
         mine_kwargs: dict = {}
         if max_files is not None and max_files > 0:
             mine_kwargs["limit"] = max_files
@@ -313,10 +322,19 @@ def _mine_project(
         src_path = Path(project_path)
         py_files = [str(p) for p in _filtered_files(src_path, skip_patterns or _DEFAULT_SKIP_PATTERNS)]
         si.build_index(project_path, py_files)
+
+        # For lexical mode: restore before query phase so FTS5-only routing works
+        if eval_mode == "lexical" and orig_embed is not None:
+            lance_mod._embed_texts = orig_embed
+            if hasattr(lance_mod, "_embed_via_socket"):
+                lance_mod._embed_via_socket = orig_embed
+            orig_embed = None  # indicate already restored
     finally:
-        lance_mod._embed_texts = orig_embed
-        if hasattr(lance_mod, "_embed_via_socket"):
-            lance_mod._embed_via_socket = orig_embed
+        # mock-vector: keep patch alive through query execution (restored by _eval_project)
+        # lexical: KEEP patch active — lexical query phase uses FTS5 fallback,
+        #          keeping patch active avoids accidentally hitting real vector space
+        # real-vector: nothing was patched
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -345,6 +363,7 @@ async def _eval_project(
     max_files: int | None = None,
     skip_patterns: tuple[str, ...] | None = None,
     force: bool = False,
+    eval_mode: str = "lexical",
 ) -> int:
     project_path = Path(project_path).resolve()
     palace_path = Path(palace_path).resolve()
@@ -371,12 +390,19 @@ async def _eval_project(
         print(f"[INFO] Skip patterns: {skip_patterns or _DEFAULT_SKIP_PATTERNS}")
         if max_files:
             print(f"[INFO] Max files: {max_files}")
+        if eval_mode == "lexical":
+            print(f"[INFO] Eval mode: lexical (mock mining, FTS5-only query, no vector)")
+        elif eval_mode == "mock-vector":
+            print(f"[INFO] Eval mode: mock-vector (mock embeddings both sides)")
+        elif eval_mode == "real-vector":
+            print(f"[INFO] Eval mode: real-vector (real embeddings both sides)")
         try:
             _mine_project(
                 str(project_path),
                 str(palace_path),
                 max_files=max_files,
                 skip_patterns=skip_patterns,
+                eval_mode=eval_mode,
             )
         except Exception as exc:
             print(f"[FAIL] Mining failed: {exc}")
@@ -397,155 +423,193 @@ async def _eval_project(
     print(f"  Hledac Code-RAG Evaluation — {len(queries)} queries")
     print(f"  project: {project_path}")
     print(f"  palace:  {palace_path}")
+    print(f"  eval_mode: {eval_mode}")
     print(f"{'='*70}\n")
 
-    for q in queries:
-        qid = q["id"]
-        query_text = q["query"]
-        qtype = q["type"]
-        exp_file = EXPECTED_FILE_MAP.get(qid, "")
+    # For mock-vector: re-apply patch so query phase also uses mock embeddings
+    _query_patch_active = False
+    _orig_embed = None
+    if eval_mode == "mock-vector":
+        import mempalace.backends.lance as lance_mod
+        _orig_embed = lance_mod._embed_texts
+        lance_mod._embed_texts = _mock_embed_texts
+        if hasattr(lance_mod, "_embed_via_socket"):
+            lance_mod._embed_via_socket = _mock_embed_texts
+        os.environ["MEMPALACE_EMBED_FALLBACK"] = "1"
+        _query_patch_active = True
 
-        result, latency = await _run_query(query_text, str(palace_path))
-        results_list = result.get("results", [])
-        result_count = len(results_list)
+    try:
+        for q in queries:
+            qid = q["id"]
+            query_text = q["query"]
+            qtype = q["type"]
+            exp_file = EXPECTED_FILE_MAP.get(qid, "")
 
-        if result_count == 0:
-            zero_result_count += 1
+            result, latency = await _run_query(query_text, str(palace_path))
+            results_list = result.get("results", [])
+            result_count = len(results_list)
 
-        t1 = _top1_file_hit(result, exp_file)
-        t5 = _top5_file_hit(result, exp_file)
-        line = _has_line_range(result)
-        sym = _has_symbol_name(result, qid)
-        in_path = _is_in_project_path(result, str(project_path))
+            if result_count == 0:
+                zero_result_count += 1
 
-        # Cross-project leak: result outside project path when project_path is set
-        leak = 0 if in_path else 1
+            t1 = _top1_file_hit(result, exp_file)
+            t5 = _top5_file_hit(result, exp_file)
+            line = _has_line_range(result)
+            sym = _has_symbol_name(result, qid)
+            in_path = _is_in_project_path(result, str(project_path))
 
-        status = "PASS" if t5 >= 1.0 else ("WARN" if t5 >= 0.5 else "FAIL")
+            # Cross-project leak: result outside project path when project_path is set
+            leak = 0 if in_path else 1
 
-        top_srcs = [h.get("source_file", "?") for h in results_list[:3]]
+            status = "PASS" if t5 >= 1.0 else ("WARN" if t5 >= 0.5 else "FAIL")
 
-        rows.append({
-            "id": qid,
-            "type": qtype,
-            "top1": t1,
-            "top5": t5,
-            "has_line_range": line,
-            "has_symbol_name": sym,
-            "result_count": result_count,
-            "in_project_path": in_path,
-            "leak": leak,
-            "latency_ms": round(latency, 1),
-            "status": status,
-            "top_sources": top_srcs,
-            "top_source_exts": [Path(h.get("source_file","?")).suffix for h in results_list[:3]],
-        })
+            top_srcs = [h.get("source_file", "?") for h in results_list[:3]]
 
-        t1_str = "✓" if t1 >= 1.0 else "✗"
-        t5_str = "✓" if t5 >= 1.0 else ("~" if t5 >= 0.5 else "✗")
-        line_str = "✓" if line >= 1.0 else "✗"
-        path_str = "✓" if in_path else "✗"
+            rows.append({
+                "id": qid,
+                "type": qtype,
+                "top1": t1,
+                "top5": t5,
+                "has_line_range": line,
+                "has_symbol_name": sym,
+                "result_count": result_count,
+                "in_project_path": in_path,
+                "leak": leak,
+                "latency_ms": round(latency, 1),
+                "status": status,
+                "top_sources": top_srcs,
+                "top_source_exts": [Path(h.get("source_file","?")).suffix for h in results_list[:3]],
+            })
 
-        print(f"  [{status}] {qid:<50} top1={t1_str} top5={t5_str} "
-              f"line={line_str} path={path_str} n={result_count} "
-              f"latency={latency:6.1f}ms  top={top_srcs[:2]}")
+            t1_str = "✓" if t1 >= 1.0 else "✗"
+            t5_str = "✓" if t5 >= 1.0 else ("~" if t5 >= 0.5 else "✗")
+            line_str = "✓" if line >= 1.0 else "✗"
+            path_str = "✓" if in_path else "✗"
 
-    # Summary
-    n = len(rows)
-    zero_pct = zero_result_count / n if n else 0
-
-    # Abort conditions
-    if zero_result_count > len(queries) * 0.3:
-        print(f"\n[ABORT] >30% queries returned zero results ({zero_result_count}/{n})")
-        return 1
-
-    # Thresholds (smoke-level)
-    top1_avg = sum(r["top1"] for r in rows) / n
-    top5_avg = sum(r["top5"] for r in rows) / n
-    line_avg = sum(r["has_line_range"] for r in rows) / n
-    sym_avg = sum(r["has_symbol_name"] for r in rows) / n
-    lat_avg = sum(r["latency_ms"] for r in rows) / n
-    total_leaks = sum(r["leak"] for r in rows)
-
-    # Source-code-first ranking metrics
-    source_code_top1 = 0
-    docs_top1 = 0
-    for r in rows:
-        exts = r.get("top_source_exts", [])
-        top_ext = exts[0] if exts else ""
-        if top_ext in _CODE_EXTENSIONS:
-            source_code_top1 += 1
-        elif top_ext in _PROSE_EXTENSIONS:
-            docs_top1 += 1
-    source_code_top1_pct = source_code_top1 / n if n else 0
-    docs_top1_pct = docs_top1 / n if n else 0
-
-    print(f"\n{'─'*70}")
-    print(f"  METRIC                    VALUE       THRESHOLD   STATUS")
-    print(f"{'─'*70}")
-    print(f"  top1_file_hit             {top1_avg:6.2%}       >= 50%        "
-          f"{'PASS' if top1_avg >= 0.5 else 'FAIL'}")
-    print(f"  top5_file_hit             {top5_avg:6.2%}       >= 60%        "
-          f"{'PASS' if top5_avg >= 0.6 else 'FAIL'}")
-    print(f"  has_line_range             {line_avg:6.2%}       >= 30%        "
-          f"{'PASS' if line_avg >= 0.3 else 'FAIL'}")
-    print(f"  has_symbol_name           {sym_avg:6.2%}       >= 40%        "
-          f"{'PASS' if sym_avg >= 0.4 else 'FAIL'}")
-    print(f"  avg_latency_ms            {lat_avg:7.1f}ms    <= 5000ms     "
-          f"{'PASS' if lat_avg <= 5000 else 'FAIL'}")
-    print(f"  zero_result_pct            {zero_pct:6.1%}       <= 30%        "
-          f"{'PASS' if zero_pct <= 0.3 else 'FAIL'}")
-    print(f"  cross_project_leak_count  {total_leaks:<8}     <= 0          "
-          f"{'PASS' if total_leaks == 0 else 'FAIL'}")
-    print(f"  source_code_top1_pct     {source_code_top1_pct:6.2%}       (code ext top1)")
-    print(f"  docs_top1_pct             {docs_top1_pct:6.2%}       (prose ext top1)")
-    print(f"─" * 70)
-    all_pass = (
-        top1_avg >= 0.5
-        and top5_avg >= 0.6
-        and zero_pct <= 0.3
-        and total_leaks == 0
-    )
-
-    if report_json:
-        report = {
-            "project": str(project_path),
-            "palace": str(palace_path),
-            "query_count": n,
-            "metrics": {
-                "top1_file_hit": round(top1_avg, 4),
-                "top5_file_hit": round(top5_avg, 4),
-                "has_line_range": round(line_avg, 4),
-                "has_symbol_name": round(sym_avg, 4),
-                "avg_latency_ms": round(lat_avg, 2),
-                "zero_result_count": zero_result_count,
-                "zero_result_pct": round(zero_pct, 4),
-                "cross_project_leak_count": total_leaks,
-                "source_code_top1_pct": round(source_code_top1_pct, 4),
-                "docs_top1_pct": round(docs_top1_pct, 4),
-            },
-            "thresholds": {
-                "top1_file_hit_min": 0.5,
-                "top5_file_hit_min": 0.6,
-                "has_line_range_min": 0.3,
-                "has_symbol_name_min": 0.4,
-                "max_latency_ms": 5000,
-                "zero_result_pct_max": 0.3,
-                "cross_project_leak_max": 0,
-            },
-            "passed": all_pass,
-            "rows": rows,
-        }
-        with open(report_json, "w") as f:
-            json.dump(report, f, indent=2)
-        print(f"\n[INFO] Report written to: {report_json}")
-
-    if all_pass:
-        print(f"\n[RESULT] PASS — all smoke thresholds met")
-        return 0
+            print(f"  [{status}] {qid:<50} top1={t1_str} top5={t5_str} "
+                  f"line={line_str} path={path_str} n={result_count} "
+                  f"latency={latency:6.1f}ms  top={top_srcs[:2]}")
+    except Exception as _q_exc:
+        print(f"[FAIL] Query loop failed: {_q_exc}")
+        _final_exit_code = 3
     else:
-        print(f"\n[RESULT] FAIL — one or more thresholds not met")
-        return 1
+        _final_exit_code = None  # will be determined below
+
+    if _final_exit_code is None:
+        n = len(rows)
+        zero_pct = zero_result_count / n if n else 0
+
+        if zero_result_count > len(queries) * 0.3:
+            print(f"\n[ABORT] >30% queries returned zero results ({zero_result_count}/{n})")
+            _final_exit_code = 1
+        else:
+            top1_avg = sum(r["top1"] for r in rows) / n
+            top5_avg = sum(r["top5"] for r in rows) / n
+            line_avg = sum(r["has_line_range"] for r in rows) / n
+            sym_avg = sum(r["has_symbol_name"] for r in rows) / n
+            lat_avg = sum(r["latency_ms"] for r in rows) / n
+            total_leaks = sum(r["leak"] for r in rows)
+
+            source_code_top1 = 0
+            docs_top1 = 0
+            for r in rows:
+                exts = r.get("top_source_exts", [])
+                top_ext = exts[0] if exts else ""
+                if top_ext in _CODE_EXTENSIONS:
+                    source_code_top1 += 1
+                elif top_ext in _PROSE_EXTENSIONS:
+                    docs_top1 += 1
+            source_code_top1_pct = source_code_top1 / n if n else 0
+            docs_top1_pct = docs_top1 / n if n else 0
+
+            print(f"\n{'─'*70}")
+            print(f"  METRIC                    VALUE       THRESHOLD   STATUS")
+            print(f"{'─'*70}")
+            print(f"  top1_file_hit             {top1_avg:6.2%}       >= 50%        "
+                  f"{'PASS' if top1_avg >= 0.5 else 'FAIL'}")
+            print(f"  top5_file_hit             {top5_avg:6.2%}       >= 60%        "
+                  f"{'PASS' if top5_avg >= 0.6 else 'FAIL'}")
+            print(f"  has_line_range             {line_avg:6.2%}       >= 30%        "
+                  f"{'PASS' if line_avg >= 0.3 else 'FAIL'}")
+            print(f"  has_symbol_name           {sym_avg:6.2%}       >= 40%        "
+                  f"{'PASS' if sym_avg >= 0.4 else 'FAIL'}")
+            print(f"  avg_latency_ms            {lat_avg:7.1f}ms    <= 5000ms     "
+                  f"{'PASS' if lat_avg <= 5000 else 'FAIL'}")
+            print(f"  zero_result_pct            {zero_pct:6.1%}       <= 30%        "
+                  f"{'PASS' if zero_pct <= 0.3 else 'FAIL'}")
+            print(f"  cross_project_leak_count  {total_leaks:<8}     <= 0          "
+                  f"{'PASS' if total_leaks == 0 else 'FAIL'}")
+            print(f"  source_code_top1_pct     {source_code_top1_pct:6.2%}       (code ext top1)")
+            print(f"  docs_top1_pct             {docs_top1_pct:6.2%}       (prose ext top1)")
+            print(f"─" * 70)
+            all_pass = (
+                top1_avg >= 0.5
+                and top5_avg >= 0.6
+                and zero_pct <= 0.3
+                and total_leaks == 0
+            )
+            _final_exit_code = 0 if all_pass else 1
+
+            # Embedding metadata for report
+            if eval_mode == "real-vector":
+                _embedding_space_consistent = True
+                _embedding_provider = "daemon-or-fallback"  # real embeddings, provider varies
+                _vector_metrics_valid = True
+            elif eval_mode == "mock-vector":
+                _embedding_space_consistent = True
+                _embedding_provider = "mock"
+                _vector_metrics_valid = True
+            else:  # lexical
+                _embedding_space_consistent = True
+                _embedding_provider = "mock"
+                _vector_metrics_valid = False
+
+            if report_json:
+                report = {
+                    "project": str(project_path),
+                    "palace": str(palace_path),
+                    "query_count": n,
+                    "eval_mode": eval_mode,
+                    "embedding_space_consistent": _embedding_space_consistent,
+                    "embedding_provider": _embedding_provider,
+                    "vector_metrics_valid": _vector_metrics_valid,
+                    "metrics": {
+                        "top1_file_hit": round(top1_avg, 4),
+                        "top5_file_hit": round(top5_avg, 4),
+                        "has_line_range": round(line_avg, 4),
+                        "has_symbol_name": round(sym_avg, 4),
+                        "avg_latency_ms": round(lat_avg, 2),
+                        "zero_result_count": zero_result_count,
+                        "zero_result_pct": round(zero_pct, 4),
+                        "cross_project_leak_count": total_leaks,
+                        "source_code_top1_pct": round(source_code_top1_pct, 4),
+                        "docs_top1_pct": round(docs_top1_pct, 4),
+                    },
+                    "thresholds": {
+                        "top1_file_hit_min": 0.5,
+                        "top5_file_hit_min": 0.6,
+                        "has_line_range_min": 0.3,
+                        "has_symbol_name_min": 0.4,
+                        "max_latency_ms": 5000,
+                        "zero_result_pct_max": 0.3,
+                        "cross_project_leak_max": 0,
+                    },
+                    "passed": all_pass,
+                    "rows": rows,
+                }
+                with open(report_json, "w") as _fj:
+                    json.dump(report, _fj, indent=2)
+                print(f"\n[INFO] Report written to: {report_json}")
+
+    # Restore mock-vector patch after query phase
+    if _query_patch_active:
+        import mempalace.backends.lance as _lm
+        _lm._embed_texts = _orig_embed
+        if hasattr(_lm, "_embed_via_socket"):
+            _lm._embed_via_socket = _orig_embed
+        os.environ.pop("MEMPALACE_EMBED_FALLBACK", None)
+
+    return _final_exit_code
 
 
 # --------------------------------------------------------------------------- #
@@ -608,6 +672,16 @@ def main() -> int:
         action="store_true",
         help="Force mining even when swap is heavy (M1 8GB safety bypass)",
     )
+    parser.add_argument(
+        "--eval-mode",
+        type=str,
+        default="lexical",
+        choices=["lexical", "mock-vector", "real-vector"],
+        dest="eval_mode",
+        help="Embedding mode: lexical (mock mining, FTS5-only query), "
+             "mock-vector (mock both sides, patch through query), "
+             "real-vector (real embeddings both sides). Default: lexical.",
+    )
     args = parser.parse_args()
 
     skip_patterns = tuple(args.skip_patterns) if args.skip_patterns else None
@@ -621,6 +695,7 @@ def main() -> int:
         max_files=args.max_files,
         skip_patterns=skip_patterns,
         force=args.force,
+        eval_mode=args.eval_mode,
     ))
 
     # Restore env

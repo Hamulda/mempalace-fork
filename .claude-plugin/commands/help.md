@@ -75,7 +75,10 @@ Then verify with `mempalace_status`.
 
 - `mempalace_search` — semantic search across all memories
 - `mempalace_hybrid_search` — semantic + keyword + KG combined
-- `mempalace_search_code` — code search with language/symbol/file-path filters
+- `mempalace_search_code` — code search with language/symbol/file-path filters. **Always pass `project_path`** to scope results and pass security checks.
+- `mempalace_project_context` — set `project_path` for repo-scoped retrieval (use before search_code and find_symbol)
+- `mempalace_find_symbol` — symbol lookup (function, class, variable) scoped to `project_path`
+- `mempalace_file_context` — exact line ranges for a symbol. Requires `project_path` or allowed roots set.
 - `mempalace_kg_query` — knowledge graph entities
 - `mempalace_status` — palace overview
 

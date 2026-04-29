@@ -34,6 +34,7 @@ PROC_RSS_MB: float | None = None
 AVAILABLE_MEM_MB: float | None = None
 SWAP_USED_MB: float | None = None
 SWAP_TOTAL_MB: float | None = None
+SWAP_FREE_MB: float | None = None
 
 if _PSUTIL_AVAILABLE:
     try:
@@ -47,6 +48,7 @@ if _PSUTIL_AVAILABLE:
         swap = psutil.swap_memory()
         SWAP_USED_MB = swap.used / 1024 / 1024 if swap.used else None
         SWAP_TOTAL_MB = swap.total / 1024 / 1024 if swap.total else None
+        SWAP_FREE_MB = swap.free / 1024 / 1024 if getattr(swap, 'free', None) is not None else None
     except Exception:
         pass
 
@@ -137,7 +139,8 @@ if LANCEDB_VERSION:
                 idx = KeywordIndex.get(PALACE_PATH)
                 if hasattr(idx, '_conn') and idx._conn:
                     cur = idx._conn.execute("SELECT COUNT(*) FROM keyword_index")
-                    LANCE_FTS5_COUNT = cur.fetchone()[0] if cur.fetchone() else None
+                    row = cur.fetchone()
+                    LANCE_FTS5_COUNT = row[0] if row else None
             except Exception:
                 pass
 
@@ -163,6 +166,7 @@ def get_report() -> dict:
         "available_mem_mb": AVAILABLE_MEM_MB,
         "swap_used_mb": SWAP_USED_MB,
         "swap_total_mb": SWAP_TOTAL_MB,
+        "swap_free_mb": SWAP_FREE_MB,
         "swap_detected": SWAP_USED_MB is not None and SWAP_USED_MB > 0,
         "lancedb_version": LANCEDB_VERSION,
         "lancedb_import_error": LANCEDB_IMPORT_ERROR,
@@ -198,9 +202,11 @@ def print_report(report: dict) -> None:
     print(f"  Process RSS:    {report['proc_rss_mb']:.1f} MB" if report['proc_rss_mb'] else "  Process RSS:    N/A")
     print(f"  Available:      {report['available_mem_mb']:.0f} MB" if report['available_mem_mb'] else "  Available:      N/A")
     if report['swap_detected']:
-        print(f"  ⚠️  SWAP IN USE: {report['swap_used_mb']:.0f} MB / {report['swap_total_mb']:.0f} MB total")
+        print(f"  ⚠️  SWAP IN USE: {report['swap_used_mb']:.0f} MB used / {report['swap_total_mb']:.0f} MB total / {report['swap_free_mb']:.0f} MB free")
     else:
-        print(f"  Swap used:      0 MB (healthy)")
+        total = report.get('swap_total_mb') or 0
+        free = report.get('swap_free_mb') or 0
+        print(f"  Swap:          {free:.0f} MB free / {total:.0f} MB total (healthy)")
     print()
     print("Imports:")
     print(f"  LanceDB:   {report['lancedb_version'] or '❌ ' + (report['lancedb_import_error'] or 'not installed')}")
@@ -250,14 +256,20 @@ if __name__ == "__main__":
 
     report = get_report()
 
-    if report.get("swap_detected"):
-        # Write report before exiting — doctor_report.json goes to probe_runtime/
-        out_path = write_report_json(report, "probe_runtime")
-        report["output_path"] = out_path
-        print(json.dumps(report, indent=2, default=str))
-        sys.exit(1)
+    # Always write the report to probe_runtime/doctor_report.json
+    out_path = write_report_json(report, "probe_runtime")
+    report["output_path"] = out_path
+
+    swap_detected = report.get("swap_detected", False)
 
     if args.json:
-        print(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2, default=str))
+    elif swap_detected:
+        # When swap is active, still print human report before exit
+        print_report(report)
+        sys.exit(1)
     else:
         print_report(report)
+
+    if swap_detected:
+        sys.exit(1)

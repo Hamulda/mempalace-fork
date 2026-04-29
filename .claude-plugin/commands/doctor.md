@@ -74,7 +74,7 @@ python3 -c "import sys; mods=[k for k in sys.modules.keys() if 'chroma' in k.low
 | `connection refused` | server.pid missing | Server not running — ensure hooks registered in `settings.json` |
 | Stale sessions | Session count high | Sessions auto-expire via TTL (6h) — no manual prune needed |
 | Slow searches | memory_pressure | Check `memory_pressure` in health output — nominal is good |
-| Backend shows `chroma` | health backend field | Switch to LanceDB: `mempalace init --backend lance ~/palace` |
+| Backend shows `chroma` | health backend field | Only LanceDB is supported — Chroma is not supported |
 | Wrong Python version | python3 --version | Requires Python 3.14 — use pyenv or virtualenv |
 
 ## If All Checks Pass but Slow

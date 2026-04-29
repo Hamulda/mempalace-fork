@@ -1,12 +1,13 @@
 {
   "python_version": "3.14.0 (main, Oct 31 2025, 23:20:55) [Clang 21.1.4 ]",
-  "python_executable": "/Users/vojtechhamada/.claude/plugins/marketplaces/mempalace/.venv/bin/python",
+  "python_executable": "/Users/vojtechhamada/.claude/plugins/marketplaces/mempalace/.venv/bin/python3",
   "platform_system": "Darwin",
   "platform_release": "25.4.0",
-  "proc_rss_mb": 21.234375,
-  "available_mem_mb": 1643298816.0,
-  "swap_used_mb": 5172.3125,
-  "swap_total_mb": 6144.0,
+  "proc_rss_mb": 21.3125,
+  "available_mem_mb": 1292730368.0,
+  "swap_used_mb": 12346.3125,
+  "swap_total_mb": 13312.0,
+  "swap_free_mb": 965.6875,
   "swap_detected": true,
   "lancedb_version": "0.30.2",
   "lancedb_import_error": null,
@@ -20,12 +21,9 @@
   "sentence_transformers_available": false,
   "chromadb_in_modules": false,
   "default_backend": "lance",
-  "palace_path": "/Users/vojtechhamada/.mempalace/palace",
+  "palace_path": "/var/folders/wx/6pbc46rn1w57p4w4v2zbcgb40000gn/T/mempalace_session_w1bci037/.mempalace/palace",
   "collection_name": "mempalace_drawers",
-  "lance_collection_count": 10613,
+  "lance_collection_count": null,
   "fts5_count": null,
-  "symbol_index_stats": {
-    "total_symbols": 1259,
-    "total_files": 72
-  }
+  "symbol_index_stats": null
 }

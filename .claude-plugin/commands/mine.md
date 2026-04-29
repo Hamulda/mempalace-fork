@@ -11,6 +11,11 @@ allowed-tools: Bash, Read
 mempalace mine ~/projects/myapp
 ```
 
+For large repos, use `--limit` to bound indexing scope:
+```bash
+mempalace mine ~/projects/myapp --limit 1000
+```
+
 ## Mine Conversations
 
 ```bash
@@ -38,3 +43,5 @@ mempalace search "why did we switch to GraphQL"
 - Mine early, mine often — MemPalace stores everything verbatim
 - First time: `mempalace init ~/palace` to set up structure
 - Use `--mode convos` for Claude Code conversation exports
+- On M1 8GB: use `--limit` to bound indexing scope. Do not run large mining during active coding — mine when idle.
+- The `general` mode classifies into: decisions, milestones, problems, preferences.

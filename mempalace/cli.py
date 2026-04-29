@@ -549,7 +549,8 @@ def cmd_embed_daemon(args):
 
     elif args.action == "doctor":
         from .embed_daemon import run_embed_doctor
-        ok = run_embed_doctor()
+        result = run_embed_doctor()
+        ok = result.get("healthy", False)
         sys.exit(0 if ok else 1)
 
 

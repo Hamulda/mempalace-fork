@@ -1,14 +1,20 @@
 """
 MemPalace Embedding Daemon.
 
-Loads the fastembed ONNX model once, serves embedding requests
-via Unix domain socket. All MemPalace processes share one model instance.
+Model priority on Apple Silicon:
+    1. MLX — mlx-community/nomic-embed-text-v1-ablated-flash-smollm2-360M
+       (native Metal, ~85MB, 256-dim Matryoshka truncation)
+    2. fastembed + CoreML EP (ANE/Metal via ONNX bridge)
+    3. fastembed CPU fallback
+
+All MemPalace processes share one model instance via Unix domain socket.
 
 Usage:
     python -m mempalace.embed_daemon
     mempalace embed-daemon start
     mempalace embed-daemon stop
     mempalace embed-daemon status
+    mempalace embed-daemon doctor
 """
 from __future__ import annotations
 
@@ -308,12 +314,57 @@ def _send_socket(payload: dict, timeout: float = 30.0) -> dict:
         sock.close()
 
 
-def run_embed_doctor() -> bool:
-    """Run protocol validation on the embed daemon. Returns True if healthy."""
+def _detect_embed_provider() -> tuple[str, str]:
+    """
+    Detect which embedding provider is available on this system.
+
+    Returns (provider, model_id):
+      mlx   — Apple Silicon with mlx-embeddings
+      coreml — fastembed with CoreML EP
+      cpu    — fastembed CPU fallback
+      unknown — could not determine
+    """
+    import platform
+    is_apple_silicon = (
+        platform.system() == "Darwin" and platform.machine() == "arm64"
+    )
+    if is_apple_silicon:
+        try:
+            import mlx_embeddings  # noqa: F401
+            return ("mlx", "mlx-community/nomic-embed-text-v1-ablated-flash-smollm2-360M")
+        except Exception:
+            pass
+        try:
+            from fastembed import TextEmbedding  # noqa: F401
+            return ("coreml", "BAAI/bge-small-en-v1.5")
+        except Exception:
+            pass
+    else:
+        try:
+            from fastembed import TextEmbedding  # noqa: F401
+            return ("cpu", "BAAI/bge-small-en-v1.5")
+        except Exception:
+            pass
+    return ("unknown", "")
+
+
+def run_embed_doctor() -> dict:
+    """
+    Run protocol validation on the embed daemon.
+
+    Returns a dict with keys:
+      healthy (bool), provider (str), model_id (str), dims (int)
+    """
     import math
     import time
 
     print("=== MemPalace Embed Daemon Doctor ===\n")
+
+    provider, model_id = _detect_embed_provider()
+    dims = 256
+    print(f"Provider:  {provider}")
+    print(f"Model ID:  {model_id}")
+    print(f"Dims:      {dims}\n")
 
     sock_path = get_socket_path()
     pid_path = get_pid_path()
@@ -321,30 +372,28 @@ def run_embed_doctor() -> bool:
     # 1. Socket exists
     if not Path(sock_path).exists():
         print(f"FAIL: Socket not found: {sock_path}")
-        return False
+        return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
     print(f"OK   socket exists: {sock_path}")
 
     # 2. PID file
+    pid_val: int | None = None
     if Path(pid_path).exists():
         try:
-            pid = int(Path(pid_path).read_text())
-            print(f"OK   PID file: {pid}")
+            pid_val = int(Path(pid_path).read_text())
+            print(f"OK   PID file: {pid_val}")
         except Exception:
             print("WARN PID file unreadable")
     else:
         print("WARN no PID file")
 
     # 3. Process alive (PID from pid file)
-    alive = False
-    if Path(pid_path).exists():
+    if pid_val is not None:
         try:
-            pid = int(Path(pid_path).read_text())
-            os.kill(pid, 0)
-            alive = True
-            print(f"OK   process alive (PID {pid})")
+            os.kill(pid_val, 0)
+            print(f"OK   process alive (PID {pid_val})")
         except ProcessLookupError:
             print("FAIL process not running (stale PID)")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         except Exception as e:
             print(f"WARN cannot check process: {e}")
 
@@ -356,10 +405,10 @@ def run_embed_doctor() -> bool:
             print("OK   empty batch → valid JSON with embeddings key")
         else:
             print(f"FAIL empty batch returned unexpected structure: {type(resp)}")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
     except Exception as e:
         print(f"FAIL empty batch probe failed: {e}")
-        return False
+        return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
 
     # 5. Single embedding
     try:
@@ -368,26 +417,27 @@ def run_embed_doctor() -> bool:
         latency_1 = time.monotonic() - t0
         if not isinstance(resp, dict) or "embeddings" not in resp:
             print(f"FAIL single embedding returned no embeddings key")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         embeds = resp["embeddings"]
         if len(embeds) != 1:
             print(f"FAIL expected 1 embedding, got {len(embeds)}")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         vec = embeds[0]
-        if len(vec) != 256:
-            print(f"FAIL dimension {len(vec)} != 256 (possible 384-dim model leak)")
-            return False
+        actual_dims = len(vec)
+        if actual_dims != 256:
+            print(f"FAIL dimension {actual_dims} != 256 (possible 384-dim model leak)")
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": actual_dims}
         if not all(math.isfinite(x) for x in vec):
             print(f"FAIL vector contains NaN/Inf")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         norm = math.sqrt(sum(x * x for x in vec))
         if norm < 1e-6:
             print(f"FAIL zero-norm vector (norm={norm:.2e})")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         print(f"OK   1 embedding: dim=256 norm={norm:.4f} latency={latency_1*1000:.1f}ms")
     except Exception as e:
         print(f"FAIL single embedding failed: {e}")
-        return False
+        return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
 
     # 6. Batch 10
     try:
@@ -397,18 +447,18 @@ def run_embed_doctor() -> bool:
         embeds = resp["embeddings"]
         if len(embeds) != 10:
             print(f"FAIL batch 10: expected 10, got {len(embeds)}")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         for i, vec in enumerate(embeds):
             if len(vec) != 256:
                 print(f"FAIL batch 10: vector[{i}] dim={len(vec)}")
-                return False
+                return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
             if not all(math.isfinite(x) for x in vec):
                 print(f"FAIL batch 10: vector[{i}] contains NaN/Inf")
-                return False
+                return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         print(f"OK   batch 10: 10 embeddings, latency={latency_10*1000:.1f}ms")
     except Exception as e:
         print(f"FAIL batch 10 failed: {e}")
-        return False
+        return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
 
     # 7. Batch 100
     try:
@@ -418,21 +468,21 @@ def run_embed_doctor() -> bool:
         embeds = resp["embeddings"]
         if len(embeds) != 100:
             print(f"FAIL batch 100: expected 100, got {len(embeds)}")
-            return False
+            return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         for i, vec in enumerate(embeds):
             if len(vec) != 256:
                 print(f"FAIL batch 100: vector[{i}] dim={len(vec)}")
-                return False
+                return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
             if not all(math.isfinite(x) for x in vec):
                 print(f"FAIL batch 100: vector[{i}] contains NaN/Inf")
-                return False
+                return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
         print(f"OK   batch 100: 100 embeddings, latency={latency_100*1000:.1f}ms")
     except Exception as e:
         print(f"FAIL batch 100 failed: {e}")
-        return False
+        return {"healthy": False, "provider": provider, "model_id": model_id, "dims": dims}
 
     print("\n=== All checks passed ===")
-    return True
+    return {"healthy": True, "provider": provider, "model_id": model_id, "dims": dims}
 
 
 def run_daemon() -> None:
