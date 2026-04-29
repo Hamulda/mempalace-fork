@@ -486,6 +486,7 @@ def cmd_embed_daemon(args):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
 
             timeout_s = float(os.environ.get(

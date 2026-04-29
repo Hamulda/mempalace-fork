@@ -211,6 +211,7 @@ def _start_daemon_if_needed() -> bool:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
 
             deadline = time.monotonic() + _SOCK_TIMEOUT
