@@ -283,6 +283,80 @@ def build_wakeup_context(
     return result
 
 
+def _path_boundary_contains(child_path: str, parent_path: str) -> bool:
+    """
+    Returns True if child_path is strictly under parent_path.
+
+    /proj matches /proj, /proj/foo, /proj/foo/bar
+    /proj-old does NOT match /proj (different prefix after common prefix)
+    """
+    if not child_path or not parent_path:
+        return False
+    cp = child_path.rstrip("/")
+    pp = parent_path.rstrip("/")
+    if cp == pp:
+        return True
+    # Ensure parent is a directory boundary — require leading slash or exact match
+    # /proj  matches /proj/foo
+    # /proj  does NOT match /proj-old
+    return cp.startswith(pp + "/")
+
+
+def _probe_embed_daemon_socket() -> tuple[str, str, int] | None:
+    """
+    Lightweight Unix socket probe of embed daemon — no model loading.
+
+    Returns (provider, model_id, dims) or None if daemon unavailable.
+    """
+    try:
+        from mempalace.embed_metadata import _probe_daemon_socket
+        result = _probe_daemon_socket()
+        if result is not None:
+            return result
+    except Exception:
+        pass
+    return None
+
+
+def _load_stored_embedding_meta(palace_path: str) -> dict:
+    """Load stored embedding metadata from palace, or empty dict."""
+    try:
+        from mempalace.embed_metadata import load_meta
+        meta = load_meta(palace_path)
+        if meta:
+            return meta
+    except Exception:
+        pass
+    return {}
+
+
+def _get_index_counts(palace_path: str) -> dict:
+    """
+    Return cheap index statistics: path_index_count, fts5_count, symbol_count.
+    Each count is O(1) or fast single-statement SQL — no scanning.
+    """
+    counts: dict[str, int | None] = {"path_index_count": None, "fts5_count": None, "symbol_count": None}
+    try:
+        from mempalace.path_index import PathIndex
+        pi = PathIndex.get(palace_path)
+        counts["path_index_count"] = pi.count()
+    except Exception:
+        pass
+    try:
+        from mempalace.lexical_index import KeywordIndex
+        li = KeywordIndex.get(palace_path)
+        counts["fts5_count"] = li.count()
+    except Exception:
+        pass
+    try:
+        from mempalace.symbol_index import SymbolIndex
+        si = SymbolIndex.get(palace_path)
+        counts["symbol_count"] = si.stats()["total_symbols"]
+    except Exception:
+        pass
+    return counts
+
+
 def build_startup_context(
     session_id: str,
     project_path: str | None = None,
@@ -303,14 +377,24 @@ def build_startup_context(
     - palace_path: palace data path
     - backend: storage backend (always 'lance')
     - python_version: sys.version_info string
-    - embedding_provider: provider name from embed daemon probe
-    - embedding_meta: model_id if available
+    - embedding_stored_provider: provider from embedding_meta.json (or null)
+    - embedding_stored_model_id: model_id from embedding_meta.json (or null)
+    - embedding_stored_dims: dims from embedding_meta.json (or null)
+    - embedding_current_provider: provider from live daemon socket probe (or null)
+    - embedding_current_model_id: model_id from live probe (or null)
+    - embedding_current_dims: dims from live probe (or null)
+    - embedding_drift_detected: true/false/unknown
+    - embedding_provider: legacy field — current provider or stored or unknown
+    - embedding_meta: legacy field — {model_id, embed_batch_size} if available
     - active_sessions: count from session registry
     - current_claims: claims for project_path (or all if no project_path)
     - pending_handoffs: handoffs for this session (limited)
     - recommended_first_actions: startup workflow steps
     - project_path_reminder: the project_path passed in or derived
     - m1_defaults: bounded defaults for M1/8GB runs
+    - path_index_count: rows in path_index.sqlite3 (or null)
+    - fts5_count: rows in FTS5 table (or null)
+    - symbol_count: top-level definitions in symbol index (or null)
     """
     import sys
     from .session_registry import SessionRegistry
@@ -341,26 +425,48 @@ def build_startup_context(
     except Exception:
         pass
 
-    # ── Embedding provider via daemon probe ─────────────────────────────────
-    embedding_provider = "unknown"
-    embedding_meta = {}
-    try:
-        req = urllib.request.Request(
-            "http://127.0.0.1:8766/probe",
-            headers={"Accept": "application/json"},
+    # ── Embedding state: stored metadata ───────────────────────────────────
+    stored = _load_stored_embedding_meta(palace_path)
+    embedding_stored_provider = stored.get("provider")
+    embedding_stored_model_id = stored.get("model_id")
+    embedding_stored_dims = stored.get("dims")
+
+    # ── Embedding state: current via Unix socket probe ───────────────────
+    current = _probe_embed_daemon_socket()
+    if current is not None:
+        embedding_current_provider, embedding_current_model_id, embedding_current_dims = current
+    else:
+        embedding_current_provider = None
+        embedding_current_model_id = None
+        embedding_current_dims = None
+
+    # ── Drift detection ────────────────────────────────────────────────────
+    if embedding_current_provider is not None and embedding_stored_provider is not None:
+        embedding_drift_detected = (
+            embedding_current_provider != embedding_stored_provider
+            or embedding_current_model_id != embedding_stored_model_id
         )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            data = resp.read()
-            probe = json.loads(data)
-            embedding_provider = probe.get("provider", "unknown")
-            model_id = probe.get("model_id", "")
-            if model_id:
-                embedding_meta["model_id"] = model_id
-            batch_size = probe.get("embed_batch_size")
-            if batch_size:
-                embedding_meta["embed_batch_size"] = batch_size
-    except Exception:
-        pass
+    elif embedding_current_provider is not None:
+        embedding_drift_detected = "unknown"  # have current, no stored
+    elif embedding_stored_provider is not None:
+        embedding_drift_detected = "unknown"  # have stored, no current (daemon down)
+    else:
+        embedding_drift_detected = "unknown"  # neither available
+
+    # ── Legacy compat fields ───────────────────────────────────────────────
+    # embedding_provider: prefer current > stored > unknown
+    if embedding_current_provider:
+        embedding_provider = embedding_current_provider
+    elif embedding_stored_provider:
+        embedding_provider = embedding_stored_provider
+    else:
+        embedding_provider = "unknown"
+
+    embedding_meta = {}
+    if embedding_current_model_id:
+        embedding_meta["model_id"] = embedding_current_model_id
+    elif embedding_stored_model_id:
+        embedding_meta["model_id"] = embedding_stored_model_id
 
     # ── Active sessions ──────────────────────────────────────────────────────
     active_sessions = 0
@@ -378,7 +484,7 @@ def build_startup_context(
         if resolved_project:
             all_claims = [
                 c for c in all_claims
-                if c.get("target_id", "").startswith(resolved_project)
+                if _path_boundary_contains(c.get("target_id", ""), resolved_project)
             ]
         current_claims = [
             {
@@ -449,11 +555,23 @@ def build_startup_context(
         "session_timeout_seconds": 300,
     }
 
+    # ── Index counts ─────────────────────────────────────────────────────────
+    index_counts = _get_index_counts(palace_path)
+
     return {
         "server_health": server_health,
         "palace_path": palace_path,
         "backend": "lance",
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        # New truthful embedding state
+        "embedding_stored_provider": embedding_stored_provider,
+        "embedding_stored_model_id": embedding_stored_model_id,
+        "embedding_stored_dims": embedding_stored_dims,
+        "embedding_current_provider": embedding_current_provider,
+        "embedding_current_model_id": embedding_current_model_id,
+        "embedding_current_dims": embedding_current_dims,
+        "embedding_drift_detected": embedding_drift_detected,
+        # Legacy compat
         "embedding_provider": embedding_provider,
         "embedding_meta": embedding_meta,
         "active_sessions": active_sessions,
@@ -464,4 +582,8 @@ def build_startup_context(
         "recommended_first_actions": recommended,
         "project_path_reminder": resolved_project,
         "m1_defaults": m1_defaults,
+        # Index stats
+        "path_index_count": index_counts["path_index_count"],
+        "fts5_count": index_counts["fts5_count"],
+        "symbol_count": index_counts["symbol_count"],
     }

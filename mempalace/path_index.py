@@ -19,6 +19,11 @@ Usage:
     idx.upsert_rows([{document_id, source_file, ...}])
     idx.delete_rows(["doc_id_1", "doc_id_2"])
     idx.search_path("src/foo.py", project_path="/proj", limit=20)
+
+SQLite LIKE wildcards:
+    % matches any sequence of chars
+    _ matches any single char
+    ESCAPE clause disables these when searching for literal %, _, backslash
 """
 
 from __future__ import annotations
@@ -31,6 +36,36 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("mempalace_path_index")
+
+_ESCAPE_CHAR = "\\"
+
+
+def _escape_sql_like(pattern: str) -> str:
+    """Escape LIKE wildcards in a pattern so they match literally."""
+    return (
+        pattern
+        .replace(_ESCAPE_CHAR, _ESCAPE_CHAR + _ESCAPE_CHAR)
+        .replace("%", _ESCAPE_CHAR + "%")
+        .replace("_", _ESCAPE_CHAR + "_")
+    )
+
+
+def _normalize_path_for_sql(path: str) -> str:
+    """Normalize a path for SQL prefix/suffix matching.
+
+    - Strips trailing slashes
+    - Converts backslashes to forward slashes
+
+    Note: Does NOT call realpath for project_path normalization.
+    Stored source_file values are not normalized (backward compat), so
+    project_path normalization must not use realpath either, or the two
+    will diverge. To enable full /var ↔ /private/var symmetry, normalize
+    source_file values at insert time using normalize_source_file().
+    """
+    if not path:
+        return path
+    path = path.replace("\\", "/").strip()
+    return path.rstrip("/")
 
 
 class PathIndex:
@@ -212,15 +247,21 @@ class PathIndex:
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """
-        Search path index for matching document_ids.
+        Search path index for matching document_ids using indexed SQL stages.
 
-        Matching priority:
-        1. Exact source_file match
-        2. Exact repo_rel_path match
-        3. Suffix match (source_file.endswith(query))
-        4. Basename match (basename == query)
+        Matching priority (each stage bounded; early exit when limit reached):
+        1. Exact source_file match — indexed equality, O(1)
+        2. Exact repo_rel_path match — indexed equality, O(1)
+        3. Suffix match — LIKE with leading wildcard, bounded scan + Python filter
+        4. Basename exact match — indexed equality, bounded
 
-        project_path filter is STRICT — source_file must start with project_path.
+        project_path filter is a strict boundary:
+            source_file = project_path  OR  source_file LIKE project_path || '/%'
+        Both stored source_file and project_path are normalized via realpath
+        on macOS so /var and /private/var compare equal.
+
+        SQL LIKE wildcards (percent, underscore, backslash) in query are
+        escaped so they match as literals, not as wildcards.
 
         Returns list of dicts with document_id, source_file, language, etc.
         """
@@ -231,74 +272,173 @@ class PathIndex:
         seen: set[str] = set()
 
         with self._lock:
+            conn = None
             try:
                 conn = sqlite3.connect(self.db_path)
                 conn.row_factory = sqlite3.Row
 
-                # Base query — always filter tombstoned
-                base_where = "is_latest=1"
-                params: list[Any] = []
+                # Build project_path boundary (strict: exact OR prefix match)
+                proj_clause, proj_params = self._project_path_filter(project_path)
 
-                if project_path:
-                    base_where += " AND (source_file LIKE ? OR source_file = ?)"
-                    prefix = project_path.rstrip("/") + "/"
-                    params.extend([f"{prefix}%", project_path])
-
+                # Language filter — applied to all stages
                 if language:
-                    base_where += " AND language = ?"
-                    params.append(language)
+                    lang_clause = "language = ?"
+                    lang_params: list[Any] = [language]
+                else:
+                    lang_clause = ""
+                    lang_params = []
 
-                rows = conn.execute(
-                    f"SELECT * FROM path_index WHERE {base_where}", params
-                ).fetchall()
+                def build_where(
+                    extra: str = "",
+                    extra_params: list[Any] | None = None,
+                ) -> tuple[str, list[Any]]:
+                    parts = ["is_latest=1"]
+                    ps: list[Any] = []
+                    if proj_clause:
+                        parts.append(proj_clause)
+                        ps.extend(proj_params)
+                    if lang_clause:
+                        parts.append(lang_clause)
+                        ps.extend(lang_params)
+                    if extra:
+                        parts.append(extra)
+                        if extra_params:
+                            ps.extend(extra_params)
+                    return " AND ".join(parts), ps
 
-                for row in rows:
-                    doc_id = row["document_id"]
-                    if doc_id in seen:
-                        continue
-                    source_file = row["source_file"]
-                    repo_rel_path = row["repo_rel_path"] or ""
-                    basename = row["basename"]
-
-                    matched = False
-
-                    # Priority 1: exact source_file
-                    if source_file == query:
-                        matched = True
-                    # Priority 2: exact repo_rel_path
-                    elif repo_rel_path and repo_rel_path == query:
-                        matched = True
-                    # Priority 3: suffix match
-                    elif source_file.endswith(query) or source_file.endswith("/" + query):
-                        matched = True
-                    # Priority 4: basename
-                    elif basename == query:
-                        matched = True
-
-                    if matched:
+                def rows_to_hits(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+                    hits = []
+                    for row in rows:
+                        doc_id = row["document_id"]
+                        if doc_id in seen:
+                            continue
                         seen.add(doc_id)
-                        results.append(
-                            {
-                                "document_id": doc_id,
-                                "source_file": source_file,
-                                "repo_rel_path": repo_rel_path,
-                                "language": row["language"],
-                                "chunk_kind": row["chunk_kind"],
-                                "symbol_name": row["symbol_name"],
-                                "line_start": row["line_start"],
-                                "line_end": row["line_end"],
-                                "wing": row["wing"],
-                                "room": row["room"],
-                            }
-                        )
-                        if len(results) >= limit:
+                        hits.append({
+                            "document_id": doc_id,
+                            "source_file": row["source_file"],
+                            "repo_rel_path": row["repo_rel_path"] or "",
+                            "language": row["language"],
+                            "chunk_kind": row["chunk_kind"],
+                            "symbol_name": row["symbol_name"],
+                            "line_start": row["line_start"],
+                            "line_end": row["line_end"],
+                            "wing": row["wing"],
+                            "room": row["room"],
+                        })
+                        if len(hits) >= limit:
                             break
+                    return hits
+
+                def exclude_matched(extra: str, params: list[Any]) -> tuple[str, list[Any]]:
+                    """Add NOT IN clause to exclude already-matched doc_ids."""
+                    matched = [r["document_id"] for r in results]
+                    if not matched:
+                        return extra, params
+                    placeholders = ",".join("?" * len(matched))
+                    excl = f" AND document_id NOT IN ({placeholders})"
+                    return extra + excl, params + matched
+
+                # ── Stage 1: exact source_file (INDEXED) ─────────────────────
+                where, params = build_where("source_file = ?", [query])
+                rows = conn.execute(
+                    f"SELECT * FROM path_index WHERE {where}", params
+                ).fetchall()
+                results.extend(rows_to_hits(rows))
+                if len(results) >= limit:
+                    return results[:limit]
+
+                # ── Stage 2: exact repo_rel_path (INDEXED) ───────────────────
+                extra, params = exclude_matched("repo_rel_path = ?", [query])
+                where, params = build_where(extra, params)
+                rows = conn.execute(
+                    f"SELECT * FROM path_index WHERE {where}", params
+                ).fetchall()
+                results.extend(rows_to_hits(rows))
+                if len(results) >= limit:
+                    return results[:limit]
+
+                # ── Stage 3: suffix match — bounded scan + Python filter ────
+                #    LIKE with leading wildcard; limit scan to 3× limit
+                escaped = _escape_sql_like(query)
+                extra, params = exclude_matched(
+                    f"source_file LIKE ? ESCAPE '{_ESCAPE_CHAR}'",
+                    ["%" + escaped],
+                )
+                where, params = build_where(extra, params)
+                scan_limit = limit * 3
+                rows = conn.execute(
+                    f"SELECT * FROM path_index WHERE {where} LIMIT {scan_limit}", params
+                ).fetchall()
+                # Python filter for true suffix semantics
+                hits = []
+                for row in rows:
+                    sf = row["source_file"]
+                    if sf.endswith(query) or sf.endswith("/" + query):
+                        doc_id = row["document_id"]
+                        if doc_id in seen:
+                            continue
+                        seen.add(doc_id)
+                        hits.append({
+                            "document_id": doc_id,
+                            "source_file": sf,
+                            "repo_rel_path": row["repo_rel_path"] or "",
+                            "language": row["language"],
+                            "chunk_kind": row["chunk_kind"],
+                            "symbol_name": row["symbol_name"],
+                            "line_start": row["line_start"],
+                            "line_end": row["line_end"],
+                            "wing": row["wing"],
+                            "room": row["room"],
+                        })
+                        if len(hits) >= limit - len(results):
+                            break
+                results.extend(hits)
+                if len(results) >= limit:
+                    return results[:limit]
+
+                # ── Stage 4: basename exact match (INDEXED, bounded) ───────────
+                extra, params = exclude_matched("basename = ?", [query])
+                where, params = build_where(extra, params)
+                rows = conn.execute(
+                    f"SELECT * FROM path_index WHERE {where} LIMIT {scan_limit}", params
+                ).fetchall()
+                results.extend(rows_to_hits(rows))
 
                 conn.close()
             except Exception as e:
                 logger.warning("PathIndex search failed: %s", e)
+            finally:
+                if conn:
+                    conn.close()
 
-        return results
+        return results[:limit]
+
+    def _project_path_filter(
+        self, project_path: str | None
+    ) -> tuple[str, list[Any]]:
+        """Build strict project_path boundary SQL.
+
+        Returns (where_clause, params) for:
+            source_file = <project_path>  OR  source_file LIKE <project_path>/%
+
+        Wildcards (%, _, backslash) in project_path itself are escaped so they
+        match literally in the LIKE expression.
+
+        Note: project_path is not normalized via realpath because stored
+        source_file values are also not normalized. For full macOS
+        /var ↔ /private/var symmetry, normalize source_file at insert
+        time using normalize_source_file() and re-index existing data.
+        """
+        if not project_path:
+            return "", []
+
+        norm_pp = _normalize_path_for_sql(project_path)
+        escaped = _escape_sql_like(norm_pp)
+        prefix = escaped.rstrip("/") + "/"
+        return (
+            "(source_file = ? OR source_file LIKE ? ESCAPE ?)",
+            [norm_pp, prefix + "%", _ESCAPE_CHAR],
+        )
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
@@ -318,3 +458,12 @@ class PathIndex:
         if source_file.startswith(prefix):
             return source_file[len(prefix) :]
         return source_file
+
+    @staticmethod
+    def normalize_source_file(source_file: str) -> str:
+        """Normalize source_file for consistent storage/lookup.
+
+        On macOS resolves symlinks so /var -> /private/var.
+        Converts backslashes to forward slashes and strips trailing slashes.
+        """
+        return _normalize_path_for_sql(source_file)

@@ -104,11 +104,20 @@ def register_symbol_tools(server, backend, config, settings):
                 for r in heuristic:
                     r["confidence"] = "low"
                     r["match_type"] = "import_ref"
+                    r["why"] = f"import-based heuristic: module imports suggest {symbol_name} may be called"
+                    r["callee_fqn"] = symbol_name
                     raw_callers.append(r)
             callers = []
             for r in raw_callers:
                 fp = r.get("source_file", "")
                 path_info = _make_path_result(fp, project_root) if fp else {}
+                # Attach why for all results
+                if r.get("match_type") == "ast_call":
+                    r["why"] = f"AST call: {r.get('caller_fqn', 'unknown')}() calls {symbol_name}() at line {r.get('line', '?')}"
+                elif r.get("match_type") == "import_ref":
+                    if not r.get("why"):
+                        r["why"] = f"import_ref: {symbol_name} imported in {fp}"
+                r["callee_fqn"] = symbol_name
                 callers.append({**r, **path_info})
             return {"symbol_name": symbol_name, "callers": callers, "count": len(callers)}
         except Exception as e:

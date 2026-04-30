@@ -807,7 +807,7 @@ class SymbolIndex:
                            (source_file, caller_fqn, callee_name, callee_attr, line, confidence)
                            VALUES (?, ?, ?, ?, ?, ?)""",
                         (file_path, cr.get("caller_fqn", ""), cr.get("callee_name", ""),
-                         cr.get("callee_attr", ""), cr.get("line", 0), cr.get("confidence", "medium")),
+                         cr.get("callee_attr", ""), cr.get("line", 0), cr.get("confidence", "high")),
                     )
                 # import_refs
                 for ir in extracted.get("import_refs", []):

@@ -147,7 +147,7 @@ class TestRefTables:
         assert len(callers) == 1
         assert callers[0]["source_file"] == str(tmp_path / "service.py")
         assert callers[0]["caller_fqn"] == "PaymentService.process"
-        assert callers[0]["confidence"] == "medium"
+        assert callers[0]["confidence"] == "high"
         assert callers[0]["match_type"] == "ast_call"
 
     def test_reindex_removes_old_call_refs(self, tmp_path):
@@ -202,7 +202,7 @@ class TestRefTables:
         assert len(callers) == 1, f"Expected 1 caller, got {len(callers)}"
         assert callers[0]["source_file"] == str(svc_path)
         assert callers[0]["caller_fqn"] == "PaymentService.process"
-        assert callers[0]["confidence"] == "medium"
+        assert callers[0]["confidence"] == "high"
         assert callers[0]["match_type"] == "ast_call"
 
     def test_full_fixture_comment_excluded(self, tmp_path):
@@ -282,7 +282,7 @@ class Y:
         callers = si.get_callers_ast("foo")
         assert len(callers) == 1
         assert callers[0]["callee_attr"] == "x"
-        assert callers[0]["confidence"] == "medium"  # default; AST gives medium
+        assert callers[0]["confidence"] == "high"  # default; AST gives medium
 
     def test_import_based_fallback_low_confidence(self, tmp_path):
         """Fallback get_callers returns low confidence."""

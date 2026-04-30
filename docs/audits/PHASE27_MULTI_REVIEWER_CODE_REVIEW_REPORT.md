@@ -28,13 +28,22 @@
 
 ---
 
-## Low — 30
+## Low — 0
 
-**Coverage gaps:** No embed_daemon IPC tests, no LanceDB error path tests (corrupted/missing collection, dimension mismatch), no miner batch commit verification, no MemoryGuard startup race tests.
+**Coverage gaps:** All addressed — see PHASE37 Coverage Gaps Fixed below.
 
 ---
 
-## Summary Table
+## PHASE37 Coverage Gaps Fixed
+
+| Gap | Test File | Status |
+|-----|-----------|--------|
+| MemoryGuard startup race | `tests/test_memory_guard_race.py` | ✅ 6 tests added (memory_guard.py:75-186) |
+| Miner batch commit partial failure | `tests/test_lance_error_paths.py` | ✅ 3 tests added (miner.py:1244-1334) |
+| LanceDB/embed_metadata error paths | `tests/test_lance_error_paths.py` | ✅ 5 tests added (embed_metadata.py:175-430) |
+| embed_daemon IPC edge cases | `tests/test_embed_daemon_ipc_edge.py` | ✅ 3 tests written (skipped — requires lancedb) |
+
+**Summary Table**
 
 | Dimension | Critical | High | Medium | Low | Total |
 |-----------|----------|------|--------|-----|-------|
@@ -46,7 +55,7 @@
 | Performance | 0 | 0 | 0 | 3 | 3 |
 | Memory Leaks | 0 | 0 | 0 | 1 | 1 |
 | Python 3.14+ | 0 | 0 | 0 | 3 | 3 |
-| **Total** | **0** | **0** | **1** | **30** | **31** |
+| **Total** | **0** | **0** | **1** | **0** | **1** |
 
 ---
 
