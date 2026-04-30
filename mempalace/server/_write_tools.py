@@ -4,7 +4,7 @@ Write tools: add_drawer, delete_drawer, diary_write, diary_read, consolidate.
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from fastmcp import Context
 
@@ -239,7 +239,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     "wing": wing, "room": room, "source_file": source_file or "", "chunk_index": 0,
                     "added_by": added_by, "agent_id": added_by,
                     "entities": json.dumps(entities) if entities else "",
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "origin_type": "observation", "is_latest": True, "supersedes_id": "",
                 }],
             )
@@ -360,7 +360,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     "wing": wing, "room": room,
                     "source_file": f"diary://{agent_name}/{now.strftime('%Y-%m-%d')}",
                     "added_by": agent_name, "agent_id": agent_name, "topic": topic,
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "origin_type": "diary_entry", "is_latest": True, "supersedes_id": "", "chunk_index": 0,
                 }],
             )
@@ -544,7 +544,7 @@ def register_write_tools(server, backend, config, settings, memory_guard):
                     "wing": wing, "room": room, "source_file": source_file or "", "chunk_index": 0,
                     "added_by": added_by, "agent_id": added_by, "description": description,
                     "entities": json.dumps(entities) if entities else "",
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "origin_type": "code_memory", "is_latest": True, "supersedes_id": "",
                     "language": language or "", "line_start": line_start or 0, "line_end": line_end or 0,
                     "symbol_name": symbol_name or "", "chunk_kind": "code_block",

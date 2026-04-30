@@ -479,7 +479,7 @@ def _quarantine_record(
         "chunk_index": chunk_index,
         "reason": reason,
         "preview": preview[:200],
-        "time": datetime.datetime.utcnow().isoformat() + "Z",
+        "time": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "model": model,
         "wing": wing,
     }
@@ -1557,24 +1557,6 @@ class LanceCollection(BaseCollection):
                 raise MemoryPressureError(
                     f"Cannot write to palace at {self._palace_path}: system memory at "
                     f"{guard.used_ratio:.0%}. Close some apps and retry."
-                )
-
-        # Check for duplicate ids — batch query with $in instead of N separate queries
-        if ids:
-            id_list = list(ids)
-            if len(id_list) == 1:
-                where_clause = f"id = '{id_list[0]}'"
-            else:
-                where_clause = "id IN (" + ", ".join(repr(i) for i in id_list) + ")"
-
-            def check_dup():
-                return self._table.search().where(where_clause).to_pandas()
-
-            result = self._write_with_retry(check_dup)
-            if not result.empty:
-                existing = result["id"].tolist()
-                raise ValueError(
-                    f"Record(s) {existing} already exist(s). Use upsert() to update."
                 )
 
         # BATCH Semantic deduplication – jeden embedding call pro celý batch

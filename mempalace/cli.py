@@ -620,15 +620,15 @@ def cmd_optimize(args):
 
 def cmd_cleanup(args):
     """Remove old non-latest memories and expired knowledge graph facts."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from .config import MempalaceConfig
     from .backends import get_backend
     from .knowledge_graph import KnowledgeGraph
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     cfg = MempalaceConfig()
-    cutoff = (datetime.utcnow() - timedelta(days=args.days)).isoformat() + "Z"
-    kg_cutoff = (datetime.utcnow() - timedelta(days=args.kg_days)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat().replace("+00:00", "Z")
+    kg_cutoff = (datetime.now(timezone.utc) - timedelta(days=args.kg_days)).isoformat().replace("+00:00", "Z")
 
     print(f"Cleanup cutoff: {cutoff} (drawers), {kg_cutoff} (KG)")
 

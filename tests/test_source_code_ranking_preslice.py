@@ -34,15 +34,12 @@ from mempalace.searcher import (
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def run_async(coro):
-    """Run an async coroutine in an existing event loop, or create a new one."""
+    """Run an async coroutine. Always creates a fresh event loop for isolation."""
+    loop = asyncio.new_event_loop()
     try:
-        loop = asyncio.get_running_loop()
-        if loop.is_closed():
-            raise RuntimeError("event loop is closed")
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
         return loop.run_until_complete(coro)
-    return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -190,21 +187,20 @@ class TestPresliceCodeBoost:
 class TestProjectPathIsolation:
     """Verify project_path filter is applied AFTER boost (no project leakage)."""
 
-    def test_no_cross_project_leakage(self, tmp_path):
+    def test_no_cross_project_leakage(self, project_with_auth_and_many_docs):
         """
         Two separate palaces — querying project A must not leak hits from B.
-        Uses the mixed_palace fixture for project A and a separate mine for B.
+        Uses the project_with_auth_and_many_docs fixture for project A.
         """
-        # Project A: the fixture project (has src/auth.py + docs)
         palace_a = tempfile.mkdtemp(prefix="mempalace_a_")
         palace_b = tempfile.mkdtemp(prefix="mempalace_b_")
         try:
-            proj_a = project_with_auth_and_many_docs(tmp_path)
+            proj_a = project_with_auth_and_many_docs
             mine(str(proj_a), palace_a, agent="test")
 
             # Project B: empty/minimal
-            proj_b = tmp_path / "proj_b"
-            proj_b.mkdir()
+            proj_b_root = tempfile.mkdtemp(prefix="mempalace_proj_b_")
+            proj_b = Path(proj_b_root)
             (proj_b / "mempalace.yaml").write_text(
                 "name: proj-b\nversion: 1\nwing: repo\n"
             )

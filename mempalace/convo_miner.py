@@ -12,7 +12,7 @@ import os
 import sys
 import hashlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 
 from .normalize import normalize
@@ -335,7 +335,7 @@ def mine_convos(
 
         # Batch: collect all drawer data then fire one upsert per file.
         documents, ids, metadatas = [], [], []
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         try:
             source_mtime = filepath.stat().st_mtime
         except OSError:

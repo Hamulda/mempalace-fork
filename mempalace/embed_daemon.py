@@ -18,6 +18,7 @@ Usage:
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import math
@@ -128,6 +129,7 @@ def _create_mlx_model():
         def _warmup(self):
             self._embed_batch(["warmup"])
             try:
+                mx.eval([])  # Finalize all pending GPU ops before clearing cache
                 mx.metal.clear_cache()
             except Exception:
                 pass
@@ -152,8 +154,11 @@ def _create_mlx_model():
 
         def embed(self, texts):
             result = self._embed_batch(list(texts))
-            # After each batch, clear Metal cache to prevent memory buildup
+            # After each batch, clear Metal cache to prevent memory buildup.
+            # mx.eval([]) is REQUIRED before clear_cache — MLX lazy evaluation
+            # means GPU ops are not finalized until eval is called.
             try:
+                mx.eval([])
                 mx.metal.clear_cache()
             except Exception:
                 pass
@@ -541,11 +546,14 @@ def run_embed_doctor() -> dict:
 
 def run_daemon() -> None:
     """Main daemon loop."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [embed-daemon] %(message)s",
-        stream=sys.stdout,
-    )
+    # Only configure logging if no handlers are already configured
+    # (operator may have set log level via environment or external config)
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [embed-daemon] %(message)s",
+            stream=sys.stdout,
+        )
 
     import platform
     is_apple_silicon = (
@@ -594,6 +602,21 @@ def run_daemon() -> None:
     # Write PID file next to socket so stop/status can find it regardless of custom sock path
     pid_path = get_pid_path()
     Path(pid_path).write_text(str(os.getpid()))
+
+    def _cleanup_atexit():
+        """Cleanup on abnormal exit (SIGKILL, crash, atexit)."""
+        logger.info("Embedding daemon exiting via atexit...")
+        _bg_executor.shutdown(wait=False)
+        try:
+            os.unlink(get_socket_path())
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(get_pid_path())
+        except FileNotFoundError:
+            pass
+
+    atexit.register(_cleanup_atexit)
 
     logger.info("Embedding daemon ready at %s (PID %d)", sock_path, os.getpid())
     print("READY", flush=True)

@@ -17,7 +17,7 @@ import fnmatch
 import time
 import json as _json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 
 from .config import MempalaceConfig
@@ -969,7 +969,7 @@ def add_drawer(
             "chunk_index": chunk_index,
             "added_by": agent,
             "agent_id": agent,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "origin_type": "observation",
             "is_latest": True,
             "supersedes_id": "",
@@ -1054,7 +1054,7 @@ def _prepare_file_drawers(
         return None
 
     revision_id = _compute_file_revision(source_file, content)
-    timestamp = datetime.utcnow().isoformat() + "Z"
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     try:
         source_mtime = os.path.getmtime(source_file)
