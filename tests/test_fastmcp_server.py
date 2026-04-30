@@ -10,13 +10,22 @@ Migration from test_mcp_server.py (legacy MCP SDK) → FastMCP Client pattern.
 import json
 import pytest
 import pytest_asyncio
-import chromadb
+
+try:
+    import chromadb
+    _CHROMADB_AVAILABLE = True
+except ImportError:
+    _CHROMADB_AVAILABLE = False
+
 from unittest.mock import patch, MagicMock
 
 from fastmcp import Client
 from mempalace.fastmcp_server import create_server
 from mempalace.settings import MemPalaceSettings
 from mempalace.backends import get_backend
+
+# ChromaDB backend has been removed — skip entire module
+pytestmark = pytest.mark.skip(reason="ChromaDB backend removed — tests require chromadb")
 
 
 pytestmark = pytest.mark.asyncio

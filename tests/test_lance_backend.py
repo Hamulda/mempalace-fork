@@ -17,7 +17,7 @@ import pytest
 pytest.importorskip("lancedb", reason="LanceDB not installed — run: pip install 'mempalace[lance]'")
 
 from mempalace.backends.lance import LanceBackend, LanceCollection, _where_to_sql, _apply_where_filter
-from mempalace.backends import get_backend, ChromaBackend
+from mempalace.backends import get_backend
 
 
 # ── Deterministic mock embeddings ───────────────────────────────────────────────
@@ -70,11 +70,10 @@ def lance_collection(tmp_palace):
 # ── Backend abstraction ────────────────────────────────────────────────────────
 
 class TestBackendFactory:
-    def test_get_chroma_backend(self):
-        backend = get_backend("chroma")
-        # ChromaBackend may be None if ChromaDB is not installed
-        if ChromaBackend is not None:
-            assert isinstance(backend, ChromaBackend)
+    def test_get_chroma_backend_raises(self):
+        """ChromaDB backend has been removed — requesting it raises ValueError."""
+        with pytest.raises(ValueError, match="ChromaDB backend has been removed"):
+            get_backend("chroma")
 
     def test_get_lance_backend(self):
         backend = get_backend("lance")

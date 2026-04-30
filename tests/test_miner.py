@@ -3,8 +3,12 @@ import shutil
 import tempfile
 from pathlib import Path
 
-import chromadb
+import pytest
+
 import yaml
+
+# ChromaDB backend has been removed — these tests require chromadb and are skipped
+pytestmark = pytest.mark.skip(reason="ChromaDB backend removed — these tests require chromadb")
 
 # Force chromadb backend for these tests (they use chromadb.PersistentClient directly)
 os.environ["MEMPALACE_BACKEND"] = "chroma"

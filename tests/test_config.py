@@ -47,20 +47,20 @@ def test_backend_reads_file_lance(tmp_path):
     assert cfg.backend == "lance"
 
 
-def test_backend_reads_file_chroma(tmp_path):
-    """Legacy Chroma backend is still readable when explicitly configured."""
-    cfg = MempalaceConfig(config_dir=str(tmp_path))
+def test_backend_reads_file_chroma_is_ignored(tmp_path):
+    """ChromaDB backend has been removed — config with backend='chroma' is ignored and defaults to lance."""
     (tmp_path / "config.json").write_text(json.dumps({"backend": "chroma"}))
-    # Re-init to re-read after writing
     cfg2 = MempalaceConfig(config_dir=str(tmp_path))
-    assert cfg2.backend == "chroma"
+    # chroma config is ignored: warns and defaults to lance
+    assert cfg2.backend == "lance"
 
 
 def test_backend_env_overrides_file(tmp_path):
-    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    """Env var MEMPALACE_BACKEND=lance overrides config file's chroma setting."""
     (tmp_path / "config.json").write_text(json.dumps({"backend": "chroma"}))
     os.environ["MEMPALACE_BACKEND"] = "lance"
     try:
+        cfg = MempalaceConfig(config_dir=str(tmp_path))
         assert cfg.backend == "lance"
     finally:
         del os.environ["MEMPALACE_BACKEND"]

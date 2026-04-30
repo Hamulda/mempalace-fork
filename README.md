@@ -150,17 +150,18 @@ Restart Claude Code, then type `/skills` to verify "mempalace" appears.
 
 ## Claude Code Plugin (Recommended for Claude Code Users)
 
-The plugin manages the shared HTTP server lifecycle automatically via hooks.
-No manual MCP registration needed — the plugin handles everything.
+The plugin provides skills and MCP tools connected via `.mcp.json` pointing to the
+shared HTTP server at `http://127.0.0.1:8765/mcp`. After installing, verify with:
 
 ```bash
-claude plugin marketplace add hamulda/mempalace-fork
-claude plugin install --scope user mempalace
+curl http://127.0.0.1:8765/health
+/mempalace:status
 ```
 
-Restart Claude Code. The plugin starts `mempalace serve` on first session,
-connects MCP tools via `.claude-plugin/.mcp.json`, and shuts down the server
-when the last session exits.
+**Hook lifecycle** (`SessionStart`, `Stop`, `PreCompact`) is managed automatically via
+hooks — but this **requires manual registration** in `settings.json` (see
+`.claude-plugin/README.md`). Without hook registration, run `mempalace serve`
+manually in a terminal.
 
 Verify with:
 ```bash
@@ -497,16 +498,10 @@ Letta charges $20–200/mo for agent-managed memory. MemPalace does it with a wi
 
 ## Claude Code Plugin
 
-The Claude Code plugin is the recommended way to run MemPalace. It manages
-server lifecycle via hooks — start on first session, stop when the last exits.
-
-```bash
-claude plugin marketplace add hamulda/mempalace-fork
-claude plugin install --scope user mempalace
-```
-
-Restart Claude Code. Tools appear automatically via `.claude-plugin/.mcp.json`
-pointing to the shared HTTP server at `http://127.0.0.1:8765/mcp`.
+The Claude Code plugin is the recommended way to run MemPalace. Tools connect via
+`.claude-plugin/.mcp.json` pointing to the shared HTTP server at
+`http://127.0.0.1:8765/mcp`. Hook lifecycle (start/stop) requires manual
+registration in `settings.json` (see `.claude-plugin/README.md`).
 
 Verify:
 ```bash

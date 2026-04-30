@@ -861,7 +861,7 @@ class SemanticDeduplicator:
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        n_workers = max(1, min(len(valid_orig_indices), 8))
+        n_workers = max(1, min(len(valid_orig_indices), 4))
 
         results: list[tuple[str, str | None]] = [("unique", None)] * len(documents)
         # Mark quarantined indices as "quarantined" so upsert skips them

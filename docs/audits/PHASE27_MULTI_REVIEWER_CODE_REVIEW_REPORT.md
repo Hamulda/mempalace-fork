@@ -59,7 +59,7 @@
 
 | ID | File:Line | Description | Status |
 |----|-----------|-------------|--------|
-| PERF-002 | `lance.py:898-905` | `classify_batch` 8-thread `ThreadPoolExecutor` all contend on same LanceDB table — thread contention, not parallelism; context switching overhead | Open |
+| PERF-002 | `lance.py:898-905` | `classify_batch` 8-thread `ThreadPoolExecutor` all contend on same LanceDB table | **Fixed 2026-04-30**: reduced max_workers from 8 to 4 |
 | PERF-003 | `searcher.py:678-680` | Sync/async code boost inconsistency: sync version slices BEFORE boost, async version slices AFTER boost — behavior differs between paths | Open |
 | PERF-004 | `lance.py:1344-1358` | `_apply_where_filter` parses metadata 3+ times per row per page for `$and` with multiple conditions — should chain filters or pre-compute once | Open |
 

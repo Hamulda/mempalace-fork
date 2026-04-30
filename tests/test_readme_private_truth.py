@@ -83,3 +83,46 @@ class TestReadmePrivateTruth:
         assert ".claude-plugin/README.md" in text, (
             "README must reference .claude-plugin/README.md for hook registration"
         )
+
+    def test_no_unqualified_automatic_lifecycle_via_hooks(self):
+        """README must not claim server lifecycle is automatic via hooks without registration qualification.
+
+        Flags: "automatically via hooks" in same sentence as server lifecycle claims
+        (lifecycle, start, stop, shutdown, session). Does NOT flag auto-save hooks.
+        """
+        text = self.readme()
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if "automatically" in line.lower() and "hooks" in line.lower():
+                # Skip auto-save feature descriptions (around "Auto-Save Hooks" section)
+                if "auto-save" in line.lower() or "save hook" in line.lower():
+                    continue
+                # Only flag if line mentions server lifecycle concepts
+                # "stop" alone is too broad (auto-save hook "stop" trigger) — require compound terms
+                lifecycle_terms = {
+                    "lifecycle", "server lifecycle", "server start", "server shutdown",
+                    "server stop", "shutdown", "session exit", "server"
+                }
+                if any(term in line.lower() for term in lifecycle_terms):
+                    # Must have hook registration qualification nearby (within 3 lines)
+                    context = "\n".join(lines[max(0, i-3):min(len(lines), i+4)])
+                    assert (
+                        "settings.json" in context
+                        or "requires" in context.lower()
+                        or "registration" in context.lower()
+                    ), (
+                        f"Overclaim at line {i+1}: 'automatically via hooks' without "
+                        f"hook registration qualification.\nContext:\n{context[:300]}"
+                    )
+
+    def test_no_unqualified_no_manual_mcp_registration(self):
+        """README must not say 'No manual MCP registration needed' without qualification."""
+        text = self.readme()
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if re.search(r"no manual.*mcp.*registration|manual.*mcp.*registration.*needed", line, re.I):
+                # Must not say "plugin handles everything" or "needed" without qualification
+                assert not re.search(r"plugin handles everything|handles everything", line, re.I), (
+                    f"Overclaim at line {i+1}: 'No manual MCP registration needed — "
+                    f"the plugin handles everything' without qualification.\n{line.strip()}"
+                )

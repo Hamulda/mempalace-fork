@@ -32,6 +32,18 @@ logger = logging.getLogger("mempalace_lexical")
 _DEFAULT_TOKENIZE = "porter unicode61"
 
 
+def _looks_like_file_extension(query: str) -> bool:
+    """Return True if query looks like a file extension pattern (e.g. auth.py, main.go)."""
+    return (
+        query.startswith(".")
+        or (
+            "." in query
+            and len(query) >= 3
+            and query.replace(".", "", 1).isalnum()
+        )
+    )
+
+
 class KeywordIndex:
     """
     Persistent FTS5 keyword index for drawer content.
@@ -219,6 +231,13 @@ class KeywordIndex:
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
 
+            # Escape FTS5 special chars: "." in file extensions like "auth.py" is
+            # a query syntax error (division operator). Wrap in double-quotes so
+            # FTS5 treats the whole token as a single term.
+            fts5_query = query
+            if _looks_like_file_extension(query):
+                fts5_query = '"' + query + '"'
+
             sql = f"""
                 SELECT document_id, bm25(drawers_fts) as score, wing, room, language
                 FROM drawers_fts
@@ -227,7 +246,7 @@ class KeywordIndex:
                 ORDER BY score
                 LIMIT ?
             """
-            params = [query] + params + [n_results]
+            params = [fts5_query] + params + [n_results]
 
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()

@@ -954,9 +954,13 @@ def _symbol_first_search(
         min_line = min(l[0] for l in lines)
         max_line = max(l[1] for l in lines)
 
-        # Use FTS5 to get chunks from this file — works without vector similarity
+        # Use FTS5 to get chunks from this file — works without vector similarity.
+        # Quote the query for FTS5 if it contains dots/spaces (FTS5 syntax operators).
         try:
-            fts5_hits = _fts5_search(query, collection, palace_path, n_results=500, language=None)
+            fts5_query = query
+            if "." in query or " " in query:
+                fts5_query = '"' + query + '"'
+            fts5_hits = _fts5_search(fts5_query, collection, palace_path, n_results=500, language=None)
         except Exception:
             fts5_hits = []
 

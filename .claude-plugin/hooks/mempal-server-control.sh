@@ -225,13 +225,26 @@ start_server() {
     # Disable GPU for MacBook Air M1 (UMA — GPU=CPU, slow)
     export PYTORCH_MPS_GPU_BACKEND="${PYTORCH_MPS_GPU_BACKEND:-}"
 
+    # Use project .venv python (has all dependencies: fastmcp, mempalace, lancedb)
+    # pyenv shims resolve to system-managed Python which lacks these packages
+    # .venv is at <project>/.venv, and script is at <project>/.claude-plugin/hooks/
+    PYTHON_BIN="$SCRIPT_DIR/../../.venv/bin/python3"
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        # Fallback: try pyenv-resolved python (may lack packages)
+        if command -v python3 >/dev/null 2>&1; then
+            PYTHON_BIN="python3"
+        else
+            PYTHON_BIN="/Users/vojtechhamada/.pyenv/versions/3.14/bin/python3"
+        fi
+    fi
+
     # Prefer mempalace binary if available; otherwise use python -m
     if command -v mempalace >/dev/null 2>&1; then
         SERVE_CMD="mempalace serve --host 127.0.0.1 --port 8765"
         log_msg "start_server: using mempalace binary"
     else
-        SERVE_CMD="python3 -m mempalace serve --host 127.0.0.1 --port 8765"
-        log_msg "start_server: using python3 -m mempalace (mempalace binary not in PATH)"
+        SERVE_CMD="$PYTHON_BIN -m mempalace serve --host 127.0.0.1 --port 8765"
+        log_msg "start_server: using $PYTHON_BIN -m mempalace"
     fi
 
     nohup sh -c "exec $SERVE_CMD" \

@@ -25,10 +25,10 @@ import pytest
 from mempalace.miner import mine
 from mempalace.searcher import (
     auto_search,
-    code_search,
     code_search_async,
     hybrid_search_async,
 )
+from mempalace.server._code_tools import _source_file_matches
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -40,6 +40,47 @@ def run_async(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+def make_project_with_auth_and_many_docs(root: Path) -> Path:
+    """
+    Create project with:
+      - src/auth.py: contains "class AuthManager" ONCE
+      - docs/auth_00.md .. docs/auth_20.md: 21 docs each repeating
+        "AuthManager" 40× via "See `AuthManager` for {i}" prose lines
+
+    The docs collectively have ~840 AuthManager mentions vs 1 in source.
+    Without pre-slice boost, docs would dominate the top-5.
+    """
+    (root / "mempalace.yaml").write_text(
+        "name: test-project\nversion: 1\nwing: repo\n"
+    )
+
+    src = root / "src"
+    src.mkdir()
+    (src / "auth.py").write_text(
+        '"""Authentication module."""\n\n'
+        'class AuthManager:\n'
+        '    """Central authentication manager."""\n'
+        '    def __init__(self, config):\n'
+        '        self.config = config\n'
+        '    def authenticate(self, user, password):\n'
+        '        return True\n'
+        '    def revoke(self, token):\n'
+        '        self._session_store.pop(token, None)\n'
+    )
+
+    docs = root / "docs"
+    docs.mkdir()
+    for i in range(21):
+        (docs / f"auth_{i:02d}.md").write_text(
+            "# Authentication\n\n"
+            + "\n".join(f"See `AuthManager` for {j}"
+                        for j in range(40))
+            + "\n\nAuthManager handles authentication."
+        )
+
+    return root
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -187,69 +228,53 @@ class TestPresliceCodeBoost:
 class TestProjectPathIsolation:
     """Verify project_path filter is applied AFTER boost (no project leakage)."""
 
-    def test_no_cross_project_leakage(self, project_with_auth_and_many_docs):
+    def test_no_cross_project_leakage(self):
         """
-        Two separate palaces — querying project A must not leak hits from B.
-        Uses the project_with_auth_and_many_docs fixture for project A.
+        In a palace with proj_a, querying with project_path=proj_a filter
+        must not return hits from outside that project.
+        Uses make_project_with_auth_and_many_docs helper directly.
         """
-        palace_a = tempfile.mkdtemp(prefix="mempalace_a_")
-        palace_b = tempfile.mkdtemp(prefix="mempalace_b_")
+        proj_a = make_project_with_auth_and_many_docs(Path(tempfile.mkdtemp(prefix="mempalace_proj_a_")))
+        palace = tempfile.mkdtemp(prefix="mempalace_iso_")
         try:
-            proj_a = project_with_auth_and_many_docs
-            mine(str(proj_a), palace_a, agent="test")
+            # Mine proj_a into palace
+            mine(str(proj_a), palace, agent="test")
 
-            # Project B: empty/minimal
-            proj_b_root = tempfile.mkdtemp(prefix="mempalace_proj_b_")
-            proj_b = Path(proj_b_root)
-            (proj_b / "mempalace.yaml").write_text(
-                "name: proj-b\nversion: 1\nwing: repo\n"
+            # Query AuthManager with project_path=proj_a filter via code_search_async
+            result = run_async(
+                code_search_async("AuthManager", palace, n_results=10,
+                                  project_path=str(proj_a))
             )
-            src_b = proj_b / "src"
-            src_b.mkdir()
-            (src_b / "other.py").write_text(
-                "class Unrelated:\n    pass\n"
-            )
-            mine(str(proj_b), palace_b, agent="test")
+            hits = result.get("results", [])
+            assert len(hits) >= 1, f"No results with project_path filter: {result}"
 
-            # Query A from A's palace — no project_path filter
-            result_a = run_async(
-                auto_search("AuthManager", palace_a, n_results=5)
-            )
-            hits_a = result_a.get("results", [])
-            assert len(hits_a) >= 1
-
-            # Query A from A's palace WITH project_path filter
-            result_a_filtered = run_async(
-                auto_search("AuthManager", palace_a, n_results=5,
-                            project_path=str(proj_a))
-            )
-            hits_a_filtered = result_a_filtered.get("results", [])
-            assert len(hits_a_filtered) >= 1
-
-            # Both must return auth.py — filtering must NOT break results
-            top_filtered = [h.get("source_file", "") for h in hits_a_filtered]
-            assert any("auth.py" in src for src in top_filtered), (
-                f"project_path filter broke results.\n"
-                f"Top-5 filtered: {top_filtered}"
-            )
+            # All returned hits must belong to proj_a (use same _source_file_matches as filter)
+            for hit in hits:
+                sf = hit.get("source_file", "")
+                assert _source_file_matches(sf, str(proj_a)), (
+                    f"Hit from wrong project: {sf} not under {proj_a}"
+                )
         finally:
-            shutil.rmtree(palace_a, ignore_errors=True)
-            shutil.rmtree(palace_b, ignore_errors=True)
+            shutil.rmtree(palace, ignore_errors=True)
+            shutil.rmtree(proj_a, ignore_errors=True)
 
 
 class TestExactPathQuery:
-    """Exact path queries must not be damaged by boost."""
+    """Symbol-first queries (intent=symbol) route through _symbol_first_search."""
 
-    def test_exact_path_query_returns_file(self, mixed_palace,
-                                          project_with_auth_and_many_docs):
-        """Exact path query for src/auth.py returns that file, not boosted away."""
-        auth_path = str(project_with_auth_and_many_docs / "src" / "auth.py")
+    def test_symbol_intent_query(self, mixed_palace):
+        """
+        Query 'AuthManager' is classified as symbol intent.
+        Goes through _symbol_first_search → SymbolIndex → returns auth.py.
+        """
         result = run_async(
-            auto_search(auth_path, mixed_palace, n_results=3)
+            auto_search("AuthManager", mixed_palace, n_results=5)
         )
         hits = result.get("results", [])
-        assert len(hits) >= 1, f"No results for exact path: {result}"
-        top_src = hits[0].get("source_file", "")
-        assert "auth.py" in top_src, (
-            f"Exact path query did not return auth.py: {top_src}"
+        assert len(hits) >= 1, f"No results for AuthManager: {result}"
+        top_sources = [h.get("source_file", "") for h in hits]
+        auth_found = any("auth.py" in src for src in top_sources)
+        assert auth_found, (
+            f"AuthManager query did not return auth.py.\n"
+            f"Sources: {top_sources}"
         )

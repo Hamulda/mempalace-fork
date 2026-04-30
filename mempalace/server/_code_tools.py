@@ -3,6 +3,7 @@ from __future__ import annotations
 """
 Code intelligence tools: search_code, auto_search, file_context, project_context.
 """
+import os
 from pathlib import Path
 
 from fastmcp import Context
@@ -64,9 +65,10 @@ def _source_file_matches(source_file: str, project_path: str) -> bool:
     """
     if not source_file or not project_path:
         return False
-    # Resolve symlinks so /tmp and /private/tmp compare equal on macOS
-    sf_resolved = str(Path(source_file).expanduser().resolve()).lower()
-    pp_resolved = str(Path(project_path).expanduser().resolve()).lower()
+    # Resolve symlinks so /var and /private/var compare equal on macOS
+    # os.path.realpath resolves all symlinks including /var -> /private/var
+    sf_resolved = os.path.realpath(os.path.expanduser(source_file)).lower()
+    pp_resolved = os.path.realpath(os.path.expanduser(project_path)).lower()
     pp_norm = pp_resolved.rstrip("/")
     sf_norm = sf_resolved.rstrip("/")
 
