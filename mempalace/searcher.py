@@ -524,7 +524,8 @@ def _rrf_merge(result_lists: list, k: int = 60) -> list:
     sorted_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
     merged = []
     for key in sorted_keys:
-        hit = seen[key]
+        # Copy hit to avoid mutating input lists (ARCH-003 fix)
+        hit = dict(seen[key])
         hit["rrf_score"] = scores[key]
         merged.append(hit)
     return merged
@@ -590,7 +591,11 @@ def hybrid_search(
                 logger.warning("KG layer failed in hybrid_search, vector search only: %s", e)
 
     # Reciprocal Rank Fusion — kombinuje vysledky ze vsech tri vrstev
-    merged = _rrf_merge([hits, fts5_hits, kg_hits])[:n_results]
+    # RRF merge, THEN boost, THEN slice — code boost must be able to pull docs
+    # outside the initial top-k into the final results (matches async path).
+    merged = _rrf_merge([hits, fts5_hits, kg_hits])
+    merged = _apply_code_boost(merged, query, "mixed")
+    merged = merged[:n_results]
 
     return {
         "query": query,
@@ -670,11 +675,9 @@ async def hybrid_search_async(
             v_task = tg.create_task(asyncio.to_thread(_vector_layer))
             f_task = tg.create_task(asyncio.to_thread(_fts5_layer))
             kg_task = tg.create_task(asyncio.to_thread(_kg_layer))
-        vector_results, fts5_hits, kg_hits = (
-            v_task.result(),
-            f_task.result(),
-            kg_task.result(),
-        )
+        # TaskGroup ensures all tasks complete before exiting the block.
+        # Result extraction is field access only — no additional waiting (BN-003 fix).
+        vector_results, fts5_hits, kg_hits = v_task.result(), f_task.result(), kg_task.result()
 
         hits = vector_results.get("results", [])
 
@@ -1054,30 +1057,19 @@ def _path_metadata_search(
     max_scan: int = 5000,
 ) -> list[dict]:
     """
-    Path-first retrieval using metadata search FIRST, FTS5 as bounded fallback.
+    Path-first retrieval using path index FIRST, bounded LanceDB scan as fallback.
 
     Query flow (in priority order):
-    1. Exact source_file match (query == source_file)
-    2. Suffix match (source_file.endswith(query))
-    3. Basename match only as last resort
-    4. Bounded LanceDB metadata scan (max_scan chunks, batch 500)
-    5. Bounded FTS5 content search ONLY if scan yields < n_results
+    1. PathIndex search (exact/suffix/basename) — fast SQLite lookup
+    2. Bounded LanceDB metadata scan if PathIndex yields < n_results
+    3. Bounded FTS5 content search ONLY if scan yields < n_results
 
     Returns list of hit dicts with rrf_score.
     """
+    from .path_index import PathIndex
+
     matched = []
     seen_ids = set()
-    batch = 500
-    scanned = 0
-
-    # Build LanceDB filter for project_path scope
-    from .retrieval_planner import build_planner_filters
-    base_filter = build_planner_filters(
-        project_path=project_path,
-        language=language,
-        wing=None,
-        is_latest=True,
-    )
 
     def _build_hit(rid, doc, meta, source_label):
         sf = meta.get("source_file", "")
@@ -1096,55 +1088,116 @@ def _path_metadata_search(
             "language": meta.get("language", ""),
         }
 
-    # ── Phase 1: Exact / suffix / basename metadata scan ─────────────────────
-    while scanned < max_scan and len(matched) < n_results:
-        try:
-            result = col.get(
-                limit=batch,
-                offset=scanned,
-                where=base_filter if base_filter else {"is_latest": True},
-                include=["documents", "metadatas", "ids"],
-            )
-        except Exception as e:
-            logger.warning("Path metadata scan get() failed: %s", e)
-            break
+    # ── Phase 1: PathIndex fast lookup ──────────────────────────────────────
+    try:
+        idx = PathIndex.get(palace_path)
+        path_results = idx.search_path(
+            query=query,
+            project_path=project_path,
+            language=language,
+            limit=n_results,
+        )
+        if path_results:
+            # Fetch full LanceDB records for matched document_ids
+            doc_ids = [r["document_id"] for r in path_results]
+            # Build a lookup from the path results
+            doc_lookup = {r["document_id"]: r for r in path_results}
 
-        batch_ids = result.get("ids", [])
-        if not batch_ids:
-            break
+            # Try to get full records from LanceDB for enriched data
+            try:
+                result = col.get(ids=doc_ids, include=["documents", "metadatas", "ids"])
+                for rid, doc, meta in zip(
+                    result.get("ids", []),
+                    result.get("documents", []),
+                    result.get("metadatas", []),
+                ):
+                    matched.append(_build_hit(rid, doc, meta, "path_index"))
+                    seen_ids.add(rid)
+            except Exception as e:
+                logger.warning("PathIndex LanceDB fetch failed: %s", e)
+                # Fall back to path index data alone
+                for rid, r in doc_lookup.items():
+                    if rid in seen_ids:
+                        continue
+                    seen_ids.add(rid)
+                    matched.append({
+                        "id": rid,
+                        "text": "",
+                        "source_file": r["source_file"],
+                        "wing": r.get("wing", "repo"),
+                        "room": r.get("room", ""),
+                        "line_start": r.get("line_start", 0),
+                        "line_end": r.get("line_end", 0),
+                        "symbol_name": r.get("symbol_name", ""),
+                        "chunk_kind": r.get("chunk_kind", "code"),
+                        "similarity": 1.0,
+                        "source": "path_index",
+                        "language": r.get("language", ""),
+                    })
+    except Exception as e:
+        logger.warning("PathIndex lookup failed: %s — falling back to LanceDB", e)
 
-        for rid, doc, meta in zip(batch_ids, result.get("documents", []), result.get("metadatas", [])):
-            if rid in seen_ids:
-                continue
-            seen_ids.add(rid)
-            sf = meta.get("source_file", "")
+    # ── Phase 2: Bounded LanceDB scan if needed ─────────────────────────────
+    if len(matched) < n_results:
+        batch = 500
+        scanned = 0
 
-            # Priority 1: exact match
-            if sf == query:
-                matched.append(_build_hit(rid, doc, meta, "path_metadata"))
-                if len(matched) >= n_results:
-                    break
-                continue
+        from .retrieval_planner import build_planner_filters
+        base_filter = build_planner_filters(
+            project_path=project_path,
+            language=language,
+            wing=None,
+            is_latest=True,
+        )
 
-            # Priority 2: suffix match (query is trailing path component)
-            if sf.endswith(query) or sf.endswith("/" + query):
-                matched.append(_build_hit(rid, doc, meta, "path_metadata"))
-                if len(matched) >= n_results:
-                    break
-                continue
+        while scanned < max_scan and len(matched) < n_results:
+            try:
+                result = col.get(
+                    limit=batch,
+                    offset=scanned,
+                    where=base_filter if base_filter else {"is_latest": True},
+                    include=["documents", "metadatas", "ids"],
+                )
+            except Exception as e:
+                logger.warning("Path metadata scan get() failed: %s", e)
+                break
 
-            # Priority 3: basename match only if query is short (file name)
-            if "/" not in query and not query.endswith(".py") and not query.endswith(".js"):
-                basename = sf.split("/")[-1]
-                if basename == query:
+            batch_ids = result.get("ids", [])
+            if not batch_ids:
+                break
+
+            for rid, doc, meta in zip(batch_ids, result.get("documents", []), result.get("metadatas", [])):
+                if rid in seen_ids:
+                    continue
+                seen_ids.add(rid)
+                sf = meta.get("source_file", "")
+
+                # Priority 1: exact match
+                if sf == query:
                     matched.append(_build_hit(rid, doc, meta, "path_metadata"))
                     if len(matched) >= n_results:
                         break
                     continue
 
-        scanned += len(batch_ids)
+                # Priority 2: suffix match
+                if sf.endswith(query) or sf.endswith("/" + query):
+                    matched.append(_build_hit(rid, doc, meta, "path_metadata"))
+                    if len(matched) >= n_results:
+                        break
+                    continue
 
-    # ── Phase 2: Bounded FTS5 fallback only if needed ───────────────────────
+                # Priority 3: basename match (short names only)
+                if "/" not in query and not query.endswith(".py") and not query.endswith(".js"):
+                    basename = sf.split("/")[-1]
+                    if basename == query:
+                        matched.append(_build_hit(rid, doc, meta, "path_metadata"))
+                        if len(matched) >= n_results:
+                            break
+                        continue
+
+            scanned += len(batch_ids)
+
+    # ── Phase 3: Bounded FTS5 fallback only if needed ───────────────────────
     if len(matched) < n_results:
         try:
             fts5_hits = _fts5_search(
@@ -1423,13 +1476,15 @@ async def auto_search(
                 }
         except Exception:
             pass
-        # Fall back to code_search if FTS5 finds nothing — inject complexity into result
+        # Fall back to code_search if FTS5 finds nothing — code_search_async already
+        # applies _apply_code_boost internally (lines 1317, 1348, 1408); do not boost
+        # again here to avoid double-boost stacking (ARCH-003 fix).
         result = await code_search_async(query, palace_path, n_results=n_results)
         result["filters"]["complexity"] = complexity
-        result["results"] = _apply_code_boost(result["results"], query, result.get("filters", {}).get("intent", "mixed"))
         return result
     elif complexity == "code":
-        # code_search returns its own filters dict — inject complexity
+        # code_search already applies _apply_code_boost internally (line 1408);
+        # do not boost again here to avoid double-boost stacking (ARCH-003 fix).
         result = await code_search_async(query, palace_path, n_results=n_results)
         result["filters"]["complexity"] = complexity
         return result

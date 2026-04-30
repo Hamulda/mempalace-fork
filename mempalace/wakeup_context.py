@@ -12,7 +12,9 @@ Phase 6 enrichment:
 
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
 from typing import Optional
 
 from .claims_manager import ClaimsManager
@@ -279,3 +281,187 @@ def build_wakeup_context(
     result["recommended_tools"] = recommended
 
     return result
+
+
+def build_startup_context(
+    session_id: str,
+    project_path: str | None = None,
+    palace_path: str | None = None,
+    limit: int = 8,
+) -> dict:
+    """
+    Build compact startup context for a Claude Code session.
+
+    Inputs:
+    - project_path: optional project root to scope claims/handoffs
+    - session_id: required, auto-detected by the MCP tool wrapper
+    - palace_path: palace data directory
+    - limit: max handoffs to return (default 8)
+
+    Returns:
+    - server_health: HTTP health ping result
+    - palace_path: palace data path
+    - backend: storage backend (always 'lance')
+    - python_version: sys.version_info string
+    - embedding_provider: provider name from embed daemon probe
+    - embedding_meta: model_id if available
+    - active_sessions: count from session registry
+    - current_claims: claims for project_path (or all if no project_path)
+    - pending_handoffs: handoffs for this session (limited)
+    - recommended_first_actions: startup workflow steps
+    - project_path_reminder: the project_path passed in or derived
+    - m1_defaults: bounded defaults for M1/8GB runs
+    """
+    import sys
+    from .session_registry import SessionRegistry
+
+    if palace_path is None:
+        palace_path = os.environ.get(
+            "MEMPALACE_PATH", os.path.expanduser("~/.mempalace/palace")
+        )
+
+    # Resolve project_path — use as-is if provided, derive from git root otherwise
+    resolved_project = project_path
+    if resolved_project is None:
+        resolved_project = _find_git_root(palace_path) or ""
+
+    claims_mgr = ClaimsManager(palace_path)
+    handoff_mgr = HandoffManager(palace_path)
+
+    # ── Server health via HTTP probe ────────────────────────────────────────
+    server_health = {"status": "unknown", "pid": None, "transport": None, "url": None}
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8765/health",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = resp.read()
+            server_health = {"status": "ok", "health": json.loads(data)}
+    except Exception:
+        pass
+
+    # ── Embedding provider via daemon probe ─────────────────────────────────
+    embedding_provider = "unknown"
+    embedding_meta = {}
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8766/probe",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = resp.read()
+            probe = json.loads(data)
+            embedding_provider = probe.get("provider", "unknown")
+            model_id = probe.get("model_id", "")
+            if model_id:
+                embedding_meta["model_id"] = model_id
+            batch_size = probe.get("embed_batch_size")
+            if batch_size:
+                embedding_meta["embed_batch_size"] = batch_size
+    except Exception:
+        pass
+
+    # ── Active sessions ──────────────────────────────────────────────────────
+    active_sessions = 0
+    try:
+        reg = SessionRegistry(palace_path)
+        sessions = reg.get_active_sessions(project_root=resolved_project or None)
+        active_sessions = len(sessions)
+    except Exception:
+        pass
+
+    # ── Claims for project_path ────────────────────────────────────────────
+    current_claims = []
+    try:
+        all_claims = claims_mgr.list_active_claims()
+        if resolved_project:
+            all_claims = [
+                c for c in all_claims
+                if c.get("target_id", "").startswith(resolved_project)
+            ]
+        current_claims = [
+            {
+                "path": c["target_id"],
+                "owner": c.get("owner"),
+                "expires_at": c.get("expires_at"),
+            }
+            for c in all_claims[:50]
+        ]
+    except Exception:
+        pass
+
+    # ── Pending handoffs for session ───────────────────────────────────────
+    pending_handoffs = []
+    try:
+        directed = handoff_mgr.get_handoffs_for_session(session_id)
+        broadcasts = handoff_mgr.pull_handoffs(session_id=None, status="pending")
+        seen = set()
+        merged = []
+        for h in directed + broadcasts:
+            if h["id"] not in seen and h["status"] in ("pending", "accepted"):
+                seen.add(h["id"])
+                merged.append(h)
+        pending_handoffs = merged[:limit]
+    except Exception:
+        pass
+
+    # ── Recommended first actions ────────────────────────────────────────────
+    recommended = []
+    if current_claims:
+        recommended.append({
+            "action": "mempalace_list_claims",
+            "reason": f"{len(current_claims)} active claim(s) in workspace",
+            "priority": "medium",
+        })
+    if pending_handoffs:
+        recommended.append({
+            "action": "mempalace_pull_handoffs",
+            "reason": f"{len(pending_handoffs)} pending handoff(s) for this session",
+            "priority": "high",
+        })
+    if not current_claims and not pending_handoffs:
+        recommended.append({
+            "action": "mempalace_status",
+            "reason": "No active claims or handoffs — check palace overview first",
+            "priority": "high",
+        })
+    recommended.extend([
+        {
+            "action": "mempalace_search",
+            "reason": "Verify facts before responding — never guess",
+            "priority": "medium",
+        },
+        {
+            "action": "mempalace_diary_write",
+            "reason": "Record what happened at end of session",
+            "priority": "low",
+        },
+    ])
+
+    # ── M1 defaults ─────────────────────────────────────────────────────────
+    m1_defaults = {
+        "max_batch": 32,
+        "embed_batch_default": 64,
+        "memory_guard_active": True,
+        "query_cache_ttl": 300,
+        "claim_timeout_seconds": 60,
+        "session_timeout_seconds": 300,
+    }
+
+    return {
+        "server_health": server_health,
+        "palace_path": palace_path,
+        "backend": "lance",
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "embedding_provider": embedding_provider,
+        "embedding_meta": embedding_meta,
+        "active_sessions": active_sessions,
+        "current_claims": current_claims,
+        "current_claims_count": len(current_claims),
+        "pending_handoffs": pending_handoffs,
+        "pending_handoffs_count": len(pending_handoffs),
+        "recommended_first_actions": recommended,
+        "project_path_reminder": resolved_project,
+        "m1_defaults": m1_defaults,
+    }

@@ -153,3 +153,67 @@ class BaseCollection(ABC):
     @abstractmethod
     def get_by_id(self, record_id: str) -> dict[str, Any] | None:
         """Get a single record by id. Returns None if not found."""
+
+    @abstractmethod
+    def query_by_vector(
+        self,
+        vector: list[float],
+        n_results: int = 5,
+        where: dict[str, Any] | None = None,
+    ) -> dict[str, list[list[Any]]]:
+        """
+        Vector search with a pre-computed embedding vector (no re-embedding).
+
+        Returns flat-list format (same as get()):
+            {
+                "ids": [[id1, id2]],
+                "documents": [[doc1, doc2]],
+                "metadatas": [[{...}, {...}]],
+                "distances": [[0.1, 0.2]]
+            }
+        """
+
+    @abstractmethod
+    def classify_batch(
+        self,
+        documents: list[str],
+        metadatas: list[dict[str, Any]],
+        n_candidates: int = 5,
+    ) -> tuple[list[tuple[str, str | None]], list[list[float] | None], list[dict]]:
+        """
+        Classify documents as unique/duplicate/conflict against existing chunks.
+
+        Uses pre-computed embeddings (caller provides them aligned with documents).
+        Returns (classifications, embeddings_for_unique, failures).
+        Classifications use same format as SemanticDeduplicator.classify_batch.
+        """
+
+    @abstractmethod
+    def upsert_with_tombstones(
+        self,
+        documents: list[str],
+        ids: list[str],
+        metadatas: list[dict[str, Any]],
+        old_chunks_by_hash: dict[str, list[tuple]],
+    ) -> None:
+        """
+        Upsert documents and tombstone superseded chunks atomically.
+
+        Tombstoning logic: for each (old_id, old_meta) in old_chunks_by_hash,
+        if old_id is NOT in superseded_ids from any metadata, write it with
+        is_latest=False (tombstone). Otherwise leave it alone.
+        """
+
+    @abstractmethod
+    def get_by_source_files(
+        self,
+        source_files: list[str],
+        is_latest: bool = True,
+    ) -> dict[str, list[tuple]]:
+        """
+        Batch-get existing chunks by source_file list.
+
+        Returns dict mapping source_file → list of (id, metadata) tuples
+        for chunks where is_latest matches the filter.
+        Only returns id+metadata, not documents or vectors.
+        """

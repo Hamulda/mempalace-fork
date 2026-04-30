@@ -1,6 +1,6 @@
 {
   "swap_warning": true,
-  "swap_used_mb": 11109.3125,
+  "swap_used_mb": 10222.625,
   "aborted_early": true,
   "reason": "swap already active at start"
 }

@@ -22,6 +22,7 @@ Canonical invalidation story:
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import time
 import threading
 from typing import Any
@@ -63,7 +64,7 @@ class QueryCache:
         # Per-shard data structures — each shard is fully independent
         self._shards: list[dict] = [
             {
-                "cache": dict[str, tuple[Any, float]](),
+                "cache": OrderedDict[str, tuple[Any, float]](),
                 # Per-(palace_path, collection) write timestamps for cross-palace isolation.
                 "last_write": {},  # Key: (palace_path, collection_name)
             }
@@ -357,10 +358,12 @@ class EmbeddingCache:
             if key in self._cache:
                 del self._cache[key]
             self._cache[key] = (embedding, time.monotonic())
-            while len(self._cache) > self._maxsize:
-                # Evict oldest entry (first key in insertion-order dict)
-                oldest = next(iter(self._cache))
-                del self._cache[oldest]
+            # Bulk evict if over capacity — single while loop, no per-eviction overhead
+            if len(self._cache) > self._maxsize:
+                excess = len(self._cache) - self._maxsize
+                for _ in range(excess):
+                    oldest = next(iter(self._cache))
+                    del self._cache[oldest]
 
     def clear(self) -> None:
         """Clear all entries."""

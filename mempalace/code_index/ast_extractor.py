@@ -349,7 +349,11 @@ def _extract_py_stdlib_ast(content: str) -> dict:
     """Extract Python symbols using the stdlib ast module.
 
     Provides class/function/async function detection with correct parent scope
-    and fully-qualified names (FQN). Falls back to regex for non-Python files.
+    and fully-qualified names (FQN). Also extracts:
+      - import_refs: {module, names, alias, line}
+      - call_refs: {caller_fqn, callee_name, callee_attr, line}
+      - class_inheritance: {name, bases} per class
+      - decorators: {name, line, parent_fqn, symbol_kind} per decorated symbol
 
     This is the M1 Air safe path when tree-sitter is unavailable.
     """
@@ -359,16 +363,56 @@ def _extract_py_stdlib_ast(content: str) -> dict:
         return _extract_py_regex(content)
 
     symbols = []
-    imports = []
-    direct_imports = []
+    imports_list = []
+    direct_imports_list = []
     exports = []
+    import_refs = []
+    call_refs_out: list[dict] = []
+    decorators: list[dict] = []
+    inheritance: list[dict] = []
 
     # Stack entries: (node, parent_scope_list)
-    # parent_scope_list tracks the enclosing class/function names
     stack: list[tuple[object, list[str]]] = []
 
     # Seed with top-level body and empty parent scope
     stack.append((tree.body, []))
+
+    # Scope tracking for caller_fqn resolution
+    call_to_scope: dict[int, str] = {}
+
+    class ScopeTracker(ast.NodeVisitor):
+        """Track enclosing scope (fqn) for every Call node."""
+
+        def __init__(self):
+            super().__init__()
+            self._scope_stack: list[str] = []  # stack of fqns
+
+        def visit_ClassDef(self, node: ast.ClassDef):
+            fqn = ".".join(self._scope_stack + [node.name]) if self._scope_stack else node.name
+            self._scope_stack.append(fqn)
+            self.generic_visit(node)
+            self._scope_stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef):
+            fqn = ".".join(self._scope_stack + [node.name]) if self._scope_stack else node.name
+            self._scope_stack.append(fqn)
+            self.generic_visit(node)
+            self._scope_stack.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+            fqn = ".".join(self._scope_stack + [node.name]) if self._scope_stack else node.name
+            self._scope_stack.append(fqn)
+            self.generic_visit(node)
+            self._scope_stack.pop()
+
+        def visit_Call(self, node: ast.Call):
+            # Capture enclosing scope (class or function name, not full fqn)
+            caller = self._scope_stack[-1] if self._scope_stack else ""
+            call_to_scope[id(node)] = caller
+            self.generic_visit(node)
+
+    tracker = ScopeTracker()
+    tracker.visit(tree)
 
     while stack:
         nodes, parents = stack.pop()
@@ -377,6 +421,23 @@ def _extract_py_stdlib_ast(content: str) -> dict:
             if isinstance(node, ast.ClassDef):
                 fqn = ".".join(parents + [node.name]) if parents else node.name
                 parent_name = parents[-1] if parents else None
+
+                # Inheritance
+                bases = []
+                for b in node.bases:
+                    try:
+                        bases.append(ast.unparse(b))
+                    except Exception:
+                        bases.append("")
+                if any(bases):
+                    inheritance.append({"name": node.name, "bases": bases, "line": node.lineno})
+
+                # Decorators
+                for dec in node.decorator_list:
+                    dec_name = _ast_name_or_attr(dec)
+                    if dec_name:
+                        decorators.append({"name": dec_name, "line": dec.lineno, "parent_fqn": fqn, "symbol_kind": "class"})
+
                 symbols.append({
                     "name": node.name,
                     "kind": "class",
@@ -388,26 +449,20 @@ def _extract_py_stdlib_ast(content: str) -> dict:
                 stack.append((node.body, parents + [node.name]))
 
             # ── function (sync or async) ────────────────────────────────────────
-            elif isinstance(node, ast.FunctionDef):
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 fqn = ".".join(parents + [node.name]) if parents else node.name
                 parent_name = parents[-1] if parents else None
-                symbols.append({
-                    "name": node.name,
-                    "kind": "function",
-                    "line_start": node.lineno,
-                    "line_end": node.lineno + 1,
-                    "parent": parent_name,
-                    "fqn": fqn,
-                })
-                stack.append((node.body, parents))
 
-            # ── async function ────────────────────────────────────────────────
-            elif isinstance(node, ast.AsyncFunctionDef):
-                fqn = ".".join(parents + [node.name]) if parents else node.name
-                parent_name = parents[-1] if parents else None
+                # Decorators
+                for dec in node.decorator_list:
+                    dec_name = _ast_name_or_attr(dec)
+                    if dec_name:
+                        decorators.append({"name": dec_name, "line": dec.lineno, "parent_fqn": fqn, "symbol_kind": "function"})
+
+                kind = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
                 symbols.append({
                     "name": node.name,
-                    "kind": "async_function",
+                    "kind": kind,
                     "line_start": node.lineno,
                     "line_end": node.lineno + 1,
                     "parent": parent_name,
@@ -418,17 +473,30 @@ def _extract_py_stdlib_ast(content: str) -> dict:
             # ── import statements ─────────────────────────────────────────────
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    imports.append(alias.name)
+                    imports_list.append(alias.name)
+                    import_refs.append({
+                        "module": alias.name,
+                        "names": [],
+                        "alias": alias.asname or "",
+                        "line": node.lineno,
+                    })
 
             elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.append(node.module)
-                for alias in node.names:
-                    direct_imports.append(alias.name)
+                mod = node.module or ""
+                if mod:
+                    imports_list.append(mod)
+                names = [a.name for a in node.names]
+                for a in node.names:
+                    direct_imports_list.append(a.name)
+                import_refs.append({
+                    "module": mod,
+                    "names": names,
+                    "alias": "",
+                    "line": node.lineno,
+                })
 
             # ── top-level assignment (export heuristic) ────────────────────────
             elif isinstance(node, ast.Assign):
-                # Only consider top-level assignments
                 if not parents:
                     for target in node.targets:
                         if isinstance(target, ast.Name):
@@ -436,17 +504,62 @@ def _extract_py_stdlib_ast(content: str) -> dict:
                             if name and name[0].isupper() and name not in ("True", "False", "None"):
                                 exports.append(name)
 
+    # Resolve call_refs using recorded scope info
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            caller_fqn = call_to_scope.get(id(node), "")
+            callee_name, callee_attr = _resolve_callee(node.func)
+            if callee_name:  # Only record actual resolvable calls
+                call_refs_out.append({
+                    "caller_fqn": caller_fqn,
+                    "callee_name": callee_name,
+                    "callee_attr": callee_attr or "",
+                    "line": node.lineno or 0,
+                })
+
     return {
         "symbols": symbols,
-        "imports": imports,
-        "direct_imports": direct_imports,
+        "imports": imports_list,
+        "direct_imports": direct_imports_list,
         "exports": exports,
         "file_signature": _file_signature(content),
         "extraction_backend": "stdlib_ast",
+        "import_refs": import_refs,
+        "call_refs": call_refs_out,
+        "class_inheritance": inheritance,
+        "decorators": decorators,
     }
 
 
-# ── Regex extractors (mirror symbol_index.py behavior) ────────────────────────
+# ── Helper functions ─────────────────────────────────────────────────────────
+
+def _ast_name_or_attr(node: ast.AST) -> str:
+    """Return 'foo' or 'foo.bar' for a Name or Attribute node."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        val = _ast_name_or_attr(node.value)
+        return f"{val}.{node.attr}" if val else node.attr
+    return ""
+
+
+def _resolve_callee(func: ast.AST) -> tuple[str, str]:
+    """Return (callee_name, callee_attr) for a Call.func node.
+
+    Examples:
+        login()           → ("login", "")
+        self.login()     → ("login", "self")
+        obj.auth.login() → ("login", "obj.auth")
+    """
+    if isinstance(func, ast.Name):
+        return (func.id, "")
+    if isinstance(func, ast.Attribute):
+        callee_attr = _ast_name_or_attr(func.value)
+        return (func.attr, callee_attr)
+    return ("", "")
+
+
+# ── Regex extractors (mirror symbol_index.py behavior) ───────────────────────-
 
 def _extract_py_regex(content: str) -> dict:
     symbols = []

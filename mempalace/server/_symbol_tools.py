@@ -96,10 +96,18 @@ def register_symbol_tools(server, backend, config, settings):
             project_root = _find_git_root(palace_path) or ""
         try:
             si = _get_symbol_index(palace_path)
-            raw_callers = si.get_callers(symbol_name, project_root)
+            # Primary: AST call graph (high confidence, precise)
+            raw_callers = si.get_callers_ast(symbol_name)
+            # Fallback: import-based heuristic (low confidence)
+            if not raw_callers:
+                heuristic = si.get_callers(symbol_name, project_root)
+                for r in heuristic:
+                    r["confidence"] = "low"
+                    r["match_type"] = "import_ref"
+                    raw_callers.append(r)
             callers = []
             for r in raw_callers:
-                fp = r.get("file_path", "")
+                fp = r.get("source_file", "")
                 path_info = _make_path_result(fp, project_root) if fp else {}
                 callers.append({**r, **path_info})
             return {"symbol_name": symbol_name, "callers": callers, "count": len(callers)}

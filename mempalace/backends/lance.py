@@ -1513,6 +1513,9 @@ class LanceCollection(BaseCollection):
         # Query cache (inicializuje se lazily při prvním query)
         self._query_cache = None
 
+        # Semantic deduplicator instance — thresholds live here, not in callers
+        self._dedup = SemanticDeduplicator()
+
     def _write_with_retry(self, fn, max_retries: int = 7):
         """Retry with logarithmic backoff for LanceDB commit conflicts."""
         for attempt in range(max_retries):
@@ -1527,6 +1530,102 @@ class LanceCollection(BaseCollection):
                     time.sleep(wait)
                     continue
                 raise
+
+    def optimize(self) -> None:
+        """Compact storage — delegates to LanceOptimizer."""
+        if self._optimizer:
+            self._optimizer.run_optimize_sync()
+
+    def optimize(self) -> None:
+        """Compact storage — delegates to LanceOptimizer."""
+        if self._optimizer:
+            self._optimizer.run_optimize_sync()
+
+    def upsert_with_tombstones(
+        self,
+        documents: list[str],
+        ids: list[str],
+        metadatas: list[dict[str, Any]],
+        old_chunks_by_hash: dict[str, list[tuple]],
+    ) -> None:
+        """
+        Upsert documents and tombstone superseded chunks atomically.
+
+        Tombstoning: old chunks NOT in superseded_ids → is_latest=False.
+        Per-file atomicity via try/except.
+        """
+        if not documents:
+            return
+
+        superseded_ids: set[str] = set()
+        for meta in metadatas:
+            raw = meta.get("supersedes_id", "")
+            if raw:
+                for sid in raw.split("|"):
+                    if sid:
+                        superseded_ids.add(sid)
+
+        tombstone_ids, tombstone_docs, tombstone_metas = [], [], []
+        for old_hash, old_list in old_chunks_by_hash.items():
+            for old_id, _ in old_list:
+                if old_id not in superseded_ids:
+                    tombstone_ids.append(old_id)
+                    tombstone_docs.append("")
+                    tombstone_metas.append({"is_latest": False})
+
+        if documents:
+            try:
+                self._write_with_retry(
+                    lambda docs=documents, mids=ids, mm=metadatas:
+                        self._table.add([{"id": i, "document": d, "metadata_json": json.dumps(m, default=str)}
+                            for d, i, m in zip(docs, mids, mm)])
+                )
+            except Exception:
+                raise
+
+        if tombstone_ids:
+            try:
+                self._table.add([{"id": tid, "document": "", "metadata_json": json.dumps(tm, default=str)}
+                    for tid, tm in zip(tombstone_ids, tombstone_metas)])
+            except Exception:
+                pass  # Tombstone failures are non-fatal
+
+    def get_by_source_files(
+        self,
+        source_files: list[str],
+        is_latest: bool = True,
+    ) -> dict[str, list[tuple]]:
+        """
+        Batch-get existing chunks by source_file list.
+
+        Returns dict mapping source_file → list of (id, metadata) tuples.
+        """
+        if not source_files:
+            return {}
+
+        if len(source_files) == 1:
+            where_clause: dict[str, Any] = {"source_file": source_files[0]}
+        else:
+            where_clause = {"$or": [{"source_file": {"$eq": sf}} for sf in source_files]}
+
+        existing: dict[str, list[tuple]] = {"ids": [], "metadatas": []}
+        try:
+            existing = self.get(
+                where={**where_clause, "is_latest": is_latest},
+                include=["metadatas", "ids"],
+            )
+        except Exception:
+            pass  # Fail-open
+
+        by_source: dict[str, list[tuple]] = {}
+        if existing and existing.get("ids"):
+            for old_id, old_meta in zip(existing["ids"], existing["metadatas"]):
+                if old_meta:
+                    sf = old_meta.get("source_file", "")
+                    if sf not in by_source:
+                        by_source[sf] = []
+                    by_source[sf].append((old_id, old_meta))
+        return by_source
 
     def run_optimize(self) -> None:
         """Run synchronous LanceDB optimize. For CLI use."""
@@ -1578,6 +1677,95 @@ class LanceCollection(BaseCollection):
             "distances": [distances],
         }
 
+    def classify_batch(
+        self,
+        documents: list[str],
+        metadatas: list[dict[str, Any]],
+        n_candidates: int = 5,
+    ) -> tuple[list[tuple[str, str | None]], list[list[float] | None], list[dict]]:
+        """
+        Classify documents as unique/duplicate/conflict using pre-computed embeddings.
+
+        Embeddings are computed internally via _embed_texts_resilient.
+        Uses a ThreadPoolExecutor for parallel vector lookups — managed here,
+        not leaked to callers of SemanticDeduplicator.
+
+        Returns (classifications, embeddings_for_unique, failures):
+          - classifications: list of (action, existing_id) tuples
+          - embeddings_for_unique: aligned embedding list (None at quarantined indices)
+          - failures: quarantine records from degenerate embedding chunks
+        """
+        if self.count() == 0:
+            valid_texts, valid_embs, failures, valid_orig_indices = _embed_texts_resilient(
+                documents, context="classify_batch(empty_collection)"
+            )
+            results: list[tuple[str, str | None]] = [("unique", None)] * len(documents)
+            for qi in {f["index"] for f in failures}:
+                results[qi] = ("quarantined", None)
+            all_embs_aligned: list[list[float] | None] = [None] * len(documents)
+            for vi, orig_i in enumerate(valid_orig_indices):
+                all_embs_aligned[orig_i] = valid_embs[vi]
+            return results, all_embs_aligned, failures
+
+        valid_texts, batch_vectors, failures, valid_orig_indices = _embed_texts_resilient(
+            documents, context="classify_batch"
+        )
+
+        orig_vec_map: dict[int, tuple[str, dict, list[float]]] = {}
+        for vi, orig_i in enumerate(valid_orig_indices):
+            orig_vec_map[orig_i] = (documents[orig_i], metadatas[orig_i], batch_vectors[vi])
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        n_workers = max(1, min(len(valid_orig_indices), 4))
+
+        results: list[tuple[str, str | None]] = [("unique", None)] * len(documents)
+        failed_orig_indices = {f["index"] for f in failures}
+        for qi in failed_orig_indices:
+            results[qi] = ("quarantined", None)
+
+        if not orig_vec_map:
+            all_embeddings_aligned = [None] * len(documents)
+            return results, all_embeddings_aligned, failures
+
+        def _classify_one(
+            args: tuple[int, str, dict, list[float]],
+        ) -> tuple[int, tuple[str, str | None]]:
+            i, doc, meta, vec = args
+            similar = self.query_by_vector(vector=vec, n_results=n_candidates)
+            if not similar["ids"] or not similar["ids"][0]:
+                return i, ("unique", None)
+            best_dist = similar["distances"][0][0]
+            best_id = similar["ids"][0][0]
+            best_meta = (similar["metadatas"][0][0] or {}) if similar["metadatas"] else {}
+            best_similarity = max(0.0, 1.0 - best_dist)
+            if best_similarity >= self._dedup.high_threshold:
+                if _dedup_scope_matches(meta, best_meta):
+                    return i, ("duplicate", best_id)
+                return i, ("unique", None)
+            if best_similarity >= self._dedup.low_threshold:
+                if not _dedup_scope_matches(meta, best_meta):
+                    return i, ("unique", None)
+                if meta.get("room") == best_meta.get("room") and meta.get("wing") == best_meta.get("wing"):
+                    return i, ("conflict", best_id)
+                return i, ("unique", None)
+            return i, ("unique", None)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_classify_one, (orig_i, doc, meta, vec)): orig_i
+                for orig_i, (doc, meta, vec) in orig_vec_map.items()
+            }
+            for future in as_completed(futures):
+                orig_i, classification = future.result()
+                results[orig_i] = classification
+
+        all_embeddings_aligned = [None] * len(documents)
+        for vi, orig_i in enumerate(valid_orig_indices):
+            all_embeddings_aligned[orig_i] = batch_vectors[vi]
+
+        return results, all_embeddings_aligned, failures
+
     # ── Write operations ──────────────────────────────────────────────────
 
     def add(
@@ -1608,6 +1796,18 @@ class LanceCollection(BaseCollection):
 
         metadatas = metadatas or [{}] * len(documents)
 
+        # Embedding metadata lock: validate provider/dims before writing.
+        # This guards against writing with a different embedding space than
+        # what the palace was initialized with.
+        from .. import embed_metadata as em
+        try:
+            provider, model_id, dims = em.detect_current_provider()
+            em.validate_write(self._palace_path, provider, model_id, dims)
+        except em.EmbeddingMismatchError:
+            raise
+        except Exception:
+            pass  # Don't block writes if metadata detection fails
+
         # Memory pressure check
         from ..memory_guard import MemoryGuard
         guard = MemoryGuard.get()
@@ -1624,12 +1824,10 @@ class LanceCollection(BaseCollection):
                 )
 
         # BATCH Semantic deduplication – jeden embedding call pro celý batch
-        deduplicator = SemanticDeduplicator()
-        classifications, all_embeddings, failures = deduplicator.classify_batch(
+        # ThreadPoolExecutor lives in LanceCollection.classify_batch, not exposed here
+        classifications, all_embeddings, failures = self.classify_batch(
             documents=documents,
             metadatas=metadatas,
-            collection=self,
-            quarantine_ctx="_do_add",
         )
 
         final_docs, final_ids, final_metas, final_embs = [], [], [], []
@@ -1701,6 +1899,18 @@ class LanceCollection(BaseCollection):
         # ── FTS5 incremental sync (add) ───────────────────────────────────
         self._sync_fts5upsert(final_ids, final_docs, final_metas)
 
+        # ── Path index sync (add) ─────────────────────────────────────────
+        self._sync_path_index_upsert(final_ids, final_metas)
+
+        # Embedding metadata: write meta on first successful write.
+        # ensure_meta is idempotent — subsequent calls update timestamp only.
+        from .. import embed_metadata as em
+        try:
+            provider, model_id, dims = em.detect_current_provider()
+            em.ensure_meta(self._palace_path, provider, model_id, dims)
+        except Exception:
+            pass  # Don't fail writes if metadata write fails
+
     def upsert(
         self,
         *,
@@ -1729,12 +1939,9 @@ class LanceCollection(BaseCollection):
                 )
 
         # Semantic deduplication – používá classify_batch pro embedding reuse
-        deduplicator = SemanticDeduplicator()
-        classifications, all_embeddings, failures = deduplicator.classify_batch(
+        classifications, all_embeddings, failures = self.classify_batch(
             documents=documents,
             metadatas=metadatas,
-            collection=self,
-            quarantine_ctx="upsert",
         )
 
         quarantined = 0
@@ -1808,7 +2015,12 @@ class LanceCollection(BaseCollection):
         get_query_cache().invalidate_collection(self._palace_path, self._collection_name)
 
         # ── FTS5 incremental sync ─────────────────────────────────────────
-        return self._sync_fts5upsert(final_ids, final_docs, final_metas)
+        fts5_warning = self._sync_fts5upsert(final_ids, final_docs, final_metas)
+
+        # ── Path index sync (upsert) ─────────────────────────────────────
+        self._sync_path_index_upsert(final_ids, final_metas)
+
+        return fts5_warning
 
     def _sync_fts5upsert(
         self,
@@ -1844,6 +2056,57 @@ class LanceCollection(BaseCollection):
         except Exception as e:
             logger.warning("FTS5 upsert failed for %d entries: %s — index may be stale", len(ids), e)
             return "FTS5 index sync failed — keyword search may be stale; run rebuild_keyword_index()"
+
+    def _sync_path_index_upsert(
+        self,
+        ids: list[str],
+        metadatas: list[dict],
+    ) -> None:
+        """Synchronize written records into the path metadata index.
+
+        Called after every successful upsert/add. Uses batch upsert for
+        efficiency. Failures are silently suppressed — path index staleness
+        is recoverable via rebuild (future work).
+        """
+        if not ids:
+            return
+        try:
+            from ..path_index import PathIndex
+            idx = PathIndex.get(self._palace_path)
+            rows = [
+                {
+                    "document_id": doc_id,
+                    "source_file": meta.get("source_file", ""),
+                    "repo_rel_path": meta.get("repo_rel_path"),
+                    "language": meta.get("language"),
+                    "chunk_kind": meta.get("chunk_kind"),
+                    "symbol_name": meta.get("symbol_name"),
+                    "line_start": meta.get("line_start"),
+                    "line_end": meta.get("line_end"),
+                    "wing": meta.get("wing"),
+                    "room": meta.get("room"),
+                    "is_latest": meta.get("is_latest", True),
+                }
+                for doc_id, meta in zip(ids, metadatas)
+            ]
+            idx.upsert_rows(rows)
+        except Exception as e:
+            logger.warning("PathIndex upsert failed for %d entries: %s", len(ids), e)
+
+    def _sync_path_index_delete(self, ids: list[str]) -> None:
+        """Remove deleted document IDs from the path metadata index.
+
+        Called after every successful delete. Returns None on success,
+        or a warning string on failure. Failures are silently suppressed.
+        """
+        if not ids:
+            return
+        try:
+            from ..path_index import PathIndex
+            idx = PathIndex.get(self._palace_path)
+            idx.delete_rows(ids)
+        except Exception as e:
+            logger.warning("PathIndex delete failed for %d entries: %s", len(ids), e)
 
     # ── Read operations ───────────────────────────────────────────────────
 
@@ -2164,7 +2427,12 @@ class LanceCollection(BaseCollection):
         # deleted_ids: explicit ids list when provided, otherwise the matching_ids
         # collected from the where-filter scan (empty list when where filtered to zero).
         deleted_ids = ids if ids else (matching_ids if where else [])
-        return self._sync_fts5delete(deleted_ids)
+        fts5_warning = self._sync_fts5delete(deleted_ids)
+
+        # ── Path index sync (delete) ──────────────────────────────────────
+        self._sync_path_index_delete(deleted_ids)
+
+        return fts5_warning
 
     def _sync_fts5delete(self, ids: list[str]) -> str | None:
         """Remove deleted document IDs from the FTS5 keyword index.

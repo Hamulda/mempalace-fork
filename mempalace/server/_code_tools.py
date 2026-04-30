@@ -8,6 +8,15 @@ from pathlib import Path
 
 from fastmcp import Context
 
+from .response_contract import (
+    make_search_response,
+    make_file_context_response,
+    make_project_context_response,
+    file_context_error,
+    normalize_hit,
+    no_palace_response,
+)
+
 # =============================================================================
 # PATH MATCHING UTILITIES (module-level for testability)
 # =============================================================================
@@ -167,7 +176,7 @@ def register_code_tools(server, backend, config, settings):
             return None
 
     def _no_palace():
-        return {"error": "No palace found", "hint": "Run: mempalace init <dir> && mempalace mine <dir>"}
+        return no_palace_response()
 
     @server.tool(timeout=settings.timeout_read)
     async def mempalace_search_code(
@@ -199,10 +208,17 @@ def register_code_tools(server, backend, config, settings):
             Each chunk contains: source_file, language, line_start, line_end,
             symbol_name, chunk_kind, doc (content).
         """
-        return await code_search_async(
+        result = await code_search_async(
             query=query, palace_path=settings.db_path, n_results=limit,
             language=language, symbol_name=symbol_name, file_path=file_path,
             project_path=project_path,
+        )
+        hits = result.get("results", [])
+        return make_search_response(
+            "search_code", hits, query,
+            project_path=project_path, project_path_applied=True,
+            filters={"language": language, "symbol_name": symbol_name, "file_path": file_path},
+            sources={"vector": len(hits)},
         )
 
     @server.tool(timeout=settings.timeout_read)
@@ -234,13 +250,27 @@ def register_code_tools(server, backend, config, settings):
             Search results dict from the appropriate search strategy.
         """
         if is_code_query(query) or project_path:
-            return await code_search_async(
+            result = await code_search_async(
                 query=query, palace_path=settings.db_path, n_results=limit,
                 project_path=project_path,
             )
+            hits = result.get("results", [])
+            return make_search_response(
+                "auto_search", hits, query,
+                project_path=project_path, project_path_applied=bool(project_path),
+                filters=result.get("filters", {}),
+                sources={"code": len(hits)},
+            )
         else:
-            return await hybrid_search_async(
+            result = await hybrid_search_async(
                 query=query, palace_path=settings.db_path, n_results=limit,
+            )
+            hits = result.get("results", [])
+            return make_search_response(
+                "auto_search", hits, query,
+                project_path=None, project_path_applied=False,
+                filters=result.get("filters", {}),
+                sources=result.get("sources", {}),
             )
 
     @server.tool(timeout=settings.timeout_read)
@@ -285,13 +315,13 @@ def register_code_tools(server, backend, config, settings):
             settings.file_context_allow_any,
             settings.file_context_allowed_roots,
         ):
-            return {"error": "file_context denied: path is outside allowed roots"}
+            return file_context_error("path is outside allowed roots", code="access_denied")
         if not p.exists():
-            return {"error": f"File not found: {file_path}"}
+            return file_context_error(f"File not found: {file_path}", code="not_found")
         try:
             content = p.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
-            return {"error": str(e)}
+            return file_context_error(str(e), code="read_error")
         lines = content.split("\n")
         n = len(lines)
         start = max(0, (line_start or 1) - 1 - context_lines)
@@ -299,12 +329,11 @@ def register_code_tools(server, backend, config, settings):
         slice_lines = lines[start:end]
         has_more_before = line_start is not None and line_start > 1 + context_lines
         has_more_after = line_end is not None and line_end < n - context_lines
-        return {
-            "file_path": str(p), "total_lines": n,
-            "range_start": start + 1, "range_end": end,
-            "has_more_before": has_more_before, "has_more_after": has_more_after,
-            "lines": [{"line_num": start + i + 1, "text": line} for i, line in enumerate(slice_lines)],
-        }
+        return make_file_context_response(
+            str(p), n, start + 1, end,
+            [{"line_num": start + i + 1, "text": line} for i, line in enumerate(slice_lines)],
+            has_more_before, has_more_after, project_path,
+        )
 
     @server.tool(timeout=settings.timeout_read)
     async def mempalace_project_context(
@@ -363,11 +392,9 @@ def register_code_tools(server, backend, config, settings):
                     for h in hits:
                         h["doc"] = h.pop("text", "")
                         h["repo_rel_path"] = _compute_repo_rel_path(h.get("source_file", ""), project_path)
-                    return {
-                        "project_path": project_path, "language": language,
-                        "query": query, "chunks": hits[:limit], "count": len(hits),
-                        "intent": intent,
-                    }
+                    return make_project_context_response(
+                        project_path, hits[:limit], query, language, intent, project_path_applied=True,
+                    )
 
                 if intent == "symbol":
                     from mempalace.searcher import _symbol_first_search
@@ -383,11 +410,9 @@ def register_code_tools(server, backend, config, settings):
                     for h in hits:
                         h["doc"] = h.pop("text", "")
                         h["repo_rel_path"] = _compute_repo_rel_path(h.get("source_file", ""), project_path)
-                    return {
-                        "project_path": project_path, "language": language,
-                        "query": query, "chunks": hits[:limit], "count": len(hits),
-                        "intent": intent,
-                    }
+                    return make_project_context_response(
+                        project_path, hits[:limit], query, language, intent, project_path_applied=True,
+                    )
 
                 # code_exact / code_semantic / memory / mixed: full code_search_async with planner
                 result = await code_search_async(
@@ -412,11 +437,11 @@ def register_code_tools(server, backend, config, settings):
                         "doc": chunk.get("text", chunk.get("document", "")),
                         "repo_rel_path": _compute_repo_rel_path(sf, project_path),
                     })
-                return {
-                    "project_path": project_path, "language": language,
-                    "query": query, "chunks": chunks[:limit], "count": len(chunks),
-                    "intent": result.get("filters", {}).get("intent", "mixed"),
-                }
+                return make_project_context_response(
+                    project_path, chunks[:limit], query, language,
+                    result.get("filters", {}).get("intent", "mixed"),
+                    project_path_applied=True,
+                )
 
             else:
                 # Mode 2: Deterministic metadata retrieval (no vector search).
@@ -477,15 +502,12 @@ def register_code_tools(server, backend, config, settings):
                 if sf:
                     chunk["repo_rel_path"] = _compute_repo_rel_path(sf, project_path)
 
-            return {
-                "project_path": project_path,
-                "language": language,
-                "query": query,
-                "chunks": matched,
-                "count": len(matched),
-            }
+            return make_project_context_response(
+                project_path, matched[:limit], None, language, "deterministic", project_path_applied=True,
+            )
         except Exception as e:
-            return {"error": str(e), "project_path": project_path}
+            from .response_contract import error_response
+            return error_response("project_context", str(e), code="query_error", meta={"project_path": project_path})
 
     @server.tool(timeout=settings.timeout_read)
     def mempalace_export_claude_md(

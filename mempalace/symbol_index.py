@@ -247,6 +247,66 @@ ALTER TABLE symbol_index ADD COLUMN symbol_fqn TEXT;
 ALTER TABLE symbol_index ADD COLUMN extraction_backend TEXT DEFAULT 'regex';
 """
 
+# ── Ref tables for call/import graph ───────────────────────────────────────────
+
+_CALL_REFS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS call_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_file TEXT NOT NULL,
+    caller_fqn TEXT NOT NULL DEFAULT '',
+    callee_name TEXT NOT NULL,
+    callee_attr TEXT NOT NULL DEFAULT '',
+    line INTEGER NOT NULL DEFAULT 0,
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    UNIQUE(source_file, caller_fqn, callee_name, line)
+);
+CREATE INDEX IF NOT EXISTS idx_call_refs_callee ON call_refs(callee_name);
+CREATE INDEX IF NOT EXISTS idx_call_refs_source ON call_refs(source_file);
+CREATE INDEX IF NOT EXISTS idx_call_refs_caller ON call_refs(caller_fqn);
+"""
+
+_IMPORT_REFS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS import_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_file TEXT NOT NULL,
+    module TEXT NOT NULL DEFAULT '',
+    imported_names TEXT NOT NULL DEFAULT '',
+    alias TEXT NOT NULL DEFAULT '',
+    line INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(source_file, module, imported_names, line)
+);
+CREATE INDEX IF NOT EXISTS idx_import_refs_source ON import_refs(source_file);
+CREATE INDEX IF NOT EXISTS idx_import_refs_module ON import_refs(module);
+"""
+
+_CLASS_INHERITANCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS class_inheritance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_file TEXT NOT NULL,
+    class_name TEXT NOT NULL,
+    bases TEXT NOT NULL DEFAULT '',
+    line INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(source_file, class_name, line)
+);
+CREATE INDEX IF NOT EXISTS idx_inheritance_source ON class_inheritance(source_file);
+CREATE INDEX IF NOT EXISTS idx_inheritance_class ON class_inheritance(class_name);
+"""
+
+_DECORATORS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS symbol_decorators (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_file TEXT NOT NULL,
+    symbol_name TEXT NOT NULL,
+    symbol_fqn TEXT NOT NULL DEFAULT '',
+    symbol_kind TEXT NOT NULL DEFAULT '',
+    decorator_name TEXT NOT NULL,
+    line INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(source_file, symbol_fqn, decorator_name, line)
+);
+CREATE INDEX IF NOT EXISTS idx_decorators_source ON symbol_decorators(source_file);
+CREATE INDEX IF NOT EXISTS idx_decorators_symbol ON symbol_decorators(symbol_fqn);
+"""
+
 
 class SymbolIndex:
     """
@@ -289,6 +349,12 @@ class SymbolIndex:
                 conn.execute(stmt)
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+        # Init ref tables (idempotent)
+        conn.executescript(_CALL_REFS_SCHEMA)
+        conn.executescript(_IMPORT_REFS_SCHEMA)
+        conn.executescript(_CLASS_INHERITANCE_SCHEMA)
+        conn.executescript(_DECORATORS_SCHEMA)
 
         self._conn = conn
 
@@ -665,6 +731,11 @@ class SymbolIndex:
                 now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
                 self._conn.execute("DELETE FROM symbol_index WHERE file_path = ?", (file_path,))
+                # Incremental ref updates: delete only this file's refs, then insert new
+                self._conn.execute("DELETE FROM call_refs WHERE source_file = ?", (file_path,))
+                self._conn.execute("DELETE FROM import_refs WHERE source_file = ?", (file_path,))
+                self._conn.execute("DELETE FROM class_inheritance WHERE source_file = ?", (file_path,))
+                self._conn.execute("DELETE FROM symbol_decorators WHERE source_file = ?", (file_path,))
 
                 symbols = extracted.get("symbols", [])
                 imports_str = ",".join(extracted.get("imports", []))
@@ -727,6 +798,47 @@ class SymbolIndex:
                         ),
                     )
                 self._conn.commit()
+
+                # ── Insert ref records ────────────────────────────────────────
+                # call_refs
+                for cr in extracted.get("call_refs", []):
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO call_refs
+                           (source_file, caller_fqn, callee_name, callee_attr, line, confidence)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (file_path, cr.get("caller_fqn", ""), cr.get("callee_name", ""),
+                         cr.get("callee_attr", ""), cr.get("line", 0), cr.get("confidence", "medium")),
+                    )
+                # import_refs
+                for ir in extracted.get("import_refs", []):
+                    names_str = ",".join(ir.get("names", []))
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO import_refs
+                           (source_file, module, imported_names, alias, line)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (file_path, ir.get("module", ""), names_str,
+                         ir.get("alias", ""), ir.get("line", 0)),
+                    )
+                # class_inheritance
+                for ci in extracted.get("class_inheritance", []):
+                    bases_str = ",".join(ci.get("bases", []))
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO class_inheritance
+                           (source_file, class_name, bases, line)
+                           VALUES (?, ?, ?, ?)""",
+                        (file_path, ci.get("name", ""), bases_str, ci.get("line", 0)),
+                    )
+                # decorators
+                for dec in extracted.get("decorators", []):
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO symbol_decorators
+                           (source_file, symbol_name, symbol_fqn, symbol_kind, decorator_name, line)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (file_path, dec.get("parent_fqn", "").split(".")[-1],
+                         dec.get("parent_fqn", ""), dec.get("symbol_kind", ""),
+                         dec.get("name", ""), dec.get("line", 0)),
+                    )
+                self._conn.commit()
             except Exception:
                 try:
                     self._conn.rollback()
@@ -746,14 +858,52 @@ class SymbolIndex:
                 continue
 
     def clear(self):
-        """Clear all entries from the index."""
+        """Clear all entries from the index including ref tables."""
         with self._lock:
             if self._conn:
                 try:
                     self._conn.execute("DELETE FROM symbol_index")
+                    self._conn.execute("DELETE FROM call_refs")
+                    self._conn.execute("DELETE FROM import_refs")
+                    self._conn.execute("DELETE FROM class_inheritance")
+                    self._conn.execute("DELETE FROM symbol_decorators")
                     self._conn.commit()
                 except Exception:
                     pass
+
+    def get_callers_ast(self, symbol_name: str) -> list[dict]:
+        """
+        Find callers of a symbol using the AST call graph (call_refs table).
+
+        Returns list of dicts with: source_file, caller_fqn, callee_name,
+        callee_attr, line, confidence.
+        """
+        with self._lock:
+            if not self._conn:
+                return []
+            try:
+                # Match on callee_name — direct function calls
+                cur = self._conn.execute(
+                    """SELECT source_file, caller_fqn, callee_name, callee_attr, line, confidence
+                       FROM call_refs
+                       WHERE callee_name = ?
+                       ORDER BY source_file""",
+                    (symbol_name,),
+                )
+                return [
+                    {
+                        "source_file": r[0],
+                        "caller_fqn": r[1],
+                        "callee_name": r[2],
+                        "callee_attr": r[3] or "",
+                        "line": r[4],
+                        "confidence": r[5] or "medium",
+                        "match_type": "ast_call",
+                    }
+                    for r in cur.fetchall()
+                ]
+            except Exception:
+                return []
 
     def list_indexed_files(self) -> set[str]:
         """

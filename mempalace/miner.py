@@ -1254,48 +1254,23 @@ def _commit_batch(
 ) -> tuple[int, int, dict]:
     """Commit a batch of prepared file results sequentially.
 
-    Batches the existing-chunk lookup across all pending files using a single
-    $or query, then processes each file's tombstones and upserts one at a time.
-    Maintains per-file atomicity: one bad file does not poison others.
+    Batches the existing-chunk lookup across all pending files using
+    collection.get_by_source_files(), then calls upsert_with_tombstones()
+    per file. Maintains per-file atomicity: one bad file does not poison others.
 
     Returns (total_drawers, files_committed, phase_totals).
     """
     if not pending:
         return 0, 0, {}
 
-    # ── Phase 1: batch existing-chunk lookup ──────────────────────────────
-    # Build a single $or query for all source_files to get existing chunks.
-    # Uses LanceDB's SQL id IN (...) path — safe for hex ids.
     t_batch_get = time.monotonic()
     source_files = [p["source_file"] for p in pending]
-    if len(source_files) == 1:
-        where_clause = {"source_file": source_files[0]}
-    else:
-        where_clause = {
-            "$or": [{"source_file": {"$eq": sf}} for sf in source_files]
-        }
-
-    existing = {"ids": [], "metadatas": []}
-    try:
-        existing = collection.get(
-            where={**where_clause, "is_latest": True},
-            include=["metadatas", "ids"],
-        )
-    except Exception:
-        pass  # Fail-open: treat as no existing chunks
+    by_source = collection.get_by_source_files(source_files, is_latest=True)
     batch_get_s = time.monotonic() - t_batch_get
 
-    # Index existing chunks by source_file for O(1) per-file lookup
-    by_source: dict[str, list[tuple]] = defaultdict(list)
-    if existing and existing.get("ids"):
-        for old_id, old_meta in zip(existing["ids"], existing["metadatas"]):
-            if old_meta:
-                by_source[old_meta.get("source_file", "")].append((old_id, old_meta))
-
-    # ── Phase 2: per-file tombstones + upserts (sequential, single writer) ─
     total_drawers = 0
     files_committed = 0
-    phase_totals = defaultdict(float)
+    phase_totals: dict[str, float] = {}
 
     for p in pending:
         sf = p["source_file"]
@@ -1304,51 +1279,29 @@ def _commit_batch(
         metadatas = p["metadatas"]
         room = p["room"]
 
-        old_chunks_by_hash: dict[str, list[tuple]] = defaultdict(list)
+        old_chunks_by_hash: dict[str, list[tuple]] = {}
         for old_id, old_meta in by_source.get(sf, []):
             old_hash = old_meta.get("content_hash", "")
             if old_hash:
+                if old_hash not in old_chunks_by_hash:
+                    old_chunks_by_hash[old_hash] = []
                 old_chunks_by_hash[old_hash].append((old_id, old_meta))
-
-        # Tombstones
-        all_old_ids = set()
-        for old_list in old_chunks_by_hash.values():
-            for old_id, _ in old_list:
-                all_old_ids.add(old_id)
-        superseded_ids = set()
-        for meta in metadatas:
-            raw = meta.get("supersedes_id", "")
-            if raw:
-                for sid in raw.split("|"):
-                    if sid:
-                        superseded_ids.add(sid)
-
-        tombstone_ids, tombstone_docs, tombstone_metas = [], [], []
-        for old_hash, old_list in old_chunks_by_hash.items():
-            for old_id, old_meta in old_list:
-                if old_id not in superseded_ids:
-                    tombstone_ids.append(old_id)
-                    tombstone_docs.append(old_meta.get("source_content", old_meta.get("document", "")))
-                    tombstone_metas.append({"is_latest": False})
 
         t_upsert = time.monotonic()
         collection_upsert_s = 0.0
         if documents:
             try:
-                collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
+                collection.upsert_with_tombstones(
+                    documents=documents,
+                    ids=ids,
+                    metadatas=metadatas,
+                    old_chunks_by_hash=old_chunks_by_hash,
+                )
             except Exception:
-                # Per-file failure isolation: continue to next file
                 continue
         collection_upsert_s = time.monotonic() - t_upsert
 
-        t_tomb = time.monotonic()
-        if tombstone_ids:
-            try:
-                collection.upsert(documents=tombstone_docs, ids=tombstone_ids, metadatas=tombstone_metas)
-            except Exception:
-                pass
-        tombstone_upsert_s = time.monotonic() - t_tomb
-
+        tombstone_upsert_s = 0.0
         total_s = batch_get_s + collection_upsert_s + tombstone_upsert_s
         if stats:
             stats.record_file({
@@ -1360,12 +1313,11 @@ def _commit_batch(
                 "tombstone_upsert_s": tombstone_upsert_s,
             })
 
-        phase_totals["collection_upsert_s"] += collection_upsert_s
-        phase_totals["tombstone_upsert_s"] += tombstone_upsert_s
+        phase_totals["collection_upsert_s"] = phase_totals.get("collection_upsert_s", 0.0) + collection_upsert_s
+        phase_totals["tombstone_upsert_s"] = phase_totals.get("tombstone_upsert_s", 0.0) + tombstone_upsert_s
         total_drawers += len(documents)
         files_committed += 1
 
-        # Update manifest for successfully committed file
         if manifest is not None:
             mf = p.get("_manifest")
             if mf:
@@ -1376,7 +1328,7 @@ def _commit_batch(
                         mf["qh"], len(documents),
                     )
                 except Exception:
-                    pass  # Fail-open
+                    pass
 
     phase_totals["batch_get_s"] = batch_get_s
     return total_drawers, files_committed, phase_totals

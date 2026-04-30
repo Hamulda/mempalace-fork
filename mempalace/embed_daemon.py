@@ -26,18 +26,22 @@ import os
 import signal
 import socket
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
 
 logger = logging.getLogger(__name__)
 
-# Bounded worker pool — prevents thread-per-connection storm on M1/8GB
-_bg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed_client")
+# Bounded worker pool — prevents thread-per-connection storm on M1/8GB.
+# Configurable via env for larger machines (e.g. 8 workers on 16GB+).
+_bg_executor = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("MEMPALACE_EMBED_WORKERS", "4")),
+    thread_name_prefix="embed_client",
+)
 
-SOCKET_PATH = os.path.expanduser("~/.mempalace/embed.sock")
+# Single source of truth for socket path — env override or default
+_SOCKET_DEFAULT = os.path.expanduser("~/.mempalace/embed.sock")
+SOCKET_PATH = os.environ.get("MEMPALACE_EMBED_SOCK", _SOCKET_DEFAULT)
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 CACHE_DIR = os.path.expanduser("~/.cache/fastembed")
 
@@ -51,6 +55,11 @@ MAX_BATCH = 32  # baseline — adaptive sizing via _get_embed_batch_size()
 MAX_REQUEST_BYTES = int(os.environ.get("MEMPALACE_EMBED_MAX_REQUEST_BYTES", "2_000_000"))
 MAX_TEXTS = int(os.environ.get("MEMPALACE_EMBED_MAX_TEXTS", "512"))
 MAX_CHARS_PER_TEXT = int(os.environ.get("MEMPALACE_EMBED_MAX_CHARS_PER_TEXT", "8192"))
+
+
+# Probe response vars — set once at daemon startup
+_provider_for_probe = "unknown"
+_model_id_for_probe = ""
 
 
 def _get_embed_batch_size() -> int:
@@ -227,8 +236,8 @@ def _daemon_sanitize_embeddings(
             logger.debug("Daemon repaired NaN/Inf embedding [%d values]", sum(1 for v in emb if not math.isfinite(v)))
         else:
             raise RuntimeError(
-                f"Daemon produced degenerate embedding (all-zero or all-NaN). "
-                "The MLX model failed on this input."
+                "Embedding computation produced degenerate output (all-zero or all-NaN vectors). "
+                "Possible causes: invalid input text, insufficient memory, or model loading failure."
             )
     if repaired:
         logger.info("Daemon repaired %d NaN/Inf embedding(s)", repaired)
@@ -276,6 +285,18 @@ def _handle_client(conn: socket.socket, model) -> None:
             data += chunk
 
         request = json.loads(data.decode("utf-8"))
+
+        # Handle probe request — returns provider info without doing inference
+        if request.get("probe"):
+            response = {
+                "provider": _provider_for_probe,
+                "model_id": _model_id_for_probe,
+                "dims": 256,  # All MemPalace models produce 256-dim Matryoshka vectors
+            }
+            payload = json.dumps(response).encode("utf-8")
+            conn.sendall(len(payload).to_bytes(4, "big") + payload)
+            conn.close()
+            return
 
         # Guard: validate texts structure
         texts = request.get("texts", [])
@@ -578,6 +599,11 @@ def run_daemon() -> None:
     except Exception as e:
         logger.error("Model load failed: %s — exiting", e)
         sys.exit(1)
+
+    # Set probe response vars — shared with handle_client probe path
+    global _provider_for_probe, _model_id_for_probe
+    _provider_for_probe, _model_id_for_probe = _detect_embed_provider()
+
     warmup_ms = (time.monotonic() - t0) * 1000
     logger.info(
         "Model loaded and warmed up (%.0fms, type=%s) at %s",

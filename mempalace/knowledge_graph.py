@@ -110,6 +110,12 @@ class KnowledgeGraph:
             self._connection.close()
             self._connection = None
 
+    def __enter__(self) -> "KnowledgeGraph":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
     def _entity_id(self, name: str) -> str:
         return name.lower().replace(" ", "_").replace("'", "")
 

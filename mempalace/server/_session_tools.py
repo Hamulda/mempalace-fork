@@ -617,6 +617,56 @@ def register_session_tools(server, backend, config, settings):
         except Exception as e:
             return {"error": str(e)}
 
+    # ── Startup ──────────────────────────────────────────────────────────────
+
+    @server.tool(timeout=settings.timeout_read)
+    def mempalace_startup_context(
+        ctx: Context,
+        project_path: str | None = None,
+        session_id: str | None = None,
+        limit: int = 8,
+    ) -> dict:
+        """
+        Build compact startup context for Claude Code session start.
+
+        Provides a single compact context pack with server health, palace
+        overview, active claims/handoffs, and M1 bounded defaults — so Claude
+        knows the project state before responding.
+
+        Inputs:
+            project_path: optional project root to scope claims (auto-derived if None)
+            session_id: auto-detected from FastMCP context or MEMPALACE_SESSION_ID
+            limit: max pending handoffs to return (default 8)
+
+        Returns:
+            - server_health: HTTP /health probe result
+            - palace_path: palace data directory
+            - backend: storage backend ('lance')
+            - python_version: sys.version_info string
+            - embedding_provider: embed daemon provider from probe
+            - embedding_meta: model_id, embed_batch_size if available
+            - active_sessions: count from session registry
+            - current_claims: claims scoped to project_path
+            - pending_handoffs: handoffs for this session
+            - recommended_first_actions: startup workflow steps
+            - project_path_reminder: resolved project_path
+            - m1_defaults: bounded defaults for M1/8GB runs
+        """
+        from ..wakeup_context import build_startup_context
+        try:
+            resolved_sid = _optional_session_id(ctx, session_id)
+            if not resolved_sid:
+                resolved_sid = "no-session"
+            result = build_startup_context(
+                session_id=resolved_sid,
+                project_path=project_path,
+                palace_path=config.palace_path,
+                limit=limit,
+            )
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
     # ── Decisions ───────────────────────────────────────────────────────────
 
     @server.tool(timeout=settings.timeout_write)

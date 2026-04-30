@@ -191,7 +191,8 @@ def cmd_search(args):
                 room=args.room,
                 n_results=args.results,
             )
-    except SearchError:
+    except SearchError as e:
+        print(f"Search failed: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -271,6 +272,16 @@ def cmd_status(args):
     swap_mb = (swap.sin + swap.sout) / (1024**2)
     print(f"Swap: {swap_mb:.1f} MB")
 
+    # ── Embedding metadata ──────────────────────────────────────────────
+    from . import embed_metadata as em
+    meta = em.load_meta(palace_path) if os.path.isdir(palace_path) else None
+    if meta:
+        print(f"Embedding: {meta.get('provider', '?')} | {meta.get('model_id', '?')} | dims={meta.get('dims', '?')}")
+        print(f"  Created: {meta.get('created_at', '?')}")
+        print(f"  Updated: {meta.get('updated_at', '?')}")
+    else:
+        print("Embedding: no metadata (palace not yet written)")
+
     # ── Embedding Daemon ────────────────────────────────────────────────
     from .embed_daemon import get_socket_path
     import socket as _socket, json
@@ -339,7 +350,7 @@ def cmd_status(args):
         except FileNotFoundError:
             print(f"Palace not initialized at {palace_path}")
         except Exception as e:
-            print(f"Backend: {backend_type} (error reading: {e})")
+            print(f"Backend: {backend_type} (error reading: {type(e).__name__}: {e})")
     else:
         print(f"Palace: not initialized at {palace_path}")
 
@@ -519,7 +530,7 @@ def cmd_embed_daemon(args):
                     pass
 
         except Exception as e:
-            print(f"Error starting daemon: {e}")
+            print(f"Error starting daemon: {type(e).__name__}")
 
     elif args.action == "stop":
         from .embed_daemon import get_pid_path
