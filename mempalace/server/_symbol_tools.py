@@ -4,15 +4,24 @@ Symbol/index tools: find, search, callers, file_symbols, recent_changes.
 Path output contract:
 - source_file: canonical identity (always absolute path)
 - repo_rel_path: user-friendly display (relative to project_root, when determinable)
+
+Response contract (v1.0):
+- Success: {ok: true, tool_contract_version: "1.0", tool: <name>, ...data}
+- Error:   {ok: false, tool_contract_version: "1.0", tool: <name>, error: {code, message}}
 """
 from pathlib import Path
 from fastmcp import Context
 
 from ..searcher import _compute_repo_rel_path
 
-
 # ── Project root resolution (imported from canonical source) ───────────────────
 from ._project_root import _find_git_root
+from .response_contract import (
+    ok_response,
+    error_response,
+    make_symbol_response,
+    make_callers_response,
+)
 
 
 def _make_path_result(file_path: str, project_root: str) -> dict:
@@ -45,7 +54,7 @@ def register_symbol_tools(server, backend, config, settings):
     @server.tool(timeout=settings.timeout_read)
     def mempalace_find_symbol(ctx: Context, symbol_name: str, project_root: str | None = None, palace_path: str | None = None) -> dict:
         if not symbol_name:
-            return {"error": "symbol_name is required"}
+            return error_response("mempalace_find_symbol", "symbol_name is required", code="missing_argument")
         palace_path = palace_path or _get_palace_path()
         if not project_root:
             project_root = _find_git_root(palace_path) or ""
@@ -59,14 +68,14 @@ def register_symbol_tools(server, backend, config, settings):
                 fp = r.get("file_path", "")
                 path_info = _make_path_result(fp, project_root) if fp else {}
                 results.append({**r, **path_info})
-            return {"symbol_name": symbol_name, "results": results, "count": len(results)}
+            return make_symbol_response(symbol_name, results, project_root, tool="mempalace_find_symbol")
         except Exception as e:
-            return {"error": str(e)}
+            return error_response("mempalace_find_symbol", str(e), code="internal_error")
 
     @server.tool(timeout=settings.timeout_read)
     def mempalace_search_symbols(ctx: Context, pattern: str, project_root: str | None = None, palace_path: str | None = None) -> dict:
         if not pattern:
-            return {"error": "pattern is required"}
+            return error_response("mempalace_search_symbols", "pattern is required", code="missing_argument")
         palace_path = palace_path or _get_palace_path()
         if not project_root:
             project_root = _find_git_root(palace_path) or ""
@@ -78,9 +87,11 @@ def register_symbol_tools(server, backend, config, settings):
                 fp = r.get("file_path", "")
                 path_info = _make_path_result(fp, project_root) if fp else {}
                 results.append({**r, **path_info})
-            return {"pattern": pattern, "results": results, "count": len(results)}
+            resp = make_symbol_response(pattern, results, project_root, tool="mempalace_search_symbols")
+            resp["pattern"] = pattern
+            return resp
         except Exception as e:
-            return {"error": str(e)}
+            return error_response("mempalace_search_symbols", str(e), code="internal_error")
 
     @server.tool(timeout=settings.timeout_read)
     def mempalace_callers(
@@ -90,7 +101,7 @@ def register_symbol_tools(server, backend, config, settings):
         palace_path: str | None = None,
     ) -> dict:
         if not symbol_name:
-            return {"error": "symbol_name is required"}
+            return error_response("mempalace_callers", "symbol_name is required", code="missing_argument")
         palace_path = palace_path or _get_palace_path()
         if not project_root:
             project_root = _find_git_root(palace_path) or ""
@@ -119,16 +130,16 @@ def register_symbol_tools(server, backend, config, settings):
                         r["why"] = f"import_ref: {symbol_name} imported in {fp}"
                 r["callee_fqn"] = symbol_name
                 callers.append({**r, **path_info})
-            return {"symbol_name": symbol_name, "callers": callers, "count": len(callers)}
+            return make_callers_response(symbol_name, callers)
         except Exception as e:
-            return {"error": str(e)}
+            return error_response("mempalace_callers", str(e), code="internal_error")
 
     @server.tool(timeout=settings.timeout_read)
     def mempalace_recent_changes(ctx: Context, project_root: str | None = None, n: int = 20) -> dict:
         if not project_root:
             project_root = _find_git_root(_get_palace_path()) or ""
         if not project_root:
-            return {"error": "project_root is required"}
+            return error_response("mempalace_recent_changes", "project_root is required", code="missing_argument")
         try:
             changes = get_recent_changes(project_root, n=n)
             hot_spots = get_hot_spots(project_root, n=5)
@@ -139,14 +150,18 @@ def register_symbol_tools(server, backend, config, settings):
             for entry in hot_spots:
                 fp = entry.get("abs_path", "")
                 entry["repo_rel_path"] = _compute_repo_rel_path(fp, project_root) if fp else ""
-            return {"recent_changes": changes, "hot_spots": hot_spots, "count": len(changes)}
+            return ok_response("mempalace_recent_changes", {
+                "recent_changes": changes,
+                "hot_spots": hot_spots,
+                "count": len(changes),
+            })
         except Exception as e:
-            return {"error": str(e)}
+            return error_response("mempalace_recent_changes", str(e), code="internal_error")
 
     @server.tool(timeout=settings.timeout_read)
     def mempalace_file_symbols(ctx: Context, file_path: str, project_root: str | None = None, palace_path: str | None = None) -> dict:
         if not file_path:
-            return {"error": "file_path is required"}
+            return error_response("mempalace_file_symbols", "file_path is required", code="missing_argument")
         palace_path = palace_path or _get_palace_path()
         if not project_root:
             project_root = _find_git_root(palace_path) or ""
@@ -154,6 +169,7 @@ def register_symbol_tools(server, backend, config, settings):
             si = _get_symbol_index(palace_path)
             result = si.get_file_symbols(file_path)
             path_info = _make_path_result(file_path, project_root)
-            return {**result, **path_info}
+            resp_data = {**result, **path_info}
+            return ok_response("mempalace_file_symbols", resp_data)
         except Exception as e:
-            return {"error": str(e)}
+            return error_response("mempalace_file_symbols", str(e), code="internal_error")

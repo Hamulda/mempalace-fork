@@ -164,8 +164,6 @@ def _compute_repo_rel(source_file: str, project_path: str) -> str:
 
     return sf
 
-    return sf
-
 
 # ── Normalize list of hits ──────────────────────────────────────────────────────
 
@@ -231,13 +229,15 @@ def make_search_response(
     return resp
 
 
-# ── Symbol tool response ────────────────────────────────────────────────────────
+# ── Symbol tools response helpers ──────────────────────────────────────────────
 
 
 def make_symbol_response(
     symbol_name: str,
     results: list[dict],
     project_root: str | None = None,
+    *,
+    tool: str = "symbol",
 ) -> dict:
     """Build a normalized symbol tool response."""
     normalized = []
@@ -254,9 +254,28 @@ def make_symbol_response(
             "line_end": r.get("line_end", 0),
             **r,
         })
-    return ok_response("symbol", {
+    return ok_response(tool, {
         "results": normalized,
         "count": len(normalized),
+    })
+
+
+def make_callers_response(
+    symbol_name: str,
+    callers: list[dict],
+    *,
+    tool: str = "mempalace_callers",
+) -> dict:
+    """
+    Build a normalized callers response.
+
+    Preserves explainability fields per caller:
+    why, match_type, confidence, caller_fqn, callee_fqn, source_file, repo_rel_path.
+    """
+    return ok_response(tool, {
+        "symbol_name": symbol_name,
+        "callers": callers,
+        "count": len(callers),
     })
 
 

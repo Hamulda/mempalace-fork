@@ -154,6 +154,7 @@ class TestEmbeddingProviderTruth:
             "path_index_count",
             "fts5_count",
             "symbol_count",
+            # collection_count intentionally excluded — list_tables is O(n)
         ]:
             assert field in result, f"Missing field: {field}"
 
@@ -167,6 +168,8 @@ class TestEmbeddingProviderTruth:
             val = result[field]
             assert val is None or isinstance(val, int), f"{field} must be int|None, got {type(val)}"
             assert val is None or val >= 0, f"{field} must be >=0"
+        # collection_count intentionally excluded — list_tables is O(n)
+        assert "collection_count" not in result
 
 
 class TestPathBoundaryClaimFilter:

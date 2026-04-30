@@ -663,7 +663,12 @@ def register_session_tools(server, backend, config, settings):
                 palace_path=config.palace_path,
                 limit=limit,
             )
-            return result
+            return {
+                "ok": True,
+                "tool_contract_version": "1.0",
+                "tool": "mempalace_startup_context",
+                **result,
+            }
         except Exception as e:
             return {"error": str(e)}
 

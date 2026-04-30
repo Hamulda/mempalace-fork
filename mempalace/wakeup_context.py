@@ -334,8 +334,13 @@ def _get_index_counts(palace_path: str) -> dict:
     """
     Return cheap index statistics: path_index_count, fts5_count, symbol_count.
     Each count is O(1) or fast single-statement SQL — no scanning.
+    collection_count is excluded — list_tables is O(n) for n tables.
     """
-    counts: dict[str, int | None] = {"path_index_count": None, "fts5_count": None, "symbol_count": None}
+    counts: dict[str, int | None] = {
+        "path_index_count": None,
+        "fts5_count": None,
+        "symbol_count": None,
+    }
     try:
         from mempalace.path_index import PathIndex
         pi = PathIndex.get(palace_path)
