@@ -173,13 +173,20 @@ def execute_query(conn: sqlite3.Connection, query: str, params: tuple = ()) -> l
 # ---------------------------------------------------------------------------
 
 
+class _FastMCPParseError(Exception):
+    """Raised when FastMCP result cannot be parsed."""
+
+
 def _get_result_data(result):
-    """Extract JSON data from FastMCP CallToolResult."""
+    """Extract JSON data from FastMCP CallToolResult. Raises _FastMCPParseError on failure."""
     if hasattr(result, "structured_content") and result.structured_content:
         return result.structured_content
     if hasattr(result, "content") and result.content:
-        return json.loads(result.content[0].text)
-    return None
+        try:
+            return json.loads(result.content[0].text)
+        except (json.JSONDecodeError, IndexError, AttributeError) as e:
+            raise _FastMCPParseError(f"Failed to parse result content: {e}, result={result!r}") from e
+    raise _FastMCPParseError(f"Result has no structured_content or content: {result!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +222,9 @@ def lance_palace(tmp_path):
 
     yield str(palace_path)
 
-    # Restore
+    # Restore + clear singletons
     lance_mod._embed_texts = _orig_embed
+    KeywordIndex._reset_for_testing()
 
 
 @pytest.fixture(scope="function")
@@ -244,15 +252,21 @@ async def seeded_lance_palace(tmp_path):
         yield str(palace_path), str(repo)
     finally:
         lance_mod._embed_texts = _orig_embed
+        KeywordIndex._reset_for_testing()
 
 
 @pytest.fixture(scope="function")
 async def lance_e2e_client(seeded_lance_palace):
-    """FastMCP Client wired to a pre-mined LanceDB palace."""
+    """FastMCP Client wired to a pre-mined LanceDB palace. Verifies server startup."""
     palace_path, _ = seeded_lance_palace
     settings = MemPalaceSettings(db_path=palace_path, db_backend="lance")
     server = create_server(settings=settings)
     async with Client(transport=server) as c:
+        # Verify server is responsive before yielding -- fail fast on cascade errors
+        try:
+            await c.call_tool("mempalace_status", {})
+        except Exception as e:
+            raise RuntimeError(f"Server failed to start for palace {palace_path}: {e}") from e
         yield c, palace_path
 
 
@@ -262,21 +276,25 @@ async def lance_e2e_client(seeded_lance_palace):
 
 
 def test_mine_fixture_repo_into_lance(lance_palace, fixture_repo):
-    """Mine the fixture repo and assert drawer count > 0."""
+    """Mine the fixture repo and assert exact drawer count."""
     mine(str(fixture_repo), lance_palace)
 
     backend = LanceBackend()
     col = backend.get_collection(lance_palace, "mempalace_drawers")
-    assert col.count() > 0
+    # Fixture creates 5 files: src/auth.py, src/db.py, src/__init__.py, README.md, pyproject.toml
+    # Mining extracts per-class/per-function drawers so count >= 5
+    count = col.count()
+    assert count >= 5, f"Expected >= 5 drawers from mining, got {count}"
 
 
 def test_lance_collection_has_drawers(lance_palace, fixture_repo):
-    """Mine then assert Lance drawer count > 0."""
+    """Mine then assert Lance drawer count >= 5."""
     mine(str(fixture_repo), lance_palace)
 
     backend = LanceBackend()
     col = backend.get_collection(lance_palace, "mempalace_drawers")
-    assert col.count() > 0
+    count = col.count()
+    assert count >= 5, f"Expected >= 5 drawers, got {count}"
 
 
 # ---------------------------------------------------------------------------
@@ -285,16 +303,21 @@ def test_lance_collection_has_drawers(lance_palace, fixture_repo):
 
 
 def test_fts5_keyword_index_populated(lance_palace, fixture_repo):
-    """After mining, FTS5 KeywordIndex must have entries."""
+    """After mining, FTS5 KeywordIndex must have entries for all major fixture terms."""
     mine(str(fixture_repo), lance_palace)
 
     idx = KeywordIndex.get(lance_palace)
 
-    results = idx.search("AuthManager", n_results=5)
-    assert len(results) > 0, "Expected AuthManager in FTS5 index"
+    # Check 3 independent terms to catch false-positives from partial mining
+    results_auth = idx.search("AuthManager", n_results=5)
+    assert len(results_auth) > 0, "Expected AuthManager in FTS5 index"
 
-    results2 = idx.search("ConnectionPool", n_results=5)
-    assert len(results2) > 0, "Expected ConnectionPool in FTS5 index"
+    results_db = idx.search("ConnectionPool", n_results=5)
+    assert len(results_db) > 0, "Expected ConnectionPool in FTS5 index"
+
+    # "fixture" only appears in README.md -- verifies README was indexed
+    results_fixture = idx.search("fixture", n_results=3)
+    assert len(results_fixture) > 0, "Expected 'fixture' from README.md in FTS5 index"
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +365,6 @@ async def test_mcp_status_shows_drawers(lance_e2e_client):
 
     result = await client.call_tool("mempalace_status", {})
     data = _get_result_data(result)
-    assert data is not None, f"Got None result: {result}"
     assert data["total_drawers"] > 0, f"Expected drawers > 0, got {data}"
 
 
@@ -353,7 +375,6 @@ async def test_mcp_list_wings(lance_e2e_client):
 
     result = await client.call_tool("mempalace_list_wings", {})
     data = _get_result_data(result)
-    assert data is not None
     assert "fixture_project" in data.get("wings", {}), f"Expected fixture_project: {data}"
 
 
@@ -367,7 +388,6 @@ async def test_mcp_hybrid_search_finds_auth(lance_e2e_client):
         "limit": 5,
     })
     data = _get_result_data(result)
-    assert data is not None
     assert "results" in data
     assert len(data["results"]) > 0, f"Expected search results: {data}"
 
@@ -382,7 +402,6 @@ async def test_mcp_hybrid_search_finds_db(lance_e2e_client):
         "limit": 5,
     })
     data = _get_result_data(result)
-    assert data is not None
     assert "results" in data
     assert len(data["results"]) > 0, f"Expected search results: {data}"
 
@@ -397,7 +416,6 @@ async def test_mcp_search_code_finds_auth(lance_e2e_client):
         "limit": 5,
     })
     data = _get_result_data(result)
-    assert data is not None
     assert "results" in data
     assert len(data["results"]) > 0, f"Expected code search results: {data}"
 
@@ -413,7 +431,6 @@ async def test_mcp_project_context(lance_e2e_client):
         "limit": 3,
     })
     data = _get_result_data(result)
-    assert data is not None
     assert "chunks" in data or "results" in data, f"Expected chunks/results: {data}"
 
 
@@ -427,7 +444,6 @@ async def test_mcp_find_symbol(lance_e2e_client):
         "project_root": palace_path,
     })
     data = _get_result_data(result)
-    assert data is not None
     assert "results" in data or "symbols" in data, f"Expected symbol results: {data}"
 
 
@@ -441,7 +457,6 @@ async def test_mcp_file_symbols(lance_e2e_client):
         "project_root": str(Path(palace_path).parent / "fixture_project"),
     })
     data = _get_result_data(result)
-    assert data is not None
     assert "symbols" in data or "results" in data, f"Expected symbol list: {data}"
 
 
@@ -477,7 +492,6 @@ async def test_delete_drawer_removes_fts5_entry(seeded_lance_palace):
             "content": unique_content,
         })
         add_data = _get_result_data(add_result)
-        assert add_data is not None
         assert add_data.get("success") is True, f"add_drawer failed: {add_data}"
         drawer_id = add_data["drawer_id"]
 
@@ -491,7 +505,6 @@ async def test_delete_drawer_removes_fts5_entry(seeded_lance_palace):
             "drawer_id": drawer_id,
         })
         del_data = _get_result_data(del_result)
-        assert del_data is not None
         assert del_data.get("success") is True, f"delete_drawer failed: {del_data}"
 
         # FTS5 must NOT return the deleted content -- ghost row check

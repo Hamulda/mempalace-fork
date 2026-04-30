@@ -263,8 +263,11 @@ class QueryCache:
             try:
                 now = time.monotonic()
                 cache = shard["cache"]
+                # TTL expiry check before insert — symmetrical with get_value
                 if key in cache:
-                    del cache[key]
+                    _, ts = cache[key]
+                    if now - ts >= self._ttl:
+                        del cache[key]
                 cache[key] = (value, now)
                 while len(cache) > self._maxsize:
                     oldest = next(iter(cache))

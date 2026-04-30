@@ -54,7 +54,11 @@ print("RESULT:", result)
         env=env, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
     if result.returncode != 0:
-        raise RuntimeError(f"mine subprocess failed: {result.stderr[:500]}")
+        raise RuntimeError(
+            f"mine subprocess failed (exit {result.returncode}):\n"
+            f"STDERR: {result.stderr}\n"
+            f"STDOUT: {result.stdout[-500:]}"
+        )
     # Parse "RESULT: {...}" from stdout
     for line in result.stdout.splitlines():
         if line.startswith("RESULT:"):

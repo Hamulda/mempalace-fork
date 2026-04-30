@@ -18,6 +18,7 @@ No MPS/GPU conflicts across sessions when using the daemon.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import math
@@ -471,7 +472,11 @@ def _quarantine_record(
     model: str,
     wing: str,
 ) -> None:
-    """Append a quarantine record to the shared JSONL log."""
+    """Append a quarantine record to the shared JSONL log. Bounded to prevent DoS.
+
+    If the file exceeds 1MB or 10,000 lines, the oldest third is truncated
+    to keep the log manageable and prevent disk exhaustion.
+    """
     import datetime
 
     record = {
@@ -485,6 +490,32 @@ def _quarantine_record(
     }
     qpath = Path(os.path.expanduser("~/.mempalace/palace/mining_quarantine.jsonl"))
     qpath.parent.mkdir(parents=True, exist_ok=True)
+
+    MAX_QSIZE = 1024 * 1024  # 1 MB
+    MAX_QLINES = 10000
+
+    try:
+        size = qpath.stat().st_size
+        lines = 0
+        with qpath.open("r") as f:
+            for line in f:
+                lines += 1
+                if lines > MAX_QLINES:
+                    break
+    except (FileNotFoundError, OSError):
+        size, lines = 0, 0
+
+    # Truncate oldest third if limits exceeded
+    if size > MAX_QSIZE or lines > MAX_QLINES:
+        try:
+            with qpath.open("r") as f:
+                existing = f.readlines()
+            keep = len(existing) // 3 * 2  # keep newest two-thirds
+            with qpath.open("w") as f:
+                f.writelines(existing[-keep:])
+        except (FileNotFoundError, OSError):
+            pass
+
     with qpath.open("a") as f:
         f.write(json.dumps(record, default=str) + "\n")
 
@@ -914,6 +945,26 @@ class SemanticDeduplicator:
 
 # ── LanceDB Async Optimizer ───────────────────────────────────────────────────
 
+_optimizer_instances: list["LanceOptimizer"] = []
+
+
+def _register_optimizer(optimizer: "LanceOptimizer") -> None:
+    """Register optimizer for atexit cleanup."""
+    _optimizer_instances.append(optimizer)
+
+
+def _close_all_optimizers() -> None:
+    """Stop all optimizer threads on process exit."""
+    for opt in _optimizer_instances:
+        try:
+            opt.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_close_all_optimizers)
+
+
 class LanceOptimizer:
     """
     Background compaction of LanceDB delta files.
@@ -939,6 +990,7 @@ class LanceOptimizer:
         self._optimize_loop: asyncio.AbstractEventLoop | None = None
         self._optimize_thread: threading.Thread | None = None
         self._optimize_lock = threading.Lock()  # guard _optimize_loop access
+        _register_optimizer(self)
 
     def _get_optimize_loop(self) -> asyncio.AbstractEventLoop:
         """Lazily start a persistent daemon thread with one event loop.
@@ -957,8 +1009,8 @@ class LanceOptimizer:
                     asyncio.set_event_loop(ev)
                     ev.run_forever()
 
-                t = threading.Thread(target=_run_loop, daemon=True, name="mp_optimize")
-                t.start()
+                self._optimize_thread = threading.Thread(target=_run_loop, daemon=True, name="mp_optimize")
+                self._optimize_thread.start()
                 # yield to the new thread — ev.run_forever() starts instantly, no spin needed
                 time.sleep(0)
             return self._optimize_loop
@@ -971,7 +1023,13 @@ class LanceOptimizer:
         self._optimize_loop = None
         if loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
-        # Don't join — daemon thread exits when process exits
+
+    def stop(self) -> None:
+        """Stop the optimizer thread and flush pending work. Call from collection close."""
+        self._stop_optimize_loop()
+        t = getattr(self, "_optimize_thread", None)
+        if t is not None:
+            t.join(timeout=2.0)
 
     def record_write(self) -> None:
         """Call after every successful write. Triggers async optimize if needed."""
@@ -1474,6 +1532,12 @@ class LanceCollection(BaseCollection):
         """Run synchronous LanceDB optimize. For CLI use."""
         if self._optimizer:
             self._optimizer.run_optimize_sync()
+
+    def close(self) -> None:
+        """Close the collection — stop optimizer thread, flush pending work."""
+        if self._optimizer:
+            self._optimizer.stop()
+            self._optimizer = None
 
     def query_by_vector(
         self,

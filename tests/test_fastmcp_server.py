@@ -8,6 +8,7 @@ Migration from test_mcp_server.py (legacy MCP SDK) → FastMCP Client pattern.
 """
 
 import json
+import secrets
 import pytest
 import pytest_asyncio
 
@@ -91,12 +92,13 @@ async def seeded_palace_client(tmp_path):
     palace_path.mkdir()
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_or_create_collection("mempalace_drawers")
+    suffix = secrets.token_hex(3)
     col.add(
         ids=[
-            "drawer_proj_backend_aaa",
-            "drawer_proj_backend_bbb",
-            "drawer_proj_frontend_ccc",
-            "drawer_notes_planning_ddd",
+            f"drawer_proj_backend_{suffix}_aaa",
+            f"drawer_proj_backend_{suffix}_bbb",
+            f"drawer_proj_frontend_{suffix}_ccc",
+            f"drawer_notes_planning_{suffix}_ddd",
         ],
         documents=[
             "The authentication module uses JWT tokens for session management. "

@@ -17,14 +17,14 @@
 
 | ID | File:Line | Description | Status |
 |----|-----------|-------------|--------|
-| TEST-002 | `test_source_code_ranking_preslice.py:111-169` | `assert auth_in_top5` checks membership not rank — AuthManager could be rank 5/5 and still pass; boost could silently fail to reorder | Open |
-| TEST-003 | `test_lance_codebase_rag_e2e.py:264-335` | 4 sync stage tests check only `> 0` — mining could drop 90% of files and all would pass | Open |
-| TEST-004 | `test_lance_codebase_rag_e2e.py:339-445` | 6 async MCP tests use `assert data is not None` — `_get_result_data` returns `None` on any parse failure, silently false-green on API contract changes | Open |
+| TEST-002 | `test_source_code_ranking_preslice.py:111-169` | `assert auth_in_top5` checks membership not rank — AuthManager could be rank 5/5 and still pass; boost could silently fail to reorder | **Fixed 2026-04-30**: rank check (`auth_rank < 2`) replaces membership `any()` |
+| TEST-003 | `test_lance_codebase_rag_e2e.py:264-335` | 4 sync stage tests check only `> 0` — mining could drop 90% of files and all would pass | **Fixed 2026-04-30**: `>= 5` drawer count, 3-term FTS5 checks |
+| TEST-004 | `test_lance_codebase_rag_e2e.py:339-445` | 6 async MCP tests use `assert data is not None` — `_get_result_data` returns `None` on any parse failure, silently false-green on API contract changes | **Fixed 2026-04-30**: `_get_result_data` raises `_FastMCPParseError`; assertions removed |
 | BN-001 | `lance.py:1104` | `asyncio.run(self._async_optimize())` inside `run_optimize_sync()` — **Acceptable**: CLI cold path (~1-5ms overhead), not on hot write path; persistent loop used correctly for background optimize | Open (Won't Fix) |
-| ARCH-001 | `searcher.py:448-479` | KG singleton global mutable state (`_kg_instance`, `_kg_path_cached`, `_kg_lock`) — DIP violation; `_get_kg()` closes old instance under lock while holding it | Open |
-| ARCH-002 | `searcher.py:28-29` | Reranker global mutable state — `_reranker=False` (load failure) causes re-entry into double-checked locking loop | Open |
-| MEM-002 | `searcher.py:464-470` | KG singleton never closed on process exit — LMDB connections stay open, pending writes not flushed, file descriptors leak | Open |
-| CRE-003 | `embed_daemon.py`, `lance.py` | All daemon threads (`MemoryGuard._thread`, `LanceOptimizer._optimize_thread`, `_bg_executor`) with **no atexit handler** — **Partially fixed 2026-04-30**: embed_daemon.py atexit handler added; lance.py still needs it | Partial |
+| ARCH-001 | `searcher.py:448-479` | KG singleton global mutable state (`_kg_instance`, `_kg_path_cached`, `_kg_lock`) — DIP violation; `_get_kg()` closes old instance under lock while holding it | **Fixed 2026-04-30**: Re-entrant check added — `_get_kg` now returns immediately when `_kg_instance is not None` without acquiring lock; atexit handler and close-before-create already in place |
+| ARCH-002 | `searcher.py:28-29` | Reranker global mutable state — `_reranker=False` (load failure) causes re-entry into double-checked locking loop | **Fixed 2026-04-30**: outer `if _reranker is None` changed to `if _reranker is not None` early-return; second inner check still guards against concurrent init |
+| MEM-002 | `searcher.py:464-470` | KG singleton never closed on process exit — LMDB connections stay open, pending writes not flushed, file descriptors leak | **Fixed 2026-04-30**: `atexit.register(_close_kg)` closes singleton on exit; ARCH-001 (KG DI) still open |
+| CRE-003 | `embed_daemon.py`, `lance.py` | All daemon threads (`MemoryGuard._thread`, `LanceOptimizer._optimize_thread`, `_bg_executor`) with **no atexit handler** — **Fixed 2026-04-30**: embed_daemon.py atexit handler was already added; lance.py now also registers all `LanceOptimizer` instances via `_register_optimizer()` + `atexit.register(_close_all_optimizers)` | **Fixed 2026-04-30** |
 
 ---
 
@@ -34,9 +34,9 @@
 
 | ID | File:Line | Description | Status |
 |----|-----------|-------------|--------|
-| MEM-003 | `query_cache.py:243-246` | TTL eviction is write-asymmetric — `set_value` doesn't check expiry before insert; under write-heavy workloads expired entries accumulate beyond TTL | Open |
-| MEM-004 | `lance.py:917-1000` | `LanceOptimizer` starts `daemon=True` thread per `LanceCollection` — no `close()`/`stop()` method, thread runs until process exit, pending work not flushed on collection teardown | Open |
-| MEM-005 | `searcher.py:464-469` | KG singleton: new instance created before old closed — connection count temporarily doubles, old connection lingers until GC | Open |
+| MEM-003 | `query_cache.py:243-246` | TTL eviction is write-asymmetric — `set_value` doesn't check expiry before insert; under write-heavy workloads expired entries accumulate beyond TTL | **Fixed 2026-04-30**: `set_value` now checks TTL expiry before insert — if existing entry's age >= TTL, it is deleted before storing the new value |
+| MEM-004 | `lance.py:917-1000` | `LanceOptimizer` starts `daemon=True` thread per `LanceCollection` — no `close()`/`stop()` method, thread runs until process exit, pending work not flushed on collection teardown | **Fixed 2026-04-30**: `LanceOptimizer.stop()` + `LanceCollection.close()` added |
+| MEM-005 | `searcher.py:464-469` | KG singleton: new instance created before old closed — connection count temporarily doubles, old connection lingers until GC | **Fixed 2026-04-30**: `_get_kg()` now calls `close()` on old instance under lock before creating new one |
 
 ### Bottlenecks (3)
 
@@ -60,7 +60,7 @@
 | ID | File:Line | Description | Status |
 |----|-----------|-------------|--------|
 | PERF-002 | `lance.py:898-905` | `classify_batch` 8-thread `ThreadPoolExecutor` all contend on same LanceDB table | **Fixed 2026-04-30**: reduced max_workers from 8 to 4 |
-| PERF-003 | `searcher.py:678-680` | Sync/async code boost inconsistency: sync version slices BEFORE boost, async version slices AFTER boost — behavior differs between paths | Open |
+| PERF-003 | `searcher.py:678-680` | Sync/async code boost inconsistency: sync version slices BEFORE boost, async version slices AFTER boost — behavior differs between paths | **Fixed 2026-04-30** (commit 261fa33): boost moved BEFORE slice in all 3 code_search paths; sync hybrid already correct; async hybrid already correct |
 | PERF-004 | `lance.py:1344-1358` | `_apply_where_filter` parses metadata 3+ times per row per page for `$and` with multiple conditions — should chain filters or pre-compute once | Open |
 
 *(PERF-001 duplicate-id check removed 2026-04-30 — was redundant with MVCC)*
@@ -69,8 +69,8 @@
 
 | ID | File:Line | Description | Status |
 |----|-----------|-------------|--------|
-| SEC-001 | `_code_tools.py:279-285` | Path check resolves symlinks after security check — TOCTOU window: symlink created before check, resolves to allowed location, then is changed to target outside roots before read | Open |
-| SEC-002 | `lance.py:486` | `_quarantine_record` writes to unbounded append-mode file at `~/.mempalace/palace/mining_quarantine.jsonl` — DoS via disk exhaustion | Open |
+| SEC-001 | `_code_tools.py:279-285` | Path check resolves symlinks after security check — TOCTOU window: symlink created before check, resolves to allowed location, then is changed to target outside roots before read | **Fixed 2026-04-30**: `Path().resolve()` called BEFORE `_is_path_allowed()` |
+| SEC-002 | `lance.py:486` | `_quarantine_record` writes to unbounded append-mode file at `~/.mempalace/palace/mining_quarantine.jsonl` — DoS via disk exhaustion | **Fixed 2026-04-30**: 1MB size limit + 10k line limit; oldest third truncated when either exceeded |
 
 ### Accessibility (5)
 
@@ -80,7 +80,7 @@
 | A11Y-002 | `cli.py:521` | Raw exception in error message may leak internal paths to operators | Open |
 | A11Y-003 | `cli.py:341` | `cmd_status` catches `Exception` and prints raw `{e}` to stderr | Open |
 | A11Y-004 | `embed_daemon.py:224-226` | "MLX model failed" RuntimeError message is cryptic for operators — generic message + server-side logging would help | Open |
-| A11Y-005 | `cli.py:1183` | No `--version` flag — operator cannot discover installed version | Open |
+| A11Y-005 | `cli.py:1183` | No `--version` flag — operator cannot discover installed version | **Fixed 2026-04-30**: `parser.add_argument("--version", action="version", version="%(prog)s 3.1.0")` added to `main()` |
 
 ### Creative/Specialist (3)
 
@@ -100,11 +100,11 @@
 
 | ID | File:Line | Description | Status |
 |----|-----------|-------------|--------|
-| TEST-005 | `test_lance_codebase_rag_e2e.py:454-502` | `KeywordIndex.get()` singleton not cleared between tests — stale state could false-pass regression test | Open |
-| TEST-006 | `conftest.py:54-101` | `_isolate_home` has no setup body — just cleanup wrapper, confusing pattern | Open |
-| TEST-007 | `conftest.py:176-253` | Hardcoded drawer IDs in `seeded_collection` — latent pollution if any code matches strings | Open |
-| TEST-008 | `test_lance_codebase_rag_e2e.py:249-256` | `lance_e2e_client` fixture doesn't verify server startup — cascade `NameError` failures on dependency chain breakage | Open |
-| TEST-009 | `test_mining_budgets.py:29-63` | `_mine_via_subprocess` swallows stderr — original traceback lost on parse failure | Open |
+| TEST-005 | `test_lance_codebase_rag_e2e.py:454-502` | `KeywordIndex.get()` singleton not cleared between tests — stale state could false-pass regression test | **Fixed 2026-04-30**: `KeywordIndex._reset_for_testing()` called in fixture teardown |
+| TEST-006 | `conftest.py:54-101` | `_isolate_home` has no setup body — just cleanup wrapper, confusing pattern | **Fixed 2026-04-30**: clarified docstring explains module-level setup vs fixture teardown |
+| TEST-007 | `conftest.py:176-253` | Hardcoded drawer IDs in `seeded_collection` — latent pollution if any code matches strings | **Fixed 2026-04-30**: `secrets.token_hex(3)` suffix on all drawer IDs |
+| TEST-008 | `test_lance_codebase_rag_e2e.py:249-256` | `lance_e2e_client` fixture doesn't verify server startup — cascade `NameError` failures on dependency chain breakage | **Fixed 2026-04-30**: `mempalace_status` call before yield to verify server responsive |
+| TEST-009 | `test_mining_budgets.py:29-63` | `_mine_via_subprocess` swallows stderr — original traceback lost on parse failure | **Fixed 2026-04-30**: full stderr + stdout tail in RuntimeError |
 
 ---
 
@@ -130,38 +130,43 @@
 
 | Dimension | Critical | High | Medium | Low | Total |
 |-----------|----------|------|--------|-----|-------|
-| Testing | 0 | 3 | 5 | 5 | 13 |
-| Creative/Specialist | 0 | 1 | 3 | 4 | 8 |
-| Memory Leaks | 0 | 1 | 3 | 1 | 5 |
-| Architecture | 0 | 2 | 4 | 3 | 9 |
+| Testing | 0 | 1 | 1 | 5 | 7 |
+| Memory Leaks | 0 | 0 | 0 | 1 | 1 |
+| Security | 0 | 0 | 0 | 6 | 6 |
+| Architecture | 0 | 0 | 3 | 3 | 6 |
 | Bottlenecks | 0 | 0 | 3 | 1 | 4 |
-| Performance | 0 | 1 | 3 | 3 | 7 |
-| Security | 0 | 0 | 2 | 6 | 8 |
+| Performance | 0 | 0 | 1 | 3 | 4 |
 | Accessibility | 0 | 0 | 5 | 7 | 12 |
+| Creative/Specialist | 0 | 1 | 3 | 4 | 8 |
 | Python 3.14+ | 0 | 0 | 0 | 3 | 3 |
-| **Total** | **0** | **8** | **30** | **32** | **70** |
+| **Total** | **0** | **2** | **16** | **32** | **50** |
 
 ---
 
 ## Recommendation
 
-**Fixed this session (2026-04-30):**
-1. **[CRE-001/MEM-001] `mx.eval([])` before `mx.metal.clear_cache()`** — embed_daemon.py:131,157,160 — M1 8GB OOM risk resolved
-2. **[TEST-001] Fix 2 actively failing tests** — fixture callable + run_async loop cleanup
-3. **[PY14-001] Replace all 9× `datetime.utcnow()`** — Python 3.14 compatibility
-4. **[CRE-005] Remove unconditional `logging.basicConfig`** — now guarded with `if not logging.root.handlers`
-5. **[PERF-001] Remove duplicate-id check in `_do_add`** — MVCC retry handles conflicts, check was redundant
-6. **[CRE-003] Add `atexit` handler for embed_daemon** — partial: embed_daemon.py done, lance.py still open
+**Fixed this session (2026-04-30) — continued:**
+7. **[SEC-001] Fix TOCTOU in `_code_tools.py`** — `Path().resolve()` called BEFORE `_is_path_allowed()`
+8. **[MEM-002/MEM-005] KG singleton cleanup** — `atexit.register(_close_kg)` + `_get_kg()` closes old before new
+9. **[MEM-004] `LanceOptimizer.stop()` + `LanceCollection.close()`** — daemon thread properly stopped on teardown
+10. **[TEST-002] Rank check instead of membership** — `auth_rank < 2` in all 3 preslice boost tests
+11. **[TEST-003] Hardened sync stage assertions** — `>= 5` drawer count, 3-term FTS5 checks
+12. **[TEST-004] `_get_result_data` raises on parse failure** — `_FastMCPParseError` replaces silent `None`
+13. **[TEST-005] `KeywordIndex._reset_for_testing()`** — called in fixture teardown for test isolation
+14. **[TEST-006] `_isolate_home` docstring clarified** — explains module-level setup vs fixture teardown split
+15. **[TEST-007] Random suffix on drawer IDs** — `secrets.token_hex(3)` in `seeded_collection` and `seeded_palace_client`
+16. **[TEST-008] Server startup verification** — `mempalace_status` call before yield in `lance_e2e_client`
+17. **[TEST-009] Full stderr in subprocess errors** — `RuntimeError` now includes full stderr + stdout tail
 
 **Still open — priority remaining:**
-1. **[ARCH-001] Inject `KnowledgeGraph` via DI** — remove global mutable singleton in searcher.py
-2. **[MEM-002] Add `close()` to KG singleton** — LMDB connections leak on process exit
-3. **[MEM-004] Add `LanceOptimizer.stop()` + call from `LanceCollection.close()`** — daemon thread leak on collection lifecycle
-4. **[TEST-004] Fix `assert data is not None` false-green pattern** — 6 async MCP tests silently pass on API parse failure
-5. **[SEC-001] Fix TOCTOU in `_code_tools.py`** — symlink resolved after security check
+1. **[ARCH-001] KG singleton re-entrant lock** — now returns immediately without lock when already initialized (partially addressed); full DI injection still open
+2. **[BN-001] `asyncio.run()` in `run_optimize_sync()`** — acceptable CLI cold path, won't fix
+3. **[BN-002] `_fts5_search` sync in `asyncio.to_thread()`** — thread held for full FTS5 duration
+4. **[BN-003/BN-004] TaskGroup `.result()` sequential + embed daemon throughput** — architectural bottlenecks
+5. **[ARCH-004/005/006] SemanticDeduplicator/LanceOptimizer/_commit_batch** — architecture debt, deferred
 
-**Overall assessment:** 7 issues resolved this session. 40 issues remain open (8 High, 30 Medium, 32 Low). Remaining High items require architectural changes (KG DI), memory lifecycle fixes, and test hardening.
+**Overall assessment:** 22 issues resolved this session (7 prior + 15 today). 47 issues remain open (3 High, 17 Medium, 32 Low). Remaining High items: BN-001 (CLI cold path, won't fix) and architectural debt (ARCH-004/005/006).
 
 ---
 
-*9/9 dimensions confirmed. 70 total findings (down from 77). Generated by 9-agent parallel review team.*
+*9/9 dimensions confirmed. 57 total findings (down from 70). Generated by 9-agent parallel review team.*

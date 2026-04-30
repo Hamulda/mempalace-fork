@@ -277,16 +277,15 @@ def register_code_tools(server, backend, config, settings):
             has_more_before, has_more_after, and lines list with
             line_num and text for each line in the slice.
         """
-        # Security check — path traversal (..) resolved by Path().resolve()
+        # Resolve symlinks BEFORE security check — prevents TOCTOU
+        p = Path(file_path).expanduser().resolve()
         if not _is_path_allowed(
-            file_path,
+            str(p),
             project_path,
             settings.file_context_allow_any,
             settings.file_context_allowed_roots,
         ):
             return {"error": "file_context denied: path is outside allowed roots"}
-
-        p = Path(file_path).expanduser().resolve()
         if not p.exists():
             return {"error": f"File not found: {file_path}"}
         try:

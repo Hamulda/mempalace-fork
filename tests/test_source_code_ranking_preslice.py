@@ -147,7 +147,7 @@ class TestPresliceCodeBoost:
     """
 
     def test_authmanager_in_top5_auto_search(self, mixed_palace):
-        """auto_search complexity=code — src/auth.py must be in top-5."""
+        """auto_search complexity=code — src/auth.py must be in top-2 (rank check, not just membership)."""
         result = run_async(
             auto_search("AuthManager", mixed_palace, n_results=5)
         )
@@ -155,55 +155,52 @@ class TestPresliceCodeBoost:
         assert len(hits) >= 1, f"No results returned: {result}"
 
         top_sources = [h.get("source_file", "") for h in hits]
-        auth_in_top5 = any("auth.py" in src for src in top_sources)
-        assert auth_in_top5, (
+        auth_rank = next((i for i, src in enumerate(top_sources) if "auth.py" in src), -1)
+        assert auth_rank != -1, (
             f"src/auth.py NOT in top-5 after boost.\n"
             f"Top-5 sources: {top_sources}\n"
             f"Hits: {hits[:3]}"
         )
+        assert auth_rank < 2, (
+            f"src/auth.py ranked {auth_rank+1}/5 — boost may be weak or missing.\n"
+            f"Top-5 sources: {top_sources}"
+        )
 
     def test_authmanager_code_via_auto_search(self, mixed_palace):
-        """auto_search auto-detects code query — src/auth.py must be in top-5."""
-        # "AuthManager" auto-detects as code complexity (symbol/class name pattern)
+        """auto_search auto-detects code query — src/auth.py must be rank 1-2."""
         result = run_async(
             auto_search("AuthManager", mixed_palace, n_results=5)
         )
         hits = result.get("results", [])
         top_sources = [h.get("source_file", "") for h in hits]
-        auth_in_top5 = any("auth.py" in src for src in top_sources)
-        assert auth_in_top5, (
-            f"auto_search: src/auth.py NOT in top-5.\n"
-            f"Top-5: {top_sources}"
-        )
+        auth_rank = next((i for i, src in enumerate(top_sources) if "auth.py" in src), -1)
+        assert auth_rank != -1, f"src/auth.py NOT in top-5.\nTop-5: {top_sources}"
+        assert auth_rank < 2, f"src/auth.py ranked {auth_rank+1}/5.\nTop-5: {top_sources}"
 
     @pytest.mark.parametrize("intent", ["symbol", "code_exact", "code_semantic"])
     def test_code_search_intent_top5(self, mixed_palace, intent):
-        """code_search with various intents — src/auth.py in top-5."""
+        """code_search with various intents — src/auth.py must be rank 1-2."""
         result = run_async(
             code_search_async("AuthManager", mixed_palace, n_results=5)
         )
         hits = result.get("results", [])
         assert len(hits) >= 1, f"No results for intent={intent}: {result}"
         top_sources = [h.get("source_file", "") for h in hits]
-        auth_in_top5 = any("auth.py" in src for src in top_sources)
-        assert auth_in_top5, (
-            f"intent={intent}: src/auth.py NOT in top-5.\n"
-            f"Top-5: {top_sources}"
-        )
+        auth_rank = next((i for i, src in enumerate(top_sources) if "auth.py" in src), -1)
+        assert auth_rank != -1, f"intent={intent}: src/auth.py NOT in top-5.\nTop-5: {top_sources}"
+        assert auth_rank < 2, f"intent={intent}: src/auth.py ranked {auth_rank+1}/5.\nTop-5: {top_sources}"
 
     def test_hybrid_search_async_authmanager(self, mixed_palace):
-        """hybrid_search_async — src/auth.py in top-5."""
+        """hybrid_search_async — src/auth.py must be rank 1-2."""
         result = run_async(
             hybrid_search_async("AuthManager", mixed_palace, n_results=5)
         )
         hits = result.get("results", [])
         assert len(hits) >= 1, f"No results: {result}"
         top_sources = [h.get("source_file", "") for h in hits]
-        auth_in_top5 = any("auth.py" in src for src in top_sources)
-        assert auth_in_top5, (
-            f"hybrid_search_async: src/auth.py NOT in top-5.\n"
-            f"Top-5: {top_sources}"
-        )
+        auth_rank = next((i for i, src in enumerate(top_sources) if "auth.py" in src), -1)
+        assert auth_rank != -1, f"hybrid_search_async: src/auth.py NOT in top-5.\nTop-5: {top_sources}"
+        assert auth_rank < 2, f"hybrid_search_async: src/auth.py ranked {auth_rank+1}/5.\nTop-5: {top_sources}"
 
     def test_memory_query_not_boosted(self, mixed_palace):
         """Memory query returns prose freely — boost must NOT dominate memory intent."""

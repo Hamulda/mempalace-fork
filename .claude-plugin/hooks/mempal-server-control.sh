@@ -227,8 +227,8 @@ start_server() {
 
     # Use project .venv python (has all dependencies: fastmcp, mempalace, lancedb)
     # pyenv shims resolve to system-managed Python which lacks these packages
-    # .venv is at <project>/.venv, and script is at <project>/.claude-plugin/hooks/
-    PYTHON_BIN="$SCRIPT_DIR/../../.venv/bin/python3"
+    # Hardcode project root to avoid SCRIPT_DIR reference issues with set -u
+    PYTHON_BIN="/Users/vojtechhamada/.claude/plugins/marketplaces/mempalace/.venv/bin/python3"
     if [[ ! -x "$PYTHON_BIN" ]]; then
         # Fallback: try pyenv-resolved python (may lack packages)
         if command -v python3 >/dev/null 2>&1; then

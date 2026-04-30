@@ -1190,6 +1190,9 @@ def main():
         default=None,
         help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace)",
     )
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s 3.1.0",
+    )
 
     sub = parser.add_subparsers(dest="command")
 

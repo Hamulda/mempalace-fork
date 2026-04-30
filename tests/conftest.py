@@ -86,13 +86,16 @@ def _mock_embed_for_all_tests():
 
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_home():
-    """Ensure HOME points to a temp dir for the entire test session.
+    """Session-scoped HOME isolation for the entire test session.
 
-    The env vars were already set at module level (above) so that
-    module-level initialisations are captured.  This fixture simply
-    restores the originals on teardown and cleans up the temp dir.
+    Setup (env var capture + temp dir) runs at module load time, BEFORE
+    any mempalace imports, so that import-time initialisations are isolated.
+    The fixture itself owns the teardown only.
+
+    To verify: env vars are captured in conftest.py module globals before
+    mempalace imports (see module-level block above).
     """
-    yield
+    yield  # Setup already done at module level -- isolation active before first import
     for var, orig in _original_env.items():
         if orig is None:
             os.environ.pop(var, None)
@@ -198,12 +201,15 @@ def collection(palace_path):
 @pytest.fixture
 def seeded_collection(collection):
     """Collection with a handful of representative drawers."""
+    import secrets
+
+    suffix = secrets.token_hex(3)  # unique per test run to avoid pollution
     collection.add(
         ids=[
-            "drawer_proj_backend_aaa",
-            "drawer_proj_backend_bbb",
-            "drawer_proj_frontend_ccc",
-            "drawer_notes_planning_ddd",
+            f"drawer_proj_backend_{suffix}_aaa",
+            f"drawer_proj_backend_{suffix}_bbb",
+            f"drawer_proj_frontend_{suffix}_ccc",
+            f"drawer_notes_planning_{suffix}_ddd",
         ],
         documents=[
             "The authentication module uses JWT tokens for session management. "

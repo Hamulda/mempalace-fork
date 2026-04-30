@@ -107,44 +107,49 @@ def _get_reranker():
     Memory guard: refuse load below 800MB free to avoid swap on 8GB M1.
     """
     global _reranker
-    if _reranker is None:
-        acquired = _reranker_lock.acquire(timeout=_RERANKER_LOCK_TIMEOUT)
-        if not acquired:
-            logger.warning("Reranker lock timeout after %.0fs — skipping init", _RERANKER_LOCK_TIMEOUT)
-            return None
+    # Re-entrant check: skip lock acquisition when _reranker is already in a
+    # terminal state (loaded or failed). Only block when another thread is
+    # actively initializing it (state == None).
+    if _reranker is not None:
+        return _reranker if _reranker is not False else None
+    acquired = _reranker_lock.acquire(timeout=_RERANKER_LOCK_TIMEOUT)
+    if not acquired:
+        logger.warning("Reranker lock timeout after %.0fs — skipping init", _RERANKER_LOCK_TIMEOUT)
+        return None
+    try:
+        if _reranker is not None:
+            return _reranker if _reranker is not False else None
+        # Memory guard: refuse load below 800MB free.
+        # Reranker loads lazily (not at startup) so this is a bonus, not a lockout.
+        # 1500MB was too conservative — would block reranking almost always on 8GB M1.
         try:
-            if _reranker is None:
-                # Memory guard: refuse load below 800MB free.
-                # Reranker loads lazily (not at startup) so this is a bonus, not a lockout.
-                # 1500MB was too conservative — would block reranking almost always on 8GB M1.
-                try:
-                    import psutil
-                    free_mb = psutil.virtual_memory().available // 1024 // 1024
-                    if free_mb < 800:
-                        logger.warning(
-                            "Low memory (%dMB free), reranking disabled", free_mb
-                        )
-                        _reranker = False
-                        return None
-                except ImportError:
-                    pass
+            import psutil
+            free_mb = psutil.virtual_memory().available // 1024 // 1024
+            if free_mb < 800:
+                logger.warning(
+                    "Low memory (%dMB free), reranking disabled", free_mb
+                )
+                _reranker = False
+                return None
+        except ImportError:
+            pass
 
-                try:
-                    from sentence_transformers import CrossEncoder
-                    import torch
+        try:
+            from sentence_transformers import CrossEncoder
+            import torch
 
-                    # MPS = Metal GPU on M1/M2/M3, detected automatically
-                    device = "mps" if torch.backends.mps.is_available() else "cpu"
-                    _reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", device=device)
-                    logger.info("BGE Reranker v2-m3 loaded on %s", device.upper())
-                except ImportError:
-                    _reranker = False
-                    logger.info("sentence-transformers not installed, reranking disabled")
-        finally:
-            try:
-                _reranker_lock.release()
-            except RuntimeError:
-                pass  # Lock was not held
+            # MPS = Metal GPU on M1/M2/M3, detected automatically
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            _reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", device=device)
+            logger.info("BGE Reranker v2-m3 loaded on %s", device.upper())
+        except ImportError:
+            _reranker = False
+            logger.info("sentence-transformers not installed, reranking disabled")
+    finally:
+        try:
+            _reranker_lock.release()
+        except RuntimeError:
+            pass  # Lock was not held
     return _reranker if _reranker is not False else None
 
 
@@ -754,6 +759,10 @@ def _query_complexity(query: str) -> str:
       simple  — short, <=3 words, no strong code signal
       complex — semantic, >=4 words, no code signal  [rerank candidate]
     """
+    # Fast path: absolute paths starting with / are always "path"
+    # (avoids catastrophic backtracking on long paths with _PATH_LIKE_RE)
+    if query.startswith("/"):
+        return "path"
     if _PATH_LIKE_RE.search(query):
         return "path"
     if _CODE_QUERY_RE.search(query):
@@ -1035,6 +1044,132 @@ def _symbol_first_search(
     return hits[:n_results]
 
 
+def _path_metadata_search(
+    query: str,
+    col,
+    palace_path: str,
+    n_results: int = 10,
+    language: str = None,
+    project_path: str = None,
+    max_scan: int = 5000,
+) -> list[dict]:
+    """
+    Path-first retrieval using metadata search FIRST, FTS5 as bounded fallback.
+
+    Query flow (in priority order):
+    1. Exact source_file match (query == source_file)
+    2. Suffix match (source_file.endswith(query))
+    3. Basename match only as last resort
+    4. Bounded LanceDB metadata scan (max_scan chunks, batch 500)
+    5. Bounded FTS5 content search ONLY if scan yields < n_results
+
+    Returns list of hit dicts with rrf_score.
+    """
+    matched = []
+    seen_ids = set()
+    batch = 500
+    scanned = 0
+
+    # Build LanceDB filter for project_path scope
+    from .retrieval_planner import build_planner_filters
+    base_filter = build_planner_filters(
+        project_path=project_path,
+        language=language,
+        wing=None,
+        is_latest=True,
+    )
+
+    def _build_hit(rid, doc, meta, source_label):
+        sf = meta.get("source_file", "")
+        return {
+            "id": rid,
+            "text": doc,
+            "source_file": sf,
+            "wing": meta.get("wing", "repo"),
+            "room": meta.get("room", ""),
+            "line_start": meta.get("line_start", 0),
+            "line_end": meta.get("line_end", 0),
+            "symbol_name": meta.get("symbol_name", ""),
+            "chunk_kind": meta.get("chunk_kind", "code"),
+            "similarity": 1.0,
+            "source": source_label,
+            "language": meta.get("language", ""),
+        }
+
+    # ── Phase 1: Exact / suffix / basename metadata scan ─────────────────────
+    while scanned < max_scan and len(matched) < n_results:
+        try:
+            result = col.get(
+                limit=batch,
+                offset=scanned,
+                where=base_filter if base_filter else {"is_latest": True},
+                include=["documents", "metadatas", "ids"],
+            )
+        except Exception as e:
+            logger.warning("Path metadata scan get() failed: %s", e)
+            break
+
+        batch_ids = result.get("ids", [])
+        if not batch_ids:
+            break
+
+        for rid, doc, meta in zip(batch_ids, result.get("documents", []), result.get("metadatas", [])):
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            sf = meta.get("source_file", "")
+
+            # Priority 1: exact match
+            if sf == query:
+                matched.append(_build_hit(rid, doc, meta, "path_metadata"))
+                if len(matched) >= n_results:
+                    break
+                continue
+
+            # Priority 2: suffix match (query is trailing path component)
+            if sf.endswith(query) or sf.endswith("/" + query):
+                matched.append(_build_hit(rid, doc, meta, "path_metadata"))
+                if len(matched) >= n_results:
+                    break
+                continue
+
+            # Priority 3: basename match only if query is short (file name)
+            if "/" not in query and not query.endswith(".py") and not query.endswith(".js"):
+                basename = sf.split("/")[-1]
+                if basename == query:
+                    matched.append(_build_hit(rid, doc, meta, "path_metadata"))
+                    if len(matched) >= n_results:
+                        break
+                    continue
+
+        scanned += len(batch_ids)
+
+    # ── Phase 2: Bounded FTS5 fallback only if needed ───────────────────────
+    if len(matched) < n_results:
+        try:
+            fts5_hits = _fts5_search(
+                query, col, palace_path,
+                n_results=(n_results - len(matched)) * 2,
+                language=language,
+            )
+            for hit in fts5_hits:
+                if hit["id"] in seen_ids:
+                    continue
+                seen_ids.add(hit["id"])
+                if project_path and not _source_file_matches(hit.get("source_file", ""), project_path):
+                    continue
+                matched.append(hit)
+        except Exception as e:
+            logger.warning("FTS5 fallback in _path_metadata_search failed: %s", e)
+
+    # Assign rrf_score
+    k = 60
+    for rank, hit in enumerate(matched):
+        hit["rrf_score"] = 1 / (k + rank + 1)
+
+    return matched[:n_results]
+
+
 def _path_first_search(
     query: str,
     palace_path: str,
@@ -1047,90 +1182,22 @@ def _path_first_search(
     Path 1 — Path-first retrieval (no vector needed).
 
     Query flow:
-    1. FTS5 search with wing filter (if project_path given, FTS5 wing=project)
-    2. Python filter: source_file prefix matches project_path
-    3. If FTS5 returns < n_results, supplement with DB-level get() scan
-       filtered by source_file prefix (batch of 100, walk until n_results or exhausted)
-    4. Language filter applied in Python
+    1. Metadata-first search: exact/suffix/basename match on source_file
+    2. Bounded LanceDB scan (max 5000 chunks, batch 500)
+    3. Bounded FTS5 content fallback only if metadata scan yields < n_results
+    4. Language filter applied throughout
 
     Returns list of hit dicts with rrf_score.
     """
-    # Step 1: FTS5 search
-    try:
-        fts5_hits = _fts5_search(query, col, palace_path, n_results=n_results * 2, language=language)
-    except Exception as e:
-        logger.warning("FTS5 search in _path_first_search failed: %s", e)
-        fts5_hits = []
-
-    # Step 2: Filter by project_path
-    matched = []
-    for hit in fts5_hits:
-        sf = hit.get("source_file", "")
-        if project_path and not _source_file_matches(sf, project_path):
-            continue
-        if language and hit.get("language") != language:
-            continue
-        matched.append(hit)
-
-    # Step 3: If FTS5 insufficient, scan via get()
-    if len(matched) < n_results and project_path:
-        try:
-            backend = get_backend("lance")
-            collection_name = MempalaceConfig().collection_name
-            collection = backend.get_collection(palace_path, collection_name, create=False)
-            offset = 0
-            batch_get = 100
-            gathered = 0
-            seen_ids = {h["id"] for h in matched}
-
-            while gathered < (n_results - len(matched)):
-                result = collection.get(
-                    limit=batch_get,
-                    offset=offset,
-                    where={"is_latest": True, "wing": {"$in": ["repo", "project"]}},
-                    include=["documents", "metadatas", "ids"],
-                )
-                batch_ids = result.get("ids", [])
-                if not batch_ids:
-                    break
-
-                for rid, doc, meta in zip(
-                    result.get("ids", []),
-                    result.get("documents", []),
-                    result.get("metadatas", []),
-                ):
-                    if rid in seen_ids:
-                        continue
-                    sf = meta.get("source_file", "")
-                    if not _source_file_matches(sf, project_path):
-                        continue
-                    if language and meta.get("language") != language:
-                        continue
-                    seen_ids.add(rid)
-                    matched.append({
-                        "id": rid,
-                        "text": doc,
-                        "source_file": sf,
-                        "wing": meta.get("wing", "repo"),
-                        "room": meta.get("room", ""),
-                        "similarity": 1.0,
-                        "source": "fts5_scan",
-                        "language": meta.get("language", ""),
-                    })
-                    gathered += 1
-                    if gathered >= n_results - len(matched):
-                        break
-
-                offset += batch_get
-        except Exception as e:
-            logger.warning("get() scan fallback in _path_first_search failed: %s", e)
-
-    # Assign rrf_score
-    k = 60
-    for rank, hit in enumerate(matched):
-        hit["rrf_score"] = 1 / (k + rank + 1)
-
-    return matched[:n_results]
+    return _path_metadata_search(
+        query=query,
+        col=col,
+        palace_path=palace_path,
+        n_results=n_results,
+        language=language,
+        project_path=project_path,
+        max_scan=5000,
+    )
 
 
 def code_search(
