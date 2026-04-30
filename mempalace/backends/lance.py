@@ -136,12 +136,12 @@ def _daemon_is_running() -> bool:
         msg_len = int.from_bytes(raw_len, "big")
         if msg_len > 10_000_000:  # sanity cap
             return False
-        data = b""
+        data = bytearray()
         while len(data) < msg_len:
             chunk = s.recv(min(65536, msg_len - len(data)))
             if not chunk:
                 return False
-            data += chunk
+            data.extend(chunk)
         response = json.loads(data.decode("utf-8"))
         if not isinstance(response, dict):
             return False
@@ -296,12 +296,12 @@ def _embed_via_socket(texts: list[str]) -> list[list[float]]:
             raw_len += chunk
         msg_len = int.from_bytes(raw_len, "big")
 
-        data = b""
+        data = bytearray()
         while len(data) < msg_len:
             chunk = s.recv(min(65536, msg_len - len(data)))
             if not chunk:
                 raise ConnectionError("Daemon closed connection mid-message")
-            data += chunk
+            data.extend(chunk)
 
         response = json.loads(data.decode("utf-8"))
         if response.get("error"):
@@ -1049,7 +1049,12 @@ class LanceOptimizer:
                 loop.call_soon_threadsafe(self._schedule_optimize)
 
     def _schedule_optimize(self) -> None:
-        """Schedule one optimize run on the persistent loop."""
+        """Schedule one optimize run on the persistent optimize loop.
+
+        Called via call_soon_threadsafe from record_write() — runs on the optimize
+        event loop (NOT the tool-handler loop). get_running_loop() is safe here
+        because the optimize loop is always running when this fires.
+        """
         if self._lock_file.exists():
             logger.debug("LanceDB optimize already running, skipping")
             return
@@ -1131,7 +1136,13 @@ class LanceOptimizer:
                 logger.debug("Both async and sync optimize unavailable: %s", e2)
 
     def run_optimize_sync(self) -> None:
-        """Synchronous optimize — for CLI use."""
+        """Synchronous optimize — for CLI use only.
+
+        Uses asyncio.run() which creates a FRESH event loop.
+        Safe to call from synchronous code (CLI).
+        Would raise RuntimeError if called from within an async context
+        (Python 3.14: asyncio.run() inside a running loop is an error).
+        """
         if self._lock_file.exists():
             # Check if lock is stale (no PID or process dead)
             stale = True
@@ -1280,13 +1291,11 @@ def _where_to_sql(where: dict[str, Any] | None) -> str | None:
         return None
 
     if "$and" in where:
-        parts = [_where_to_sql(sub) for sub in where["$and"]]
-        parts = [p for p in parts if p]
+        parts = [p for p in (_where_to_sql(sub) for sub in where["$and"]) if p]
         return "(" + " AND ".join(parts) + ")" if parts else None
 
     if "$or" in where:
-        parts = [_where_to_sql(sub) for sub in where["$or"]]
-        parts = [p for p in parts if p]
+        parts = [p for p in (_where_to_sql(sub) for sub in where["$or"]) if p]
         return "(" + " OR ".join(parts) + ")" if parts else None
 
     parts = []
@@ -1461,13 +1470,8 @@ def _apply_time_decay(
     recency_weights = np.exp(-decay_lambda * days_old)
 
     # Combined score
-    combined = scores * recency_weights
-
-    results_df = results_df.copy()
-    results_df["_combined_score"] = combined
-    results_df = results_df.sort_values("_combined_score", ascending=False)
-
-    return results_df
+    results_df = results_df.assign(_combined_score=scores * recency_weights)
+    return results_df.sort_values("_combined_score", ascending=False)
 
 
 # ── LanceCollection ──────────────────────────────────────────────────────────

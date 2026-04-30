@@ -57,11 +57,12 @@ def error_response(
 # ── No-palace response ──────────────────────────────────────────────────────────
 
 
-def no_palace_response() -> dict:
+def no_palace_response(tool: str = "unknown") -> dict:
     """Build a no-palace error response."""
     return {
         "ok": False,
         "tool_contract_version": TOOL_CONTRACT_VERSION,
+        "tool": tool,
         "error": {
             "code": "no_palace",
             "message": "No palace found",
@@ -95,10 +96,18 @@ def normalize_hit(hit: dict, project_path: str | None = None) -> dict:
 
     Preserves all original keys (no data loss on partial hits).
     """
-    # Resolve text: prefer "text", fall back to "doc", fall back to ""
-    text = hit.get("text") or hit.get("doc") or hit.get("content", "")
+    # Resolve text: prefer non-None "text", fall back to "doc", fall back to ""
+    # None text must not overwrite a present doc
+    _raw_text = hit.get("text")
+    text = _raw_text if _raw_text is not None else hit.get("doc") or hit.get("content", "")
 
-    # Resolve source_file
+    # Compute score: prefer non-None score, fall back to similarity/rrf_score
+    _raw_score = hit.get("score")
+    score = _raw_score if _raw_score is not None else hit.get("similarity") or hit.get("rrf_score") or 0.0
+
+    # Project context — argument takes priority over raw hit value
+    _raw_ppa = hit.get("project_path_applied")
+    resolved_project_path_applied = project_path if project_path is not None else (_raw_ppa if _raw_ppa is not None else "")
     source_file = hit.get("source_file") or hit.get("file_path") or ""
 
     # Compute repo_rel_path if project_path provided
@@ -107,7 +116,9 @@ def normalize_hit(hit: dict, project_path: str | None = None) -> dict:
         repo_rel_path = _compute_repo_rel(source_file, project_path)
 
     return {
-        # Canonical identity
+        # Preserve original metadata for debugging (goes first so canonical fields win)
+        **hit,
+        # Canonical identity (overwrites any raw hit values)
         "id": hit.get("id") or hit.get("drawer_id") or "",
         # Canonical content
         "text": text,
@@ -126,13 +137,11 @@ def normalize_hit(hit: dict, project_path: str | None = None) -> dict:
         # Kind
         "chunk_kind": hit.get("chunk_kind") or hit.get("kind") or "",
         # Score
-        "score": hit.get("score") or hit.get("similarity") or hit.get("rrf_score") or 0.0,
+        "score": score,
         # Retrieval path
         "retrieval_path": hit.get("retrieval_path") or hit.get("source") or hit.get("_source") or "unknown",
         # Project context
-        "project_path_applied": project_path or hit.get("project_path_applied") or "",
-        # Preserve original metadata for debugging
-        **hit,
+        "project_path_applied": resolved_project_path_applied,
     }
 
 

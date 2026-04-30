@@ -512,11 +512,15 @@ def _rrf_merge(result_lists: list, k: int = 60) -> list:
     """Reciprocal Rank Fusion — combines results from multiple retrieval systems."""
     scores = {}
     seen = {}
+    _text_hash_cache = {}
     for result_list in result_lists:
         for rank, hit in enumerate(result_list):
             key = hit.get("id")
             if not key:
-                key = hashlib.md5(hit["text"].encode(), usedforsecurity=False).hexdigest()[:16]
+                text = hit["text"]
+                if text not in _text_hash_cache:
+                    _text_hash_cache[text] = hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()[:16]
+                key = _text_hash_cache[text]
             scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
             if key not in seen:
                 seen[key] = hit
@@ -752,6 +756,7 @@ _PATH_LIKE_RE = _re.compile(
 _RERANK_SHORTLIST_MAX = 20
 
 
+@functools.lru_cache(maxsize=256)
 def _query_complexity(query: str) -> str:
     """
     Classify query into complexity tiers for retrieval budgeting.
@@ -775,6 +780,7 @@ def _query_complexity(query: str) -> str:
     return "complex"
 
 
+@functools.lru_cache(maxsize=128)
 def _should_rerank(query: str, n_results: int) -> bool:
     """
     Decide whether to rerank for a given query + top_k.
