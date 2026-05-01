@@ -28,16 +28,22 @@ import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # Bounded worker pool — prevents thread-per-connection storm on M1/8GB.
 # Configurable via env for larger machines (e.g. 8 workers on 16GB+).
+max_workers = int(os.environ.get("MEMPALACE_EMBED_WORKERS", "4"))
 _bg_executor = ThreadPoolExecutor(
-    max_workers=int(os.environ.get("MEMPALACE_EMBED_WORKERS", "4")),
+    max_workers=max_workers,
     thread_name_prefix="embed_client",
 )
+
+# Backpressure: limit pending connections to prevent unbounded memory growth on load spikes.
+# When _bg_executor is saturated, the semaphore blocks new accepts until a worker completes.
+_sem_backpressure = threading.Semaphore(max_workers)
 
 # Single source of truth for socket path — env override or default
 _SOCKET_DEFAULT = os.path.expanduser("~/.mempalace/embed.sock")
@@ -665,8 +671,21 @@ def run_daemon() -> None:
 
     try:
         while True:
-            conn, _ = server.accept()
-            _bg_executor.submit(_handle_client, conn, model)
+            # Acquire semaphore to apply backpressure when executor is saturated.
+            # Blocks accept() until a worker slot frees up — callers see TCP backoff.
+            _sem_backpressure.acquire()
+            try:
+                conn, _ = server.accept()
+                # Wrap to ensure semaphore is released even if _handle_client raises.
+                def _release_then_handle(conn=conn, model=model):
+                    try:
+                        _handle_client(conn, model)
+                    finally:
+                        _sem_backpressure.release()
+                _bg_executor.submit(_release_then_handle)
+            except Exception:
+                _sem_backpressure.release()
+                raise
     except KeyboardInterrupt:
         pass
     finally:

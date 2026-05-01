@@ -35,9 +35,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from ..exceptions import MemoryPressureError
+
+# Shared executor for classify_batch — avoids per-call ThreadPoolExecutor creation.
+# Bounded to 4 workers (CPU-bound LanceDB queries, not pure CPU).
+_CLASSIFY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp_classify")
 
 # LanceDB core + dependencies
 try:
@@ -890,8 +895,6 @@ class SemanticDeduplicator:
         for vi, orig_i in enumerate(valid_orig_indices):
             orig_vec_map[orig_i] = (documents[orig_i], metadatas[orig_i], batch_vectors[vi])
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         n_workers = max(1, min(len(valid_orig_indices), 4))
 
         results: list[tuple[str, str | None]] = [("unique", None)] * len(documents)
@@ -926,14 +929,13 @@ class SemanticDeduplicator:
                 return i, ("unique", None)
             return i, ("unique", None)
 
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(_classify_one, (orig_i, doc, meta, vec)): orig_i
-                for orig_i, (doc, meta, vec) in orig_vec_map.items()
-            }
-            for future in as_completed(futures):
-                orig_i, classification = future.result()
-                results[orig_i] = classification
+        futures = {
+            _CLASSIFY_EXECUTOR.submit(_classify_one, (orig_i, doc, meta, vec)): orig_i
+            for orig_i, (doc, meta, vec) in orig_vec_map.items()
+        }
+        for future in as_completed(futures):
+            orig_i, classification = future.result()
+            results[orig_i] = classification
 
         # Build aligned embeddings list: None at quarantined indices so upsert zip stays aligned
         all_embeddings_aligned: list[list[float] | None] = [None] * len(documents)
@@ -1719,10 +1721,6 @@ class LanceCollection(BaseCollection):
         for vi, orig_i in enumerate(valid_orig_indices):
             orig_vec_map[orig_i] = (documents[orig_i], metadatas[orig_i], batch_vectors[vi])
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        n_workers = max(1, min(len(valid_orig_indices), 4))
-
         results: list[tuple[str, str | None]] = [("unique", None)] * len(documents)
         failed_orig_indices = {f["index"] for f in failures}
         for qi in failed_orig_indices:
@@ -1755,14 +1753,13 @@ class LanceCollection(BaseCollection):
                 return i, ("unique", None)
             return i, ("unique", None)
 
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(_classify_one, (orig_i, doc, meta, vec)): orig_i
-                for orig_i, (doc, meta, vec) in orig_vec_map.items()
-            }
-            for future in as_completed(futures):
-                orig_i, classification = future.result()
-                results[orig_i] = classification
+        futures = {
+            _CLASSIFY_EXECUTOR.submit(_classify_one, (orig_i, doc, meta, vec)): orig_i
+            for orig_i, (doc, meta, vec) in orig_vec_map.items()
+        }
+        for future in as_completed(futures):
+            orig_i, classification = future.result()
+            results[orig_i] = classification
 
         all_embeddings_aligned = [None] * len(documents)
         for vi, orig_i in enumerate(valid_orig_indices):

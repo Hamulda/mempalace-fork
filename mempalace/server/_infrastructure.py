@@ -9,6 +9,7 @@ import os
 import logging
 import sys
 import threading
+import atexit
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
@@ -107,3 +108,6 @@ def wal_log_async(operation: str, params: dict, result: dict = None, wal_file: P
 
 
 # ─── Status cache ────────────────────────────────────────────────────────────
+
+
+atexit.register(lambda: (wal_executor.shutdown(wait=True), bg_executor.shutdown(wait=True)))

@@ -112,6 +112,7 @@ class ClaimsManager:
         self._local = threading.local()
         self._cleanup_timer: Optional[threading.Timer] = None
         self._cleanup_interval = 60.0  # seconds between lazy cleanup runs
+        self._cleanup_scheduled = False  # True while timer is active and not cancelled
         self._connect()
         self._initialize()
         self._start_lazy_cleanup()
@@ -127,15 +128,18 @@ class ClaimsManager:
                 self.cleanup_expired()
             except Exception as exc:
                 _logger.warning("lazy cleanup failed: %s", exc)
-            # Re-schedule
+            # Re-schedule only if not cancelled.
             with self._write_lock:
-                if self._cleanup_timer is not None:
+                if self._cleanup_scheduled:
                     self._cleanup_timer = threading.Timer(
                         self._cleanup_interval, _run
                     )
                     self._cleanup_timer.daemon = True
                     self._cleanup_timer.start()
+                else:
+                    self._cleanup_timer = None
 
+        self._cleanup_scheduled = True
         self._cleanup_timer = threading.Timer(self._cleanup_interval, _run)
         self._cleanup_timer.daemon = True
         self._cleanup_timer.start()
@@ -529,6 +533,7 @@ class ClaimsManager:
 
     def close(self) -> None:
         with self._write_lock:
+            self._cleanup_scheduled = False
             if self._cleanup_timer is not None:
                 self._cleanup_timer.cancel()
                 self._cleanup_timer = None

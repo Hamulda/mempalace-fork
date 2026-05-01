@@ -7,6 +7,7 @@ Returns verbatim text — the actual words, never summaries.
 """
 
 import asyncio
+import atexit
 import functools
 import hashlib
 import logging
@@ -1585,3 +1586,5 @@ def _apply_code_boost(hits: list[dict], query: str, intent: str) -> list[dict]:
     hits.sort(key=lambda h: h.get("rrf_score", 0.0), reverse=True)
     return hits
 
+
+atexit.register(lambda: _search_executor.shutdown(wait=True))

@@ -90,20 +90,20 @@ class TestChromaRemoved:
     def test_chromadb_not_imported_on_backend_package_import(self):
         """Importing mempalace.backends must NOT load chromadb into sys.modules."""
         import sys
-        # Ensure chromadb is not in sys.modules after backends import
-        # This test runs in isolation due to import isolation in pytest
-        assert "chromadb" not in sys.modules
+        # Check exact module key or prefix+dot (not substring — PIL.GimpGradientFile matches 'chroma')
+        assert "chromadb" not in sys.modules and not any(k.startswith("chromadb.") for k in sys.modules), \
+            "chromadb was loaded into sys.modules"
 
     def test_chromadb_not_imported_on_get_backend_chroma_call(self):
         """get_backend('chroma') must raise WITHOUT loading chromadb into sys.modules."""
         import sys
         from mempalace.backends import get_backend
-        before = "chromadb" in sys.modules
+        before = "chromadb" in sys.modules or any(k.startswith("chromadb.") for k in sys.modules)
         try:
             get_backend("chroma")
         except ValueError:
             pass  # Expected
-        after = "chromadb" in sys.modules
+        after = "chromadb" in sys.modules or any(k.startswith("chromadb.") for k in sys.modules)
         assert not after, "chromadb was loaded into sys.modules despite ValueError"
 
 
